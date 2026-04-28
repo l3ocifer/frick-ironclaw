@@ -419,3 +419,61 @@ Licensed under either of:
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
+
+
+<!-- homelab-deployment:begin -->
+## Homelab Deployment
+
+This service is deployed to production on the [`l3ocifer/homelab`](https://github.com/l3ocifer/homelab) K3s cluster via ArgoCD GitOps. **Future engineers should treat the homelab repo as the operational source of truth.**
+
+### Cluster footprint
+
+| Field | Value |
+|---|---|
+| **ArgoCD Application** | [`ironclaw`](https://argocd.leopaska.xyz/applications/ironclaw) |
+| **AppSet entry** | [`argocd/apps/production-apps.yaml`](https://github.com/l3ocifer/homelab/blob/main/argocd/apps/production-apps.yaml) |
+| **Namespace** | `ironclaw` |
+| **Public URL** | https://ironclaw.leopaska.xyz |
+| **Manifest path (this repo)** | `k8s/overlays/homelab/` |
+| **Tracked branch** | `main` |
+| **Container images** | `ghcr.io/l3ocifer/ironclaw:latest` |
+| **Image auto-update** | ArgoCD Image Updater (newest-build strategy) |
+
+### Required platform resources (provided by homelab)
+
+| Resource | Endpoint / Reference |
+|---|---|
+| **Postgres (with pgvector)** | `homelab-pg-rw.databases.svc.cluster.local:5432` — DB `ironclaw` created via `postInitSQL` in [`argocd/apps/_postgres/homelab-pg.yaml`](https://github.com/l3ocifer/homelab/blob/main/argocd/apps/_postgres/homelab-pg.yaml). pgvector extension is preloaded on `template1`. |
+| **TLS / DNS** | Cloudflare Tunnel + Traefik IngressRoute, cert via cert-manager (Let's Encrypt DNS-01) |
+
+### SealedSecrets (committed to homelab repo)
+
+| Secret | Type | Keys | Vaultwarden item |
+|---|---|---|---|
+| `ironclaw/ironclaw-secrets` | Opaque | (intentionally not enumerated — see Vaultwarden) | `ironclaw-bundle` |
+
+### Re-seal procedure
+
+If a secret reports `no key could decrypt secret (...)` after a cluster rebuild:
+
+1. Plaintext source of truth: self-hosted Vaultwarden at https://warden.leopaska.xyz
+2. Follow the step-by-step re-seal flow: [`docs/argocd-triage.md#re-seal-procedure-per-secret`](https://github.com/l3ocifer/homelab/blob/main/docs/argocd-triage.md#re-seal-procedure-per-secret)
+3. For the GHCR pull secret use the bulk loop in [`docs/argocd-triage.md#ghcr-pull-secrets-special-case--dockerconfigjson`](https://github.com/l3ocifer/homelab/blob/main/docs/argocd-triage.md#ghcr-pull-secrets-special-case--dockerconfigjson)
+
+### Image build & deploy flow
+
+1. Push to `main` triggers GitHub Actions build (`.github/workflows/`)
+2. Image pushed to GHCR
+3. ArgoCD Image Updater (in `argocd` ns of homelab cluster) detects new digest within ~2m
+4. ArgoCD applies the updated manifest; rolling restart
+
+### Operational references
+
+- **Live status**: https://argocd.leopaska.xyz/applications/ironclaw
+- **Logs**: https://grafana.leopaska.xyz → Explore → Loki → `{namespace="ironclaw"}`
+- **Metrics**: kube-prometheus-stack scrapes pods/services with `prometheus.io/scrape: "true"`
+- **Production apps catalog**: [`docs/production-apps.md`](https://github.com/l3ocifer/homelab/blob/main/docs/production-apps.md)
+- **Disaster recovery runbook**: [`docs/disaster-recovery.md`](https://github.com/l3ocifer/homelab/blob/main/docs/disaster-recovery.md)
+- **Secrets workflow**: [`docs/secrets-checklist.md`](https://github.com/l3ocifer/homelab/blob/main/docs/secrets-checklist.md)
+- **Health triage**: [`docs/argocd-triage.md`](https://github.com/l3ocifer/homelab/blob/main/docs/argocd-triage.md)
+<!-- homelab-deployment:end -->
