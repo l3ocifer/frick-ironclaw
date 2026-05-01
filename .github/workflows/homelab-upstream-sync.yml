@@ -13,7 +13,7 @@ permissions:
 
 env:
   UPSTREAM: https://github.com/nearai/ironclaw.git
-  UPSTREAM_BRANCH: main
+  UPSTREAM_BRANCH: staging
   PR_BRANCH: chore/sync-upstream
 
 jobs:
