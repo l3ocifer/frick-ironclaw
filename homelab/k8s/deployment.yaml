@@ -41,7 +41,7 @@ spec:
         fsGroup: 0
       containers:
         - name: ironclaw
-          image: ghcr.io/l3ocifer/frick-ironclaw:latest
+          image: ghcr.io/l3ocifer/frick-ironclaw:homelab
           imagePullPolicy: Always
           ports:
             - { name: gateway, containerPort: 3000, protocol: TCP }
