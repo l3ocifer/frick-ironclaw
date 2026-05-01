@@ -1,0 +1,97 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frick
+  namespace: agents-shared
+  labels:
+    app.kubernetes.io/name: frick
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: agents
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate                    # state PVC is RWO
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frick
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frick
+        app.kubernetes.io/component: agent
+    spec:
+      serviceAccountName: frick-ops
+      restartPolicy: Always
+      affinity:
+        nodeAffinity:
+          # Soft-prefer alef (RTX 3090 → fastest local-LLM routing).
+          # Will tolerate eviction to thebeast or any other worker.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 80
+              preference:
+                matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: In, values: [alef] }
+            - weight: 30
+              preference:
+                matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: In, values: [thebeast] }
+      securityContext:
+        runAsNonRoot: false
+        fsGroup: 0
+      containers:
+        - name: ironclaw
+          image: ghcr.io/l3ocifer/frick-ironclaw:latest
+          imagePullPolicy: Always
+          ports:
+            - { name: gateway, containerPort: 3000, protocol: TCP }
+            - { name: metrics, containerPort: 9100, protocol: TCP }
+          env:
+            - { name: AGENT_NAME, value: "Frick" }
+            - { name: AGENT_ID, value: "frick" }
+            - { name: TZ, value: "America/New_York" }
+            - { name: HARDSTOP_PATH, value: "/data/HARDSTOP-FRICK" }
+            - { name: IRONCLAW_BIND, value: "0.0.0.0:3000" }
+            - { name: IRONCLAW_CONFIG, value: "/etc/ironclaw/openclaw.json" }
+            - { name: IRONCLAW_PERSONA_DIR, value: "/etc/ironclaw/persona" }
+          envFrom:
+            - secretRef: { name: frick-secrets }
+          livenessProbe:
+            httpGet: { path: /health, port: gateway }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+          readinessProbe:
+            httpGet: { path: /health, port: gateway }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits:   { memory: "8Gi" }
+          volumeMounts:
+            - { name: state,           mountPath: /data }
+            - { name: persona,         mountPath: /etc/ironclaw/persona, readOnly: true }
+            - { name: ironclaw-config, mountPath: /etc/ironclaw/openclaw.json, subPath: openclaw.json, readOnly: true }
+            - { name: graph-frick,     mountPath: /data/graphs/frick }
+            - { name: graph-frack,     mountPath: /data/graphs/frack,    readOnly: true }
+            - { name: graph-sancho,    mountPath: /data/graphs/sancho,   readOnly: true }
+            - { name: graph-vetinari,  mountPath: /data/graphs/vetinari, readOnly: true }
+            - { name: graph-quirm,     mountPath: /data/graphs/quirm,    readOnly: true }
+            - { name: graph-vimes,     mountPath: /data/graphs/vimes,    readOnly: true }
+            - { name: graph-puck,      mountPath: /data/graphs/puck,     readOnly: true }
+            - { name: graph-leo,       mountPath: /data/graphs/leo }
+              # Restricted writes per HANDOFF.md §4 — runtime-enforced
+      volumes:
+        - { name: state,            persistentVolumeClaim: { claimName: frick-state } }
+        - { name: persona,          configMap: { name: frick-persona } }
+        - { name: ironclaw-config,  configMap: { name: frick-ironclaw-config } }
+        - { name: graph-frick,      persistentVolumeClaim: { claimName: frick-graph } }
+        - { name: graph-frack,      persistentVolumeClaim: { claimName: frack-graph } }
+        - { name: graph-sancho,     persistentVolumeClaim: { claimName: sancho-graph } }
+        - { name: graph-vetinari,   persistentVolumeClaim: { claimName: vetinari-graph } }
+        - { name: graph-quirm,      persistentVolumeClaim: { claimName: quirm-graph } }
+        - { name: graph-vimes,      persistentVolumeClaim: { claimName: vimes-graph } }
+        - { name: graph-puck,       persistentVolumeClaim: { claimName: puck-graph } }
+        - { name: graph-leo,        persistentVolumeClaim: { claimName: leo-graph } }
+      imagePullSecrets:
+        - { name: ghcr-credentials }

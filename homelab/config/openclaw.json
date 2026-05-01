@@ -1,0 +1,166 @@
+{
+  // OpenClaw config for Frick (Alef server)
+  // Intel i7-3820, 54GB RAM, RTX 3090 @ 115W power limit
+  
+  models: {
+    mode: "merge",
+    providers: {
+      ollama: {
+        baseUrl: "http://127.0.0.1:11434/v1",
+        apiKey: "ollama-local",
+        api: "openai-completions",
+        models: [
+          {
+            id: "qwen2.5-coder:32b",
+            name: "Qwen 2.5 Coder 32B",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 32768,
+            maxTokens: 8192,
+          },
+          {
+            id: "qwen3-coder:30b",
+            name: "Qwen3 Coder 30B (MoE)",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 262144,
+            maxTokens: 8192,
+          },
+          {
+            id: "gemma3:27b",
+            name: "Gemma 3 27B",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 131072,
+            maxTokens: 8192,
+          },
+          {
+            id: "mistral-small3.2:24b",
+            name: "Mistral Small 3.2 24B",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 32768,
+            maxTokens: 8192,
+          },
+          {
+            id: "codestral:22b",
+            name: "Codestral 22B",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 32768,
+            maxTokens: 8192,
+          },
+          {
+            id: "deepseek-coder-v2:16b",
+            name: "DeepSeek Coder V2 16B",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 131072,
+            maxTokens: 8192,
+          },
+          {
+            id: "phi3.5:latest",
+            name: "Phi 3.5 (fast)",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 131072,
+            maxTokens: 4096,
+          }
+        ]
+      }
+    }
+  },
+
+  agents: {
+    defaults: {
+      model: {
+        primary: "ollama/qwen2.5-coder:32b",
+        fallbacks: ["ollama/qwen3-coder:30b", "ollama/gemma3:27b", "ollama/mistral-small3.2:24b"],
+      },
+      workspace: "~/.openclaw/workspace",
+      compaction: { mode: "safeguard" },
+      contextPruning: { mode: "cache-ttl", ttl: "1h" },
+      maxConcurrent: 4,  // Conservative due to thermal limits
+      thinkingDefault: "low",
+      heartbeat: {
+        every: "30m",
+        target: "last",
+      },
+      // Memory search with Logseq integration via extraPaths
+      memorySearch: {
+        enabled: true,
+        sources: ["memory", "sessions"],
+        // Logseq paths - synced via SyncThing from MacBook
+        // Note: Update path after setting up Logseq sync on Alef
+        extraPaths: [
+          "/home/l3o/Logseq/notes-sync/pages/ai-memory",
+          "/home/l3o/Logseq/notes-sync/journals",
+          "/home/l3o/Logseq/notes-sync/pages",
+        ],
+        // Use local embeddings (no cloud API)
+        provider: "local",
+        local: {
+          modelPath: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf",
+        },
+        fallback: "none",
+        // Sync settings
+        sync: {
+          watch: true,
+          watchDebounceMs: 2000,
+          onSessionStart: true,
+          onSearch: true,
+        },
+        // Hybrid search (BM25 + vector)
+        query: {
+          hybrid: {
+            enabled: true,
+            vectorWeight: 0.7,
+            textWeight: 0.3,
+          },
+        },
+      },
+    },
+    list: [
+      {
+        id: "main",
+        default: true,
+        identity: {
+          name: "Frick",
+          theme: "infrastructure ops engineer for homelab and cloud",
+          emoji: "🏠",
+        },
+      }
+    ],
+  },
+
+  tools: {
+    profile: "full",
+    allow: ["read", "exec", "write", "edit", "web_search", "browser"],
+    exec: { host: "gateway", ask: "off", security: "full" },
+    elevated: {
+      enabled: true,
+      allowFrom: {
+        agents: ["main"],
+      },
+    },
+  },
+
+  skills: {
+    load: {
+      extraDirs: ["~/.claude/skills"],
+    },
+  },
+
+  gateway: {
+    mode: "local",
+    port: 18789,
+    bind: "loopback",
+  },
+}

@@ -1,0 +1,74 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Sunday 02:45 UTC — last in the four-agent stagger after Vetinari
+    # (02:00), Frack (02:15), Sancho (02:30).
+    - cron: "45 2 * * 0"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM: https://github.com/nearai/ironclaw.git
+  UPSTREAM_BRANCH: main
+  PR_BRANCH: chore/sync-upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, token: "${{ secrets.GITHUB_TOKEN }}" }
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream + fetch
+        run: |
+          git remote add upstream "${UPSTREAM}" || git remote set-url upstream "${UPSTREAM}"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - id: ahead
+        run: |
+          BEHIND=$(git rev-list --count main..upstream/${UPSTREAM_BRANCH})
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          UPSTREAM_SHORT=$(git rev-parse --short upstream/${UPSTREAM_BRANCH})
+          echo "upstream_short=$UPSTREAM_SHORT" >> "$GITHUB_OUTPUT"
+
+      - if: steps.ahead.outputs.behind == '0'
+        run: echo "Already up to date."
+
+      - if: steps.ahead.outputs.behind != '0'
+        id: branch
+        run: |
+          BRANCH="${PR_BRANCH}-${{ steps.ahead.outputs.upstream_short }}"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          git switch -C "$BRANCH"
+          if git merge --no-edit upstream/${UPSTREAM_BRANCH}; then
+            echo "Merge clean."
+          else
+            git add -A
+            git commit -m "merge: upstream conflicts (manual resolution required)" --no-verify || true
+          fi
+          git push -f origin "$BRANCH"
+
+      - if: steps.ahead.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          BEHIND: ${{ steps.ahead.outputs.behind }}
+          SHORT: ${{ steps.ahead.outputs.upstream_short }}
+        run: |
+          if gh pr view "$BRANCH" --json number > /dev/null 2>&1; then
+            echo "PR exists; pushed updates."
+          else
+            gh pr create \
+              --base main --head "$BRANCH" \
+              --title "chore: sync upstream ironclaw@${SHORT}" \
+              --body "Automated upstream sync. Upstream nearai/ironclaw@${SHORT}, behind by ${BEHIND} commits."
+          fi
