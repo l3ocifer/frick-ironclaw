@@ -1,6 +1,6 @@
 ---
 # Frick's Postgres database — declarative replacement for the
-# `CREATE DATABASE ironclaw` line that used to live in
+# `CREATE DATABASE ironclaw_frick` line that used to live in
 # homelab-pg.yaml's postInitSQL (which only runs once at cluster
 # bootstrap, so it was useless for adding/recreating the agent later).
 #
@@ -12,14 +12,14 @@
 apiVersion: postgresql.cnpg.io/v1
 kind: Database
 metadata:
-  name: ironclaw
+  name: ironclaw-frick
   namespace: databases
   annotations:
     argocd.argoproj.io/sync-wave: "1"
 spec:
   cluster:
     name: homelab-pg
-  name: ironclaw
+  name: ironclaw_frick
   owner: frick
   ensure: present
   encoding: UTF8
