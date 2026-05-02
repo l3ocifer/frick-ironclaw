@@ -29,7 +29,7 @@ configMapGenerator:
       - openclaw.json=../config/openclaw.json
 
 generatorOptions:
-  disableNameSuffixHash: false
+  disableNameSuffixHash: true
 
 commonLabels:
   app.kubernetes.io/name: frick
