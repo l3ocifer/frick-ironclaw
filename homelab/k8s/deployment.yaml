@@ -43,6 +43,8 @@ spec:
         - name: ironclaw
           image: ghcr.io/l3ocifer/frick-ironclaw:homelab
           imagePullPolicy: Always
+          command: ["ironclaw"]
+          args: ["--no-onboard", "run"]
           ports:
             - { name: gateway, containerPort: 3000, protocol: TCP }
             - { name: metrics, containerPort: 9100, protocol: TCP }
@@ -51,18 +53,28 @@ spec:
             - { name: AGENT_ID, value: "frick" }
             - { name: TZ, value: "America/New_York" }
             - { name: HARDSTOP_PATH, value: "/data/HARDSTOP-FRICK" }
-            - { name: IRONCLAW_BIND, value: "0.0.0.0:3000" }
-            - { name: IRONCLAW_CONFIG, value: "/etc/ironclaw/openclaw.json" }
+            - { name: GATEWAY_ENABLED, value: "true" }
+            - { name: GATEWAY_HOST, value: "0.0.0.0" }
+            - { name: GATEWAY_PORT, value: "3000" }
+            - { name: CLI_ENABLED, value: "false" }
+            - { name: LLM_BACKEND, value: "openai_compatible" }
+            - { name: LLM_BASE_URL, value: "http://litellm.inference.svc.cluster.local:4000/v1" }
+            - { name: LLM_MODEL, value: "chat" }
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: frick-secrets
+                  key: LITELLM_API_KEY
             - { name: IRONCLAW_PERSONA_DIR, value: "/etc/ironclaw/persona" }
           envFrom:
             - secretRef: { name: frick-secrets }
           livenessProbe:
-            httpGet: { path: /health, port: gateway }
+            httpGet: { path: /api/health, port: gateway }
             initialDelaySeconds: 30
             periodSeconds: 30
             failureThreshold: 5
           readinessProbe:
-            httpGet: { path: /health, port: gateway }
+            httpGet: { path: /api/health, port: gateway }
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
