@@ -163,4 +163,22 @@
     port: 18789,
     bind: "loopback",
   },
+
+  // Fleet event bus — durable async A2A backbone shared by all
+  // seven agents. Backed by Postgres LISTEN/NOTIFY on the `fleet`
+  // database (schema in scripts/agents/sql/fleet-schema.sql, applied
+  // declaratively by argocd/apps/_postgres/fleet-schema-job.yaml).
+  // Connection string sealed in frick-secrets as FLEET_DATABASE_URL.
+  fleet: {
+    enabled: true,
+    agentId: "frick",
+    databaseUrlEnv: "FLEET_DATABASE_URL",
+    notifyChannel: "fleet_events_new",
+    inbound: {
+      // Frick is the cluster ops agent — wakes for every infrastructure
+      // event, every P0, and anything explicitly targeting `frick` or
+      // broadcast (target IS NULL).
+      predicate: "severity IN ('warn','critical','p0') OR target IS NULL OR target = 'frick' OR kind LIKE 'k8s.%' OR kind LIKE 'cluster.%' OR kind LIKE 'storage.%'",
+    },
+  },
 }
