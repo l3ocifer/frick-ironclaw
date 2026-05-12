@@ -25,6 +25,10 @@ spec:
       restartPolicy: Always
       affinity:
         nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: In, values: [alef, thebeast, blade] }
           # Soft-prefer alef (RTX 3090 → fastest local-LLM routing).
           # Will tolerate eviction to thebeast or any other worker.
           preferredDuringSchedulingIgnoredDuringExecution:
