@@ -32,6 +32,10 @@ pub struct Capabilities {
     pub tool_invoke: Option<ToolInvokeCapability>,
     /// Check if secrets exist.
     pub secrets: Option<SecretsCapability>,
+    /// Webhook authentication and signature verification.
+    pub webhook: Option<WebhookCapability>,
+    /// Arbitrary websocket configuration preserved from capabilities JSON.
+    pub websocket: Option<serde_json::Value>,
 }
 
 impl Capabilities {
@@ -302,40 +306,29 @@ impl SecretsCapability {
     }
 }
 
-/// Rate limiting configuration.
-#[derive(Debug, Clone)]
-pub struct RateLimitConfig {
-    /// Maximum requests per minute.
-    pub requests_per_minute: u32,
-    /// Maximum requests per hour.
-    pub requests_per_hour: u32,
-}
+/// Rate limiting configuration for WASM tool HTTP calls.
+///
+/// Type alias for `ToolRateLimitConfig` from the shared rate limiter module.
+/// WASM capabilities use it to configure per-tool HTTP request limits.
+pub use crate::tools::tool::ToolRateLimitConfig as RateLimitConfig;
 
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        Self {
-            requests_per_minute: 60,
-            requests_per_hour: 1000,
-        }
-    }
-}
-
-impl RateLimitConfig {
-    /// Create a restrictive rate limit.
-    pub fn restrictive() -> Self {
-        Self {
-            requests_per_minute: 10,
-            requests_per_hour: 100,
-        }
-    }
-
-    /// Create a permissive rate limit.
-    pub fn permissive() -> Self {
-        Self {
-            requests_per_minute: 120,
-            requests_per_hour: 5000,
-        }
-    }
+/// Webhook auth/signature capability configuration for tools.
+#[derive(Debug, Clone, Default)]
+pub struct WebhookCapability {
+    /// Optional header name for shared-secret validation.
+    pub secret_header: Option<String>,
+    /// Secret name in secrets store for shared-secret validation.
+    pub secret_name: Option<String>,
+    /// Secret name in secrets store containing Ed25519 public key (Discord-style).
+    pub signature_key_secret_name: Option<String>,
+    /// Secret name in secrets store for HMAC-SHA256 signing validation.
+    pub hmac_secret_name: Option<String>,
+    /// Header containing signature (e.g. X-Hub-Signature-256 or X-Slack-Signature).
+    pub hmac_signature_header: Option<String>,
+    /// Optional timestamp header. When present, Slack-style v0 signature is used.
+    pub hmac_timestamp_header: Option<String>,
+    /// Optional signature prefix (default: "sha256=" or "v0=" for timestamped mode).
+    pub hmac_prefix: Option<String>,
 }
 
 #[cfg(test)]
@@ -349,6 +342,8 @@ mod tests {
         assert!(caps.http.is_none());
         assert!(caps.tool_invoke.is_none());
         assert!(caps.secrets.is_none());
+        assert!(caps.webhook.is_none());
+        assert!(caps.websocket.is_none());
     }
 
     #[test]

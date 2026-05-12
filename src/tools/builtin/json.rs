@@ -15,7 +15,9 @@ impl Tool for JsonTool {
     }
 
     fn description(&self) -> &str {
-        "Parse, query, and transform JSON data. Supports JSONPath-like queries."
+        "Parse, query, and transform JSON data. Supports JSONPath-like queries. \
+         Use `source_tool_call_id` to reference the full output of a previous tool call \
+         (avoids truncation issues with large responses)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -28,27 +30,48 @@ impl Tool for JsonTool {
                     "description": "The JSON operation to perform"
                 },
                 "data": {
-                    "description": "The JSON data to operate on (string for parse, object otherwise)"
+                    "description": "JSON input data. Pass a string for parse, or any JSON value otherwise. Not required when source_tool_call_id is provided."
+                },
+                "source_tool_call_id": {
+                    "type": "string",
+                    "description": "Reference a previous tool call's full output by its ID (e.g., 'call_abc123'). Use this instead of data when the previous tool output was large and may have been truncated."
                 },
                 "path": {
                     "type": "string",
                     "description": "JSONPath-like path for query operation (e.g., 'foo.bar[0].baz')"
                 }
             },
-            "required": ["operation", "data"]
+            "required": ["operation"]
         })
     }
 
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
         let operation = require_str(&params, "operation")?;
 
-        let data = require_param(&params, "data")?;
+        // Resolve data: from stash (via source_tool_call_id) or from params
+        let data_value =
+            if let Some(ref_id) = params.get("source_tool_call_id").and_then(|v| v.as_str()) {
+                let stash = ctx.tool_output_stash.read().await;
+                let full_output = stash.get(ref_id).ok_or_else(|| {
+                    ToolError::InvalidParameters(format!(
+                        "no tool output found for call ID '{}'. Available IDs: {:?}",
+                        ref_id,
+                        stash.keys().collect::<Vec<_>>()
+                    ))
+                })?;
+                // Parse the stashed output as JSON, or wrap as string
+                serde_json::from_str::<serde_json::Value>(full_output)
+                    .unwrap_or_else(|_| serde_json::Value::String(full_output.clone()))
+            } else {
+                require_param(&params, "data")?.clone()
+            };
+        let data = &data_value;
 
         let result = match operation {
             "parse" => {
@@ -64,7 +87,12 @@ impl Tool for JsonTool {
                 parsed
             }
             "stringify" => {
-                let json_str = serde_json::to_string_pretty(data).map_err(|e| {
+                let value = if data.is_string() {
+                    parse_json_input(data)?
+                } else {
+                    data.clone()
+                };
+                let json_str = serde_json::to_string_pretty(&value).map_err(|e| {
                     ToolError::ExecutionFailed(format!("failed to stringify: {}", e))
                 })?;
 
@@ -75,14 +103,18 @@ impl Tool for JsonTool {
                     ToolError::InvalidParameters("missing 'path' parameter for query".to_string())
                 })?;
 
-                query_json(data, path)?
+                let value = if data.is_string() {
+                    parse_json_input(data)?
+                } else {
+                    data.clone()
+                };
+                query_json(&value, path)?
             }
             "validate" => {
-                let is_valid = if let Some(s) = data.as_str() {
-                    serde_json::from_str::<serde_json::Value>(s).is_ok()
-                } else {
-                    true // Already a valid JSON value
-                };
+                let is_valid = data
+                    .as_str()
+                    .map(|s| serde_json::from_str::<serde_json::Value>(s).is_ok())
+                    .unwrap_or(false);
 
                 serde_json::json!({ "valid": is_valid })
             }
@@ -100,6 +132,14 @@ impl Tool for JsonTool {
     fn requires_sanitization(&self) -> bool {
         false // Internal tool, no external data
     }
+}
+
+fn parse_json_input(data: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    let json_str = data
+        .as_str()
+        .ok_or_else(|| ToolError::InvalidParameters("'data' must be a JSON string".to_string()))?;
+    serde_json::from_str(json_str)
+        .map_err(|e| ToolError::InvalidParameters(format!("invalid JSON input: {}", e)))
 }
 
 /// Simple JSONPath-like query implementation.
@@ -164,6 +204,85 @@ mod tests {
         assert_eq!(
             query_json(&data, "foo.bar[2]").unwrap(),
             serde_json::json!(3)
+        );
+    }
+
+    #[test]
+    fn test_parse_json_input_accepts_valid_json_string() {
+        let input = serde_json::json!("{\"ok\":true}");
+        let parsed = parse_json_input(&input).unwrap();
+        assert_eq!(parsed, serde_json::json!({"ok": true}));
+    }
+
+    #[test]
+    fn test_parse_json_input_rejects_invalid_json_string() {
+        let input = serde_json::json!("{not valid json}");
+        let err = parse_json_input(&input).unwrap_err();
+        assert!(err.to_string().contains("invalid JSON input"));
+    }
+
+    #[tokio::test]
+    async fn test_query_with_object_data_from_stash() {
+        use crate::context::JobContext;
+
+        let ctx = JobContext::with_user("test", "chat", "test-session");
+
+        // Simulate stashed output: the http tool stores serialized JSON
+        // containing {"status": 200, "body": {"leagues": [{"name": "MLB"}]}}
+        let stashed = r#"{"status": 200, "body": {"leagues": [{"name": "MLB"}]}}"#;
+        ctx.tool_output_stash
+            .write()
+            .await
+            .insert("call_http_01".to_string(), stashed.to_string());
+
+        let tool = JsonTool;
+        let params = serde_json::json!({
+            "operation": "query",
+            "source_tool_call_id": "call_http_01",
+            "path": "body.leagues[0].name"
+        });
+
+        let result = tool.execute(params, &ctx).await.unwrap();
+        assert_eq!(result.result, serde_json::json!("MLB"));
+    }
+
+    #[tokio::test]
+    async fn test_stringify_with_object_data_from_stash() {
+        use crate::context::JobContext;
+
+        let ctx = JobContext::with_user("test", "chat", "test-session");
+
+        let stashed = r#"{"key": "value"}"#;
+        ctx.tool_output_stash
+            .write()
+            .await
+            .insert("call_01".to_string(), stashed.to_string());
+
+        let tool = JsonTool;
+        let params = serde_json::json!({
+            "operation": "stringify",
+            "source_tool_call_id": "call_01"
+        });
+
+        let result = tool.execute(params, &ctx).await.unwrap();
+        let stringified = result.result.as_str().unwrap();
+        assert!(stringified.contains("\"key\": \"value\""));
+    }
+
+    #[test]
+    fn test_json_tool_schema_data_is_freeform() {
+        let schema = JsonTool.parameters_schema();
+        let data = schema
+            .get("properties")
+            .and_then(|p| p.get("data"))
+            .expect("data schema missing");
+
+        // Data is intentionally freeform (no "type" constraint) for OpenAI
+        // compatibility. OpenAI rejects union types containing "array" unless
+        // "items" is also specified.
+        assert!(
+            data.get("type").is_none(),
+            "data schema should not have a 'type' to be freeform for OpenAI compatibility"
         );
     }
 }

@@ -3,9 +3,11 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// Points in the agent lifecycle where hooks can be attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum HookPoint {
     /// Before processing an inbound user message.
     BeforeInbound,
@@ -21,8 +23,22 @@ pub enum HookPoint {
     TransformResponse,
 }
 
+impl HookPoint {
+    /// Human-readable hook point identifier.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HookPoint::BeforeInbound => "beforeInbound",
+            HookPoint::BeforeToolCall => "beforeToolCall",
+            HookPoint::BeforeOutbound => "beforeOutbound",
+            HookPoint::OnSessionStart => "onSessionStart",
+            HookPoint::OnSessionEnd => "onSessionEnd",
+            HookPoint::TransformResponse => "transformResponse",
+        }
+    }
+}
+
 /// Contextual data carried with each hook invocation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HookEvent {
     /// An inbound user message about to be processed.
     Inbound {
@@ -49,7 +65,15 @@ pub enum HookEvent {
     /// A new session was created.
     SessionStart { user_id: String, session_id: String },
     /// A session was ended (pruned).
-    SessionEnd { user_id: String, session_id: String },
+    SessionEnd {
+        user_id: String,
+        session_id: String,
+        /// Thread IDs (= conversation IDs) that belonged to this session.
+        /// Used by hooks like SessionSummaryHook to summarize the correct
+        /// conversation rather than guessing via recency.
+        #[serde(default)]
+        thread_ids: Vec<uuid::Uuid>,
+    },
     /// The final response is being transformed before completing a turn.
     ResponseTransform {
         user_id: String,
@@ -133,7 +157,8 @@ impl HookOutcome {
 }
 
 /// How to handle hook execution failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HookFailureMode {
     /// On error/timeout, continue processing as if the hook returned `ok()`.
     FailOpen,

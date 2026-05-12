@@ -12,6 +12,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::bootstrap::ironclaw_base_dir;
+
 const SERVICE_LABEL: &str = "com.ironclaw.daemon";
 const SYSTEMD_UNIT: &str = "ironclaw.service";
 
@@ -57,13 +59,26 @@ fn install_macos() -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let logs_dir = ironclaw_logs_dir()?;
+    let logs_dir = ironclaw_logs_dir();
     std::fs::create_dir_all(&logs_dir)?;
 
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
-    let plist = format!(
+    let plist = macos_plist_content(
+        &exe.display().to_string(),
+        &stdout.display().to_string(),
+        &stderr.display().to_string(),
+    );
+
+    std::fs::write(&file, plist)?;
+    println!("Installed launchd service: {}", file.display());
+    println!("  Start with: ironclaw service start");
+    Ok(())
+}
+
+fn macos_plist_content(exe: &str, stdout: &str, stderr: &str) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -79,6 +94,12 @@ fn install_macos() -> Result<()> {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <!-- Disable interactive CLI/REPL in daemon mode to prevent blocking on stdin -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLI_ENABLED</key>
+    <string>false</string>
+  </dict>
   <key>StandardOutPath</key>
   <string>{stdout}</string>
   <key>StandardErrorPath</key>
@@ -87,15 +108,10 @@ fn install_macos() -> Result<()> {
 </plist>
 "#,
         label = SERVICE_LABEL,
-        exe = xml_escape(&exe.display().to_string()),
-        stdout = xml_escape(&stdout.display().to_string()),
-        stderr = xml_escape(&stderr.display().to_string()),
-    );
-
-    std::fs::write(&file, plist)?;
-    println!("Installed launchd service: {}", file.display());
-    println!("  Start with: ironclaw service start");
-    Ok(())
+        exe = xml_escape(exe),
+        stdout = xml_escape(stdout),
+        stderr = xml_escape(stderr),
+    )
 }
 
 fn install_linux() -> Result<()> {
@@ -112,6 +128,8 @@ fn install_linux() -> Result<()> {
          \n\
          [Service]\n\
          Type=simple\n\
+         # Disable interactive CLI/REPL in daemon mode to prevent blocking on stdin\n\
+         Environment=\"CLI_ENABLED=false\"\n\
          ExecStart=\"{exe}\" run\n\
          Restart=always\n\
          RestartSec=3\n\
@@ -250,9 +268,8 @@ fn linux_unit_path() -> Result<PathBuf> {
         .join(SYSTEMD_UNIT))
 }
 
-fn ironclaw_logs_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not find home directory")?;
-    Ok(home.join(".ironclaw").join("logs"))
+fn ironclaw_logs_dir() -> PathBuf {
+    ironclaw_base_dir().join("logs")
 }
 
 // ── Shell helpers ───────────────────────────────────────────────
@@ -350,8 +367,15 @@ mod tests {
 
     #[test]
     fn logs_dir_under_ironclaw() {
-        let path = ironclaw_logs_dir().unwrap();
+        let path = ironclaw_logs_dir();
         let s = path.to_string_lossy();
         assert!(s.ends_with(".ironclaw/logs"), "unexpected path: {s}");
+    }
+
+    #[test]
+    fn macos_plist_sets_cli_enabled_false() {
+        let plist = macos_plist_content("/tmp/ironclaw", "/tmp/stdout.log", "/tmp/stderr.log");
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains("    <key>CLI_ENABLED</key>\n    <string>false</string>"));
     }
 }

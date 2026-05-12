@@ -22,9 +22,14 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use tokio::sync::broadcast;
 use tracing::field::{Field, Visit};
-use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, reload};
 
-use crate::safety::LeakDetector;
+use ironclaw_common::AppEvent;
+use ironclaw_safety::LeakDetector;
+
+use super::platform::sse::SseManager;
 
 /// Maximum number of recent log entries kept for late-joining SSE subscribers.
 const HISTORY_CAP: usize = 500;
@@ -88,6 +93,9 @@ impl LogBroadcaster {
     }
 
     /// Snapshot of recent entries for replaying to a new subscriber.
+    ///
+    /// Returns entries oldest-first so that the frontend's `prepend()`
+    /// naturally places the newest entry at the top of the DOM.
     pub fn recent_entries(&self) -> Vec<LogEntry> {
         self.recent
             .lock()
@@ -100,6 +108,128 @@ impl Default for LogBroadcaster {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Handle for changing the tracing `EnvFilter` at runtime.
+///
+/// Wraps a `reload::Handle` so the gateway can switch between log levels
+/// (e.g. `ironclaw=debug`) without restarting the process.
+pub struct LogLevelHandle {
+    handle: reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+    current_level: Mutex<String>,
+    base_filter: String,
+}
+
+impl LogLevelHandle {
+    pub fn new(
+        handle: reload::Handle<EnvFilter, tracing_subscriber::Registry>,
+        initial_level: String,
+        base_filter: String,
+    ) -> Self {
+        Self {
+            handle,
+            current_level: Mutex::new(initial_level),
+            base_filter,
+        }
+    }
+
+    /// Change the `ironclaw=<level>` directive at runtime.
+    ///
+    /// `level` must be one of: trace, debug, info, warn, error.
+    pub fn set_level(&self, level: &str) -> Result<(), String> {
+        const VALID: &[&str] = &["trace", "debug", "info", "warn", "error"];
+        let level = level.to_lowercase();
+        if !VALID.contains(&level.as_str()) {
+            return Err(format!(
+                "invalid level '{}', must be one of: {}",
+                level,
+                VALID.join(", ")
+            ));
+        }
+
+        let filter_str = if self.base_filter.is_empty() {
+            format!("ironclaw={}", level)
+        } else {
+            format!("ironclaw={},{}", level, self.base_filter)
+        };
+
+        let new_filter = EnvFilter::new(&filter_str);
+        self.handle
+            .reload(new_filter)
+            .map_err(|e| format!("failed to reload filter: {}", e))?;
+
+        if let Ok(mut current) = self.current_level.lock() {
+            *current = level;
+        }
+        Ok(())
+    }
+
+    /// Returns the current ironclaw log level (e.g. "info", "debug").
+    pub fn current_level(&self) -> String {
+        self.current_level
+            .lock()
+            .map(|l| l.clone())
+            .unwrap_or_else(|_| "info".to_string())
+    }
+}
+
+/// Initialise the tracing subscriber with a reloadable `EnvFilter`.
+///
+/// Returns the `LogLevelHandle` so callers can swap the filter at runtime.
+/// The fmt layer and `WebLogLayer` are attached alongside the reloadable filter.
+///
+/// When `suppress_stderr` is true, the stderr formatter is omitted. This is
+/// used in TUI mode where logs are displayed in the dedicated Logs tab instead
+/// of interleaving with the alternate screen.
+pub fn init_tracing(
+    log_broadcaster: Arc<LogBroadcaster>,
+    suppress_stderr: bool,
+) -> Arc<LogLevelHandle> {
+    let raw_filter =
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "ironclaw=info,tower_http=warn".to_string());
+
+    // Split into the ironclaw directive and "everything else" (base_filter).
+    let mut ironclaw_level = String::from("info");
+    let mut base_parts: Vec<&str> = Vec::new();
+
+    for part in raw_filter.split(',') {
+        let trimmed = part.trim();
+        if trimmed.starts_with("ironclaw=") {
+            if let Some(lvl) = trimmed.strip_prefix("ironclaw=") {
+                ironclaw_level = lvl.to_string();
+            }
+        } else if !trimmed.is_empty() {
+            base_parts.push(trimmed);
+        }
+    }
+    let base_filter = base_parts.join(",");
+
+    let env_filter = EnvFilter::new(&raw_filter);
+    let (reload_layer, reload_handle) = reload::Layer::new(env_filter);
+
+    let handle = Arc::new(LogLevelHandle::new(
+        reload_handle,
+        ironclaw_level,
+        base_filter,
+    ));
+
+    let fmt_layer = if suppress_stderr {
+        None
+    } else {
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(crate::tracing_fmt::TruncatingStderr::default()),
+        )
+    };
+
+    tracing_subscriber::registry()
+        .with(reload_layer)
+        .with(fmt_layer)
+        .with(WebLogLayer::new(log_broadcaster))
+        .init();
+
+    handle
 }
 
 /// Visitor that extracts the `message` field and all extra key-value
@@ -169,6 +299,66 @@ impl WebLogLayer {
     pub fn new(broadcaster: Arc<LogBroadcaster>) -> Self {
         Self { broadcaster }
     }
+}
+
+/// Forward WARN/ERROR log entries into the chat SSE stream as
+/// `AppEvent::Warning` so the debug inspector's Activity tab can surface
+/// warnings alongside tool/LLM events.
+///
+/// The event is verbose-only at the `SseManager` layer, so only debug
+/// subscribers receive it. When `owner_id` is `Some`, warnings are
+/// scoped to that user to avoid leaking per-request log context across
+/// tenants in multi-tenant deployments; in single-user mode they may be
+/// broadcast globally.
+///
+/// Lag recovery: `broadcast::Receiver::recv()` returns
+/// `Err(RecvError::Lagged)` when the subscriber falls behind. Early code
+/// used `while let Ok(entry) = rx.recv().await`, which would permanently
+/// kill the bridge during a log storm. The `match` shape here keeps the
+/// loop alive on lag and exits only when the broadcaster closes.
+pub fn spawn_warning_bridge(
+    broadcaster: Arc<LogBroadcaster>,
+    sse: Arc<SseManager>,
+    owner_id: Option<String>,
+) {
+    let mut rx = broadcaster.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(entry) => {
+                    if entry.level != "WARN" && entry.level != "ERROR" {
+                        continue;
+                    }
+                    // `AppEvent::Warning` is verbose-only: if no debug
+                    // subscriber is connected there is nobody to deliver
+                    // to, and broadcasting would just pressure the
+                    // shared SSE buffer for non-debug clients.
+                    if !sse.has_verbose_receivers() {
+                        continue;
+                    }
+                    let event = AppEvent::Warning {
+                        source: entry.target,
+                        message: entry.message,
+                        thread_id: None,
+                    };
+                    // The tracing `LogBroadcaster` is a typed source log in
+                    // the sense of `.claude/rules/gateway-events.md`: every
+                    // `AppEvent::Warning` on the SSE stream projects from
+                    // exactly one `LogEntry` produced by `WebLogLayer`.
+                    // It is not yet listed in the rule's source-log table
+                    // (the current entries are engine `EventKind`, sandbox
+                    // `JobEvent`, and channel-lifecycle logs), so the
+                    // broadcast sites carry an explicit annotation below.
+                    match &owner_id {
+                        Some(uid) => sse.broadcast_for_user(uid, event), // projection-exempt: log source, WARN/ERROR tracing bridge → AppEvent::Warning
+                        None => sse.broadcast(event), // projection-exempt: log source, WARN/ERROR tracing bridge → AppEvent::Warning
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 impl<S: tracing::Subscriber> Layer<S> for WebLogLayer {
@@ -340,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_leak_detector_scrubs_api_key_in_log() {
-        let detector = crate::safety::LeakDetector::new();
+        let detector = ironclaw_safety::LeakDetector::new();
         let msg = "Connecting with token sk-proj-test1234567890abcdefghij";
         let result = detector.scan_and_clean(msg);
         // Should be blocked (OpenAI key pattern)
@@ -349,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_leak_detector_passes_clean_log() {
-        let detector = crate::safety::LeakDetector::new();
+        let detector = ironclaw_safety::LeakDetector::new();
         let msg = "Request completed status=200 url=https://api.example.com/data";
         let result = detector.scan_and_clean(msg);
         assert!(result.is_ok());

@@ -27,6 +27,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 use bollard::Docker;
@@ -63,6 +65,29 @@ pub struct ContainerRunner {
     proxy_port: u16,
 }
 
+/// Append `text` into `buffer` up to `limit` bytes without breaking UTF-8.
+///
+/// Returns `true` when truncation occurred.
+fn append_with_limit(buffer: &mut String, text: &str, limit: usize) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+
+    if buffer.len() >= limit {
+        return true;
+    }
+
+    let remaining = limit - buffer.len();
+    if text.len() <= remaining {
+        buffer.push_str(text);
+        return false;
+    }
+
+    let end = crate::util::floor_char_boundary(text, remaining);
+    buffer.push_str(&text[..end]);
+    true
+}
+
 impl ContainerRunner {
     /// Create a new container runner.
     pub fn new(docker: Docker, image: String, proxy_port: u16) -> Self {
@@ -70,6 +95,18 @@ impl ContainerRunner {
             docker,
             image,
             proxy_port,
+        }
+    }
+
+    /// Create a runner for image-only operations (exists / pull / build).
+    ///
+    /// `proxy_port` is unused for image operations, so this avoids requiring
+    /// a real port number when the caller only needs to check or build images.
+    pub fn for_image_ops(docker: Docker, image: String) -> Self {
+        Self {
+            docker,
+            image,
+            proxy_port: 0,
         }
     }
 
@@ -112,6 +149,141 @@ impl ContainerRunner {
         }
 
         tracing::info!("Successfully pulled image: {}", self.image);
+        Ok(())
+    }
+
+    /// Build the sandbox image from a Dockerfile.
+    ///
+    /// This is used when the image is not available from a registry and needs
+    /// to be built locally from source.
+    ///
+    /// # Security
+    ///
+    /// The `dockerfile_path` MUST point to a trusted Dockerfile. Docker builds
+    /// execute arbitrary `RUN` commands from the Dockerfile, which is a code
+    /// execution vector. Callers must ensure the path is not user-controlled
+    /// and points to a known, safe Dockerfile (e.g., bundled with the application).
+    pub async fn build_image(&self, dockerfile_path: &Path) -> Result<()> {
+        use tokio::io::AsyncBufReadExt;
+        use tokio::process::Command;
+
+        const MAX_STDERR_CAPTURE: usize = 4096;
+
+        // Canonicalize so the -f path is absolute and context_dir is its parent.
+        // This avoids the bug where a relative path like "docker/sandbox.Dockerfile"
+        // would be resolved twice (once for context_dir, once by docker -f).
+        let canonical =
+            dockerfile_path
+                .canonicalize()
+                .map_err(|e| SandboxError::ContainerCreationFailed {
+                    reason: format!(
+                        "cannot resolve Dockerfile path '{}': {}",
+                        dockerfile_path.display(),
+                        e
+                    ),
+                })?;
+
+        let context_dir =
+            canonical
+                .parent()
+                .ok_or_else(|| SandboxError::ContainerCreationFailed {
+                    reason: format!(
+                        "Dockerfile path '{}' has no parent directory",
+                        canonical.display()
+                    ),
+                })?;
+
+        tracing::info!(
+            "Building sandbox image from {}: {}",
+            canonical.display(),
+            self.image
+        );
+
+        let mut child = Command::new("docker")
+            .arg("build")
+            .arg("-f")
+            .arg(&canonical)
+            .arg("-t")
+            .arg(&self.image)
+            .arg(".")
+            .current_dir(context_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| SandboxError::ContainerCreationFailed {
+                reason: format!("failed to run docker build: {}", e),
+            })?;
+
+        // Both streams are piped above, so take() returns Some.
+        let mut stdout_lines = tokio::io::BufReader::new(child.stdout.take().ok_or_else(|| {
+            SandboxError::ContainerCreationFailed {
+                reason: "stdout pipe missing".to_string(),
+            }
+        })?)
+        .lines();
+        let mut stderr_lines = tokio::io::BufReader::new(child.stderr.take().ok_or_else(|| {
+            SandboxError::ContainerCreationFailed {
+                reason: "stderr pipe missing".to_string(),
+            }
+        })?)
+        .lines();
+
+        let mut stderr_capture = String::new();
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+
+        while !stdout_done || !stderr_done {
+            tokio::select! {
+                line = stdout_lines.next_line(), if !stdout_done => {
+                    match line {
+                        Ok(Some(line)) => tracing::info!("[docker build] {}", line),
+                        Ok(None) => stdout_done = true,
+                        Err(e) => {
+                            tracing::warn!("Error reading docker build stdout: {}", e);
+                            stdout_done = true;
+                        }
+                    }
+                },
+                line = stderr_lines.next_line(), if !stderr_done => {
+                    match line {
+                        Ok(Some(line)) => {
+                            tracing::info!("[docker build] {}", line);
+                            if stderr_capture.len() < MAX_STDERR_CAPTURE {
+                                stderr_capture.push_str(&line);
+                                stderr_capture.push('\n');
+                            }
+                        }
+                        Ok(None) => stderr_done = true,
+                        Err(e) => {
+                            tracing::warn!("Error reading docker build stderr: {}", e);
+                            stderr_done = true;
+                        }
+                    }
+                },
+            }
+        }
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| SandboxError::ContainerCreationFailed {
+                reason: format!("docker build wait failed: {}", e),
+            })?;
+
+        if !status.success() {
+            let code = status
+                .code()
+                .map_or("unknown".to_string(), |c| c.to_string());
+            return Err(SandboxError::ContainerCreationFailed {
+                reason: format!(
+                    "docker build failed (exit {}): {}",
+                    code,
+                    stderr_capture.trim_end()
+                ),
+            });
+        }
+
+        tracing::info!("Successfully built image: {}", self.image);
         Ok(())
     }
 
@@ -283,7 +455,7 @@ impl ContainerRunner {
             // Prevent privilege escalation
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             // Read-only root filesystem (workspace is still writable if policy allows)
-            readonly_rootfs: Some(policy == SandboxPolicy::ReadOnly),
+            readonly_rootfs: Some(policy != SandboxPolicy::FullAccess),
             // Tmpfs mounts for /tmp and cargo cache
             tmpfs: Some(
                 [
@@ -393,23 +565,11 @@ impl ContainerRunner {
             match result {
                 Ok(LogOutput::StdOut { message }) => {
                     let text = String::from_utf8_lossy(&message);
-                    if stdout.len() + text.len() > half_max {
-                        truncated = true;
-                        let remaining = half_max.saturating_sub(stdout.len());
-                        stdout.push_str(&text[..remaining.min(text.len())]);
-                    } else {
-                        stdout.push_str(&text);
-                    }
+                    truncated |= append_with_limit(&mut stdout, &text, half_max);
                 }
                 Ok(LogOutput::StdErr { message }) => {
                     let text = String::from_utf8_lossy(&message);
-                    if stderr.len() + text.len() > half_max {
-                        truncated = true;
-                        let remaining = half_max.saturating_sub(stderr.len());
-                        stderr.push_str(&text[..remaining.min(text.len())]);
-                    } else {
-                        stderr.push_str(&text);
-                    }
+                    truncated |= append_with_limit(&mut stderr, &text, half_max);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -439,23 +599,11 @@ impl ContainerRunner {
                 match result {
                     Ok(LogOutput::StdOut { message }) => {
                         let text = String::from_utf8_lossy(&message);
-                        if stdout.len() < half_max {
-                            let remaining = half_max.saturating_sub(stdout.len());
-                            stdout.push_str(&text[..remaining.min(text.len())]);
-                            if text.len() > remaining {
-                                truncated = true;
-                            }
-                        }
+                        truncated |= append_with_limit(&mut stdout, &text, half_max);
                     }
                     Ok(LogOutput::StdErr { message }) => {
                         let text = String::from_utf8_lossy(&message);
-                        if stderr.len() < half_max {
-                            let remaining = half_max.saturating_sub(stderr.len());
-                            stderr.push_str(&text[..remaining.min(text.len())]);
-                            if text.len() > remaining {
-                                truncated = true;
-                            }
-                        }
+                        truncated |= append_with_limit(&mut stderr, &text, half_max);
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -490,38 +638,147 @@ impl ContainerRunner {
 ///
 /// Tries these locations in order:
 /// 1. `DOCKER_HOST` env var (bollard default)
-/// 2. `/var/run/docker.sock` (Linux default)
-/// 3. `~/.docker/run/docker.sock` (Docker Desktop on macOS)
+/// 2. `/var/run/docker.sock` (Linux default; also used by OrbStack and Podman Desktop on macOS)
+/// 3. `~/.docker/run/docker.sock` (Docker Desktop 4.13+ on macOS — primary user-owned socket)
+/// 4. `~/.colima/default/docker.sock` (Colima — popular lightweight Docker Desktop alternative)
+/// 5. `~/.rd/docker.sock` (Rancher Desktop on macOS)
+/// 6. `$XDG_RUNTIME_DIR/docker.sock` (common rootless Docker socket on Linux)
+/// 7. `/run/user/$UID/docker.sock` (rootless Docker fallback on Linux)
 pub async fn connect_docker() -> Result<Docker> {
-    // First try bollard defaults (checks DOCKER_HOST, then /var/run/docker.sock)
+    // First try bollard defaults (checks DOCKER_HOST env var, then /var/run/docker.sock).
+    // This covers Linux, OrbStack (updates the /var/run symlink), and any user with
+    // DOCKER_HOST set to their runtime's socket.
     if let Ok(docker) = Docker::connect_with_local_defaults()
         && docker.ping().await.is_ok()
     {
         return Ok(docker);
     }
 
-    // Try Docker Desktop socket (macOS)
-    if let Some(home) = std::env::var_os("HOME") {
-        let desktop_sock = std::path::Path::new(&home).join(".docker/run/docker.sock");
-        if desktop_sock.exists() {
-            let sock_str = desktop_sock.to_string_lossy();
-            if let Ok(docker) =
-                Docker::connect_with_socket(&sock_str, 120, bollard::API_DEFAULT_VERSION)
-                && docker.ping().await.is_ok()
-            {
-                return Ok(docker);
+    #[cfg(unix)]
+    {
+        // Try well-known user-owned socket locations for desktop and rootless runtimes.
+        // Docker Desktop 4.13+ (stabilised in 4.18) stopped creating the
+        // /var/run/docker.sock symlink by default and moved the API socket
+        // to ~/.docker/run/docker.sock.
+        for sock in unix_socket_candidates() {
+            if sock.exists() {
+                let sock_str = sock.to_string_lossy();
+                if let Ok(docker) =
+                    Docker::connect_with_socket(&sock_str, 120, bollard::API_DEFAULT_VERSION)
+                    && docker.ping().await.is_ok()
+                {
+                    return Ok(docker);
+                }
             }
         }
     }
 
     Err(SandboxError::DockerNotAvailable {
-        reason: "Socket not found: /var/run/docker.sock".to_string(),
+        reason: "Could not connect to Docker daemon. Tried: $DOCKER_HOST, \
+            /var/run/docker.sock, ~/.docker/run/docker.sock, \
+            ~/.colima/default/docker.sock, ~/.rd/docker.sock, \
+            $XDG_RUNTIME_DIR/docker.sock, /run/user/$UID/docker.sock"
+            .to_string(),
     })
+}
+
+#[cfg(unix)]
+pub(crate) fn unix_socket_candidates() -> Vec<PathBuf> {
+    unix_socket_candidates_from_env(
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        std::env::var("UID").ok(),
+    )
+}
+
+#[cfg(unix)]
+fn unix_socket_candidates_from_env(
+    home: Option<PathBuf>,
+    xdg_runtime_dir: Option<PathBuf>,
+    uid: Option<String>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut push_unique = |path: PathBuf| {
+        if !candidates.iter().any(|existing| existing == &path) {
+            candidates.push(path);
+        }
+    };
+
+    if let Some(home) = home {
+        push_unique(home.join(".docker/run/docker.sock")); // Docker Desktop 4.13+
+        push_unique(home.join(".colima/default/docker.sock")); // Colima
+        push_unique(home.join(".rd/docker.sock")); // Rancher Desktop
+    }
+
+    if let Some(xdg_runtime_dir) = xdg_runtime_dir {
+        push_unique(xdg_runtime_dir.join("docker.sock"));
+    }
+
+    if let Some(uid) = uid.filter(|value| !value.is_empty()) {
+        push_unique(PathBuf::from(format!("/run/user/{uid}/docker.sock")));
+    }
+
+    candidates
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_with_limit_truncates_on_utf8_boundary() {
+        let mut out = String::new();
+        let truncated = append_with_limit(&mut out, "ab🙂cd", 5);
+        assert!(truncated);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn append_with_limit_marks_truncated_when_full() {
+        let mut out = "abc".to_string();
+        let truncated = append_with_limit(&mut out, "z", 3);
+        assert!(truncated);
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn append_with_limit_appends_without_truncation() {
+        let mut out = String::new();
+        let truncated = append_with_limit(&mut out, "hello", 10);
+        assert!(!truncated);
+        assert_eq!(out, "hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_socket_candidates_include_rootless_paths() {
+        let candidates = unix_socket_candidates_from_env(
+            Some(PathBuf::from("/home/tester")),
+            Some(PathBuf::from("/run/user/1000")),
+            Some("1000".to_string()),
+        );
+
+        assert!(candidates.contains(&PathBuf::from("/home/tester/.docker/run/docker.sock")));
+        assert!(candidates.contains(&PathBuf::from("/home/tester/.colima/default/docker.sock")));
+        assert!(candidates.contains(&PathBuf::from("/home/tester/.rd/docker.sock")));
+        assert!(candidates.contains(&PathBuf::from("/run/user/1000/docker.sock")));
+    }
+
+    #[tokio::test]
+    async fn build_image_rejects_nonexistent_dockerfile() {
+        // The behavior under test (Dockerfile path canonicalization) happens
+        // before any Docker daemon call, so we don't need a reachable daemon.
+        let docker = Docker::connect_with_http_defaults().unwrap();
+        let runner = ContainerRunner::for_image_ops(docker, "test-nonexistent:latest".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let bad_path = dir.path().join("definitely-does-not-exist.Dockerfile");
+        let err = runner.build_image(&bad_path).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot resolve Dockerfile path"),
+            "expected path resolution error, got: {msg}"
+        );
+    }
 
     #[tokio::test]
     async fn test_docker_connection() {

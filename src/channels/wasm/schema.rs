@@ -38,7 +38,7 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -46,11 +46,20 @@ use serde::{Deserialize, Serialize};
 use crate::channels::wasm::capabilities::{
     ChannelCapabilities, EmitRateLimitConfig, MIN_POLL_INTERVAL_MS,
 };
+use crate::channels::wasm::is_reserved_runtime_config_key;
 use crate::tools::wasm::{CapabilitiesFile as ToolCapabilitiesFile, RateLimitSchema};
 
 /// Root schema for a channel capabilities JSON file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChannelCapabilitiesFile {
+    /// Extension version (semver).
+    #[serde(default)]
+    pub version: Option<String>,
+
+    /// WIT interface version this channel was compiled against (semver).
+    #[serde(default)]
+    pub wit_version: Option<String>,
+
     /// File type, must be "channel".
     #[serde(default = "default_type")]
     pub r#type: String,
@@ -90,6 +99,44 @@ impl ChannelCapabilitiesFile {
         serde_json::from_slice(bytes)
     }
 
+    /// Validate the capabilities file and emit warnings for common misconfigurations.
+    ///
+    /// Called once at load time to catch issues early. Warnings are emitted via
+    /// `tracing::warn` so they show up in startup logs without blocking loading.
+    pub fn validate(&self) {
+        const MIN_PROMPT_LENGTH: usize = 30;
+
+        // Check for short prompts in required_secrets
+        for secret in &self.setup.required_secrets {
+            if secret.prompt.len() < MIN_PROMPT_LENGTH {
+                tracing::warn!(
+                    channel = self.name,
+                    secret = secret.name,
+                    prompt = secret.prompt,
+                    "setup.required_secrets prompt is shorter than {} chars — \
+                     consider a more descriptive prompt that tells the user where to find this value",
+                    MIN_PROMPT_LENGTH
+                );
+            }
+        }
+
+        // Has required_secrets but no setup_url
+        if !self.setup.required_secrets.is_empty() && self.setup.setup_url.is_none() {
+            tracing::warn!(
+                channel = self.name,
+                "setup.required_secrets defined but no setup.setup_url — \
+                 user has no link to obtain credentials"
+            );
+        }
+
+        // Validate manifest-driven runtime-config secret injection. Called
+        // purely for its side effect: emitting warnings for unsafe mapping
+        // entries (empty keys, reserved runtime keys, undeclared secret
+        // names). The runtime path uses `validated_secret_config_mappings`
+        // (silent filter).
+        let _ = self.validated_secret_config_mappings_with_warnings();
+    }
+
     /// Convert to runtime ChannelCapabilities.
     pub fn to_capabilities(&self) -> ChannelCapabilities {
         self.capabilities.to_channel_capabilities(&self.name)
@@ -98,6 +145,13 @@ impl ChannelCapabilitiesFile {
     /// Get the channel config as JSON string.
     pub fn config_json(&self) -> String {
         serde_json::to_string(&self.config).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Whether this channel declares owner/pairing gating in its config.
+    pub fn requires_binding(&self) -> bool {
+        ["owner_id", "dm_policy", "allow_from"]
+            .iter()
+            .any(|key| self.config.contains_key(*key))
     }
 
     /// Get the webhook secret header name for this channel.
@@ -111,6 +165,30 @@ impl ChannelCapabilitiesFile {
             .and_then(|w| w.secret_header.as_deref())
     }
 
+    /// Get the signature verification key secret name for this channel.
+    ///
+    /// Returns the secret name declared in `webhook.signature_key_secret_name`,
+    /// used to look up the Ed25519 public key in the secrets store.
+    pub fn signature_key_secret_name(&self) -> Option<&str> {
+        self.capabilities
+            .channel
+            .as_ref()
+            .and_then(|c| c.webhook.as_ref())
+            .and_then(|w| w.signature_key_secret_name.as_deref())
+    }
+
+    /// Get the HMAC-SHA256 signing secret name for this channel.
+    ///
+    /// Returns the secret name declared in `webhook.hmac_secret_name`,
+    /// used to look up the HMAC signing secret in the secrets store (Slack-style).
+    pub fn hmac_secret_name(&self) -> Option<&str> {
+        self.capabilities
+            .channel
+            .as_ref()
+            .and_then(|c| c.webhook.as_ref())
+            .and_then(|w| w.hmac_secret_name.as_deref())
+    }
+
     /// Get the webhook secret name for this channel.
     ///
     /// Returns the configured secret name or defaults to "{channel_name}_webhook_secret".
@@ -121,6 +199,103 @@ impl ChannelCapabilitiesFile {
             .and_then(|c| c.webhook.as_ref())
             .and_then(|w| w.secret_name.clone())
             .unwrap_or_else(|| format!("{}_webhook_secret", self.name))
+    }
+
+    /// Whether the host should enforce generic webhook-secret validation.
+    ///
+    /// Defaults to true. Channels can opt out when they validate the shared
+    /// secret themselves using provider-specific request body fields.
+    pub fn webhook_secret_managed_by_host(&self) -> bool {
+        self.capabilities
+            .channel
+            .as_ref()
+            .and_then(|c| c.webhook.as_ref())
+            .and_then(|w| w.managed_by_host)
+            .unwrap_or(true)
+    }
+
+    /// Return setup.secret_config_mappings after applying security constraints.
+    ///
+    /// Only mappings for declared `setup.required_secrets` are allowed, and
+    /// mappings cannot target reserved runtime config keys.
+    pub fn validated_secret_config_mappings(&self) -> Vec<SecretConfigMappingSchema> {
+        self.collect_validated_secret_config_mappings(false)
+    }
+
+    fn validated_secret_config_mappings_with_warnings(&self) -> Vec<SecretConfigMappingSchema> {
+        self.collect_validated_secret_config_mappings(true)
+    }
+
+    fn collect_validated_secret_config_mappings(
+        &self,
+        emit_warnings: bool,
+    ) -> Vec<SecretConfigMappingSchema> {
+        let required_secret_names: HashSet<String> = self
+            .setup
+            .required_secrets
+            .iter()
+            .map(|secret| secret.name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        self.setup
+            .secret_config_mappings
+            .iter()
+            .filter_map(|mapping| {
+                let config_key = mapping.config_key.trim();
+                let secret_name = mapping.secret_name.trim();
+
+                if config_key.is_empty() {
+                    if emit_warnings {
+                        tracing::warn!(
+                            channel = self.name,
+                            secret_name = %mapping.secret_name,
+                            "Ignoring setup.secret_config_mappings entry with empty config_key"
+                        );
+                    }
+                    return None;
+                }
+
+                if is_reserved_runtime_config_key(config_key) {
+                    if emit_warnings {
+                        tracing::warn!(
+                            channel = self.name,
+                            config_key = %config_key,
+                            "Ignoring setup.secret_config_mappings entry targeting reserved runtime config key"
+                        );
+                    }
+                    return None;
+                }
+
+                if secret_name.is_empty() {
+                    if emit_warnings {
+                        tracing::warn!(
+                            channel = self.name,
+                            config_key = %config_key,
+                            "Ignoring setup.secret_config_mappings entry with empty secret_name"
+                        );
+                    }
+                    return None;
+                }
+
+                if !required_secret_names.contains(&secret_name.to_ascii_lowercase()) {
+                    if emit_warnings {
+                        tracing::warn!(
+                            channel = self.name,
+                            config_key = %config_key,
+                            secret_name = %secret_name,
+                            "Ignoring setup.secret_config_mappings entry for undeclared secret (must be listed in setup.required_secrets)"
+                        );
+                    }
+                    return None;
+                }
+
+                Some(SecretConfigMappingSchema {
+                    config_key: config_key.to_string(),
+                    secret_name: secret_name.to_string(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -156,6 +331,14 @@ impl ChannelCapabilitiesSchema {
 
             if let Some(prefix) = &channel.workspace_prefix {
                 caps.workspace_prefix = prefix.clone();
+            }
+
+            if !channel.durable_workspace_paths.is_empty() {
+                caps.durable_workspace_paths = channel
+                    .durable_workspace_paths
+                    .iter()
+                    .map(|path| caps.prefix_workspace_path(path))
+                    .collect();
             }
 
             if let Some(rate) = &channel.emit_rate_limit {
@@ -194,6 +377,10 @@ pub struct ChannelSpecificCapabilitiesSchema {
     #[serde(default)]
     pub workspace_prefix: Option<String>,
 
+    /// Workspace paths that are safe to persist across restarts.
+    #[serde(default)]
+    pub durable_workspace_paths: Vec<String>,
+
     /// Rate limiting for emit_message.
     #[serde(default)]
     pub emit_rate_limit: Option<EmitRateLimitSchema>,
@@ -230,6 +417,23 @@ pub struct WebhookSchema {
     /// Default: "{channel_name}_webhook_secret"
     #[serde(default)]
     pub secret_name: Option<String>,
+
+    /// Secret name in secrets store containing the Ed25519 public key
+    /// for signature verification (e.g., Discord interaction verification).
+    #[serde(default)]
+    pub signature_key_secret_name: Option<String>,
+
+    /// Secret name in secrets store for HMAC-SHA256 signing (Slack-style).
+    #[serde(default)]
+    pub hmac_secret_name: Option<String>,
+
+    /// Whether the host/router should enforce generic webhook-secret
+    /// validation before the channel sees the request.
+    ///
+    /// Default: true. Set to false when the provider sends the shared secret
+    /// in a provider-specific request field rather than the configured header.
+    #[serde(default)]
+    pub managed_by_host: Option<bool>,
 }
 
 /// Setup configuration schema.
@@ -241,10 +445,22 @@ pub struct SetupSchema {
     #[serde(default)]
     pub required_secrets: Vec<SecretSetupSchema>,
 
+    /// Optional mapping from secret names to runtime config keys.
+    ///
+    /// Use this when a channel needs raw secret values in its runtime config
+    /// (for example, provider token exchanges that require secrets in request
+    /// bodies). This is explicit opt-in to avoid over-injecting secrets.
+    #[serde(default)]
+    pub secret_config_mappings: Vec<SecretConfigMappingSchema>,
+
     /// Optional validation endpoint to verify configuration.
     /// Placeholders like {secret_name} are replaced with actual values.
     #[serde(default)]
     pub validation_endpoint: Option<String>,
+
+    /// User-facing URL where they can create/manage credentials.
+    #[serde(default)]
+    pub setup_url: Option<String>,
 }
 
 /// Configuration for a secret required during setup.
@@ -267,6 +483,15 @@ pub struct SecretSetupSchema {
     /// Auto-generate configuration if the user doesn't provide a value.
     #[serde(default)]
     pub auto_generate: Option<AutoGenerateSchema>,
+}
+
+/// Mapping from a secret in the secrets store to a runtime config key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretConfigMappingSchema {
+    /// Config key to inject into the channel runtime config.
+    pub config_key: String,
+    /// Secret name in the secrets store.
+    pub secret_name: String,
 }
 
 /// Configuration for auto-generating a secret value.
@@ -494,6 +719,55 @@ mod tests {
     }
 
     #[test]
+    fn test_requires_binding_detects_dm_owner_fields() {
+        let telegram = ChannelCapabilitiesFile::from_json(
+            r#"{
+                "name": "telegram",
+                "config": {
+                    "owner_id": null,
+                    "dm_policy": "pairing",
+                    "allow_from": []
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(telegram.requires_binding());
+
+        let wechat = ChannelCapabilitiesFile::from_json(
+            r#"{
+                "name": "wechat",
+                "config": {
+                    "base_url": "https://ilinkai.weixin.qq.com",
+                    "bot_type": "3"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(!wechat.requires_binding());
+    }
+
+    #[test]
+    fn test_durable_workspace_paths_are_prefixed() {
+        let json = r#"{
+            "name": "slack",
+            "capabilities": {
+                "channel": {
+                    "workspace_prefix": "channels/slack/",
+                    "durable_workspace_paths": ["state/active_threads"]
+                }
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        let caps = file.to_capabilities();
+
+        assert_eq!(
+            caps.durable_workspace_paths,
+            vec!["channels/slack/state/active_threads".to_string()]
+        );
+    }
+
+    #[test]
     fn test_emit_rate_limit() {
         let json = r#"{
             "name": "test",
@@ -535,6 +809,25 @@ mod tests {
             Some("X-Telegram-Bot-Api-Secret-Token")
         );
         assert_eq!(file.webhook_secret_name(), "telegram_webhook_secret");
+        assert!(file.webhook_secret_managed_by_host());
+    }
+
+    #[test]
+    fn test_webhook_schema_can_disable_host_managed_secret_validation() {
+        let json = r#"{
+            "name": "feishu",
+            "capabilities": {
+                "channel": {
+                    "webhook": {
+                        "secret_name": "feishu_verification_token",
+                        "managed_by_host": false
+                    }
+                }
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        assert!(!file.webhook_secret_managed_by_host());
     }
 
     #[test]
@@ -567,12 +860,25 @@ mod tests {
                         "auto_generate": { "length": 64 }
                     }
                 ],
+                "secret_config_mappings": [
+                    {
+                        "config_key": "bot_token",
+                        "secret_name": "telegram_bot_token"
+                    }
+                ],
                 "validation_endpoint": "https://api.telegram.org/bot{telegram_bot_token}/getMe"
             }
         }"#;
 
         let file = ChannelCapabilitiesFile::from_json(json).unwrap();
         assert_eq!(file.setup.required_secrets.len(), 2);
+        assert_eq!(file.setup.secret_config_mappings.len(), 1);
+        assert_eq!(file.setup.secret_config_mappings[0].config_key, "bot_token");
+        assert_eq!(
+            file.setup.secret_config_mappings[0].secret_name,
+            "telegram_bot_token"
+        );
+        assert_eq!(file.validated_secret_config_mappings().len(), 1);
         assert_eq!(file.setup.required_secrets[0].name, "telegram_bot_token");
         assert!(!file.setup.required_secrets[0].optional);
         assert!(file.setup.required_secrets[1].optional);
@@ -583,6 +889,202 @@ mod tests {
                 .unwrap()
                 .length,
             64
+        );
+    }
+
+    #[test]
+    fn test_validated_secret_config_mappings_filters_unsafe_entries() {
+        let json = r#"{
+            "name": "feishu",
+            "setup": {
+                "required_secrets": [
+                    {
+                        "name": "feishu_app_id",
+                        "prompt": "Enter your Feishu app id from open.feishu.cn"
+                    }
+                ],
+                "secret_config_mappings": [
+                    { "config_key": "app_id", "secret_name": "feishu_app_id" },
+                    { "config_key": "webhook_secret", "secret_name": "feishu_app_id" },
+                    { "config_key": "bot_username", "secret_name": "feishu_app_id" },
+                    { "config_key": "stolen_key", "secret_name": "openai_api_key" },
+                    { "config_key": "", "secret_name": "feishu_app_id" }
+                ]
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        let mappings = file.validated_secret_config_mappings();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].config_key, "app_id");
+        assert_eq!(mappings[0].secret_name, "feishu_app_id");
+    }
+
+    #[test]
+    fn test_telegram_bundled_setup_includes_webhook_secret() {
+        let json = include_str!("../../../channels-src/telegram/telegram.capabilities.json");
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+
+        let webhook_secret = file
+            .setup
+            .required_secrets
+            .iter()
+            .find(|secret| secret.name == "telegram_webhook_secret")
+            .expect("telegram webhook secret should be declared in the bundled manifest");
+
+        assert!(webhook_secret.optional);
+        assert_eq!(
+            webhook_secret
+                .auto_generate
+                .as_ref()
+                .expect("telegram webhook secret should auto-generate")
+                .length,
+            64
+        );
+    }
+
+    // ── Category 5: Discord Capabilities Setup & Configuration ──────────
+
+    #[test]
+    fn test_validate_channel_short_prompt() {
+        // prompt < 30 chars — should not panic
+        let json = r#"{
+            "name": "test-channel",
+            "setup": {
+                "required_secrets": [
+                    { "name": "bot_token", "prompt": "Bot token" }
+                ],
+                "setup_url": "https://example.com"
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        // Should not panic; warning emitted for short prompt
+        file.validate();
+    }
+
+    #[test]
+    fn test_validate_channel_missing_setup_url() {
+        // required_secrets without setup_url — should not panic
+        let json = r#"{
+            "name": "test-channel",
+            "setup": {
+                "required_secrets": [
+                    {
+                        "name": "bot_token",
+                        "prompt": "Enter your bot token from the developer portal settings"
+                    }
+                ]
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        // Should not panic; warning emitted for missing setup_url
+        file.validate();
+    }
+
+    #[test]
+    fn test_validate_clean_channel() {
+        // Well-configured channel — should not panic or warn
+        let json = r#"{
+            "name": "good-channel",
+            "setup": {
+                "required_secrets": [
+                    {
+                        "name": "bot_token",
+                        "prompt": "Enter your bot token from https://example.com/bot-settings"
+                    }
+                ],
+                "setup_url": "https://example.com/bot-settings"
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        // Should not panic and emits no warnings
+        file.validate();
+    }
+
+    #[test]
+    fn test_discord_capabilities_has_public_key_secret() {
+        let json = include_str!("../../../channels-src/discord/discord.capabilities.json");
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+
+        let secret_names: Vec<&str> = file
+            .setup
+            .required_secrets
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert!(
+            secret_names.contains(&"discord_public_key"),
+            "discord.capabilities.json must include discord_public_key in setup.required_secrets, \
+             found: {:?}",
+            secret_names
+        );
+    }
+
+    #[test]
+    fn test_webhook_schema_signature_key_secret_name() {
+        let json = r#"{
+            "name": "discord",
+            "capabilities": {
+                "channel": {
+                    "allowed_paths": ["/webhook/discord"],
+                    "webhook": {
+                        "signature_key_secret_name": "discord_public_key"
+                    }
+                }
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        assert_eq!(file.signature_key_secret_name(), Some("discord_public_key"));
+    }
+
+    #[test]
+    fn test_signature_key_secret_name_none_when_missing() {
+        let json = r#"{
+            "name": "telegram",
+            "capabilities": {
+                "channel": {
+                    "allowed_paths": ["/webhook/telegram"],
+                    "webhook": {
+                        "secret_header": "X-Telegram-Bot-Api-Secret-Token"
+                    }
+                }
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        assert_eq!(file.signature_key_secret_name(), None);
+    }
+
+    #[test]
+    fn test_discord_capabilities_signature_key() {
+        let json = include_str!("../../../channels-src/discord/discord.capabilities.json");
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        assert_eq!(
+            file.signature_key_secret_name(),
+            Some("discord_public_key"),
+            "discord.capabilities.json must declare signature_key_secret_name"
+        );
+    }
+
+    #[test]
+    fn test_discord_capabilities_secrets_allowlist() {
+        let json = include_str!("../../../channels-src/discord/discord.capabilities.json");
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+
+        let caps = file.to_capabilities();
+        let secrets_caps = caps
+            .tool_capabilities
+            .secrets
+            .expect("Discord should have secrets capability");
+
+        assert!(
+            secrets_caps.is_allowed("discord_public_key"),
+            "discord_public_key must be in the secrets allowlist"
         );
     }
 }

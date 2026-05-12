@@ -37,7 +37,7 @@ impl Default for WasmChannelRuntimeConfig {
             default_limits: ResourceLimits {
                 // Channels may need more memory for message buffering
                 memory_bytes: 50 * 1024 * 1024, // 50 MB
-                fuel: 10_000_000,
+                fuel: 500_000_000,
                 timeout: Duration::from_secs(60),
             },
             fuel_config: FuelConfig::default(),
@@ -68,35 +68,48 @@ impl WasmChannelRuntimeConfig {
 }
 
 /// A compiled WASM channel component ready for instantiation.
-#[derive(Debug)]
+///
+/// Stores the pre-compiled `Component` directly so instantiation
+/// doesn't require recompilation.
 pub struct PreparedChannelModule {
     /// Channel name.
     pub name: String,
     /// Channel description.
     pub description: String,
-    /// Compiled component bytes (public for testing, otherwise use component_bytes()).
-    pub(crate) component_bytes: Vec<u8>,
+    /// Pre-compiled component (cheaply cloneable via internal Arc).
+    pub(crate) component: Option<wasmtime::component::Component>,
     /// Resource limits for this channel.
     pub limits: ResourceLimits,
 }
 
 impl PreparedChannelModule {
-    /// Get the compiled component bytes.
-    pub fn component_bytes(&self) -> &[u8] {
-        &self.component_bytes
+    /// Get the pre-compiled component for instantiation.
+    pub fn component(&self) -> Option<&wasmtime::component::Component> {
+        self.component.as_ref()
     }
 
     /// Create a PreparedChannelModule for testing purposes.
     ///
-    /// Creates a module with no actual WASM bytes, suitable for testing
+    /// Creates a module with no actual WASM component, suitable for testing
     /// channel infrastructure without requiring a real WASM component.
     pub fn for_testing(name: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
-            component_bytes: Vec::new(),
+            component: None,
             limits: ResourceLimits::default(),
         }
+    }
+}
+
+impl std::fmt::Debug for PreparedChannelModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedChannelModule")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("has_component", &self.component.is_some())
+            .field("limits", &self.limits)
+            .finish()
     }
 }
 
@@ -136,6 +149,22 @@ impl WasmChannelRuntime {
 
         // Disable debug info in production
         wasmtime_config.debug_info(false);
+
+        // Enable persistent compilation cache. Wasmtime serializes compiled native
+        // code to disk (~/.cache/wasmtime by default), so subsequent startups
+        // deserialize instead of recompiling — typically 10-50x faster.
+        //
+        // On Windows, each Engine gets its own cache subdirectory to avoid
+        // OS error 33 (ERROR_LOCK_VIOLATION) when multiple engines share the
+        // default cache and Windows holds exclusive locks on memory-mapped
+        // files. See #448.
+        if let Err(e) = crate::tools::wasm::enable_compilation_cache(
+            &mut wasmtime_config,
+            "channels",
+            config.cache_dir.as_deref(),
+        ) {
+            tracing::warn!("Failed to enable wasmtime compilation cache: {}", e);
+        }
 
         let engine = Engine::new(&wasmtime_config).map_err(|e| {
             WasmChannelError::Config(format!("Failed to create Wasmtime engine: {}", e))
@@ -183,13 +212,13 @@ impl WasmChannelRuntime {
         // Compile in blocking task (Wasmtime compilation is synchronous)
         let prepared = tokio::task::spawn_blocking(move || {
             // Validate and compile the component
-            let _component = wasmtime::component::Component::new(&engine, &wasm_bytes)
+            let component = wasmtime::component::Component::new(&engine, &wasm_bytes)
                 .map_err(|e| WasmChannelError::Compilation(e.to_string()))?;
 
             Ok::<_, WasmChannelError>(PreparedChannelModule {
                 name: name.clone(),
                 description: desc,
-                component_bytes: wasm_bytes,
+                component: Some(component),
                 limits: limits.unwrap_or(default_limits),
             })
         })

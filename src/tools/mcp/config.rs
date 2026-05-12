@@ -6,10 +6,31 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use ironclaw_common::{MAX_MCP_SERVER_NAME_LEN, McpServerName};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
+use crate::bootstrap::ironclaw_base_dir;
+use crate::tools::mcp::McpTool;
 use crate::tools::tool::ToolError;
+
+/// Transport configuration for an MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "lowercase")]
+pub enum McpTransportConfig {
+    /// HTTP/HTTPS transport (uses the `url` field on McpServerConfig).
+    Http,
+    /// Stdio transport — spawns a child process.
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+    /// Unix domain socket transport.
+    Unix { socket_path: String },
+}
 
 /// Configuration for connecting to a remote MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +40,14 @@ pub struct McpServerConfig {
 
     /// Server URL (must be HTTPS for remote servers).
     pub url: String,
+
+    /// Transport configuration. If `None`, defaults to Http using `url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<McpTransportConfig>,
+
+    /// Custom headers to include in every HTTP request.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
 
     /// OAuth configuration (if server requires authentication).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31,6 +60,13 @@ pub struct McpServerConfig {
     /// Optional description for the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Last successfully discovered MCP tool catalog.
+    ///
+    /// This lets the runtime advertise concrete latent provider actions even
+    /// while the server is currently inactive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cached_tools: Vec<McpTool>,
 }
 
 fn default_true() -> bool {
@@ -43,9 +79,51 @@ impl McpServerConfig {
         Self {
             name: name.into(),
             url: url.into(),
+            transport: None,
+            headers: HashMap::new(),
             oauth: None,
             enabled: true,
             description: None,
+            cached_tools: Vec::new(),
+        }
+    }
+
+    /// Create a new stdio transport MCP server configuration.
+    pub fn new_stdio(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            url: String::new(),
+            transport: Some(McpTransportConfig::Stdio {
+                command: command.into(),
+                args,
+                env,
+            }),
+            headers: HashMap::new(),
+            oauth: None,
+            enabled: true,
+            description: None,
+            cached_tools: Vec::new(),
+        }
+    }
+
+    /// Create a new Unix socket transport MCP server configuration.
+    pub fn new_unix(name: impl Into<String>, socket_path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: String::new(),
+            transport: Some(McpTransportConfig::Unix {
+                socket_path: socket_path.into(),
+            }),
+            headers: HashMap::new(),
+            oauth: None,
+            enabled: true,
+            description: None,
+            cached_tools: Vec::new(),
         }
     }
 
@@ -61,37 +139,126 @@ impl McpServerConfig {
         self
     }
 
+    /// Set custom headers.
+    pub fn with_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Get the effective transport type.
+    pub fn effective_transport(&self) -> EffectiveTransport<'_> {
+        match &self.transport {
+            Some(McpTransportConfig::Http) | None => EffectiveTransport::Http,
+            Some(McpTransportConfig::Stdio { command, args, env }) => {
+                EffectiveTransport::Stdio { command, args, env }
+            }
+            Some(McpTransportConfig::Unix { socket_path }) => {
+                EffectiveTransport::Unix { socket_path }
+            }
+        }
+    }
+
     /// Validate the server configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.name.is_empty() {
-            return Err(ConfigError::InvalidConfig {
-                reason: "Server name cannot be empty".to_string(),
-            });
+        // The server-name allowlist (non-empty, length cap, alphanumeric /
+        // dash / underscore only) now lives in `McpServerName::new` — see
+        // `ironclaw_common::identity`. Delegating here keeps the on-disk
+        // wire format a plain string (via `McpServerConfig.name: String`)
+        // while gating every construction path through the newtype's
+        // validation. The allowlist itself originated in #2400 as
+        // defence against shell-metacharacter injection when the name is
+        // interpolated into secret keys or tool-name prefixes.
+        McpServerName::new(&self.name).map_err(|e| ConfigError::InvalidConfig {
+            reason: e.to_string(),
+        })?;
+
+        match self.effective_transport() {
+            EffectiveTransport::Http => {
+                if self.url.is_empty() {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "Server URL cannot be empty".to_string(),
+                    });
+                }
+
+                // Remote servers must use HTTPS (localhost is allowed for development)
+                let is_localhost = is_localhost_url(&self.url);
+                if !is_localhost && !self.url.to_lowercase().starts_with("https://") {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "Remote MCP servers must use HTTPS".to_string(),
+                    });
+                }
+            }
+            EffectiveTransport::Stdio { command, .. } => {
+                if command.is_empty() {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "Stdio transport command cannot be empty".to_string(),
+                    });
+                }
+            }
+            EffectiveTransport::Unix { socket_path } => {
+                if socket_path.is_empty() {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "Unix socket path cannot be empty".to_string(),
+                    });
+                }
+            }
         }
 
-        if self.url.is_empty() {
-            return Err(ConfigError::InvalidConfig {
-                reason: "Server URL cannot be empty".to_string(),
-            });
-        }
-
-        // Remote servers must use HTTPS (localhost is allowed for development)
-        let url_lower = self.url.to_lowercase();
-        let is_localhost = url_lower.contains("localhost") || url_lower.contains("127.0.0.1");
-        if !is_localhost && !url_lower.starts_with("https://") {
-            return Err(ConfigError::InvalidConfig {
-                reason: "Remote MCP servers must use HTTPS".to_string(),
-            });
+        // Validate custom header names and values using the http crate's RFC 9110
+        // token validation (catches CRLF, spaces, colons, null bytes, etc.)
+        for (name, value) in &self.headers {
+            if name.is_empty() {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "Header name cannot be empty".to_string(),
+                });
+            }
+            if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!(
+                        "Header name '{}' is not a valid HTTP header name (RFC 9110)",
+                        name
+                    ),
+                });
+            }
+            if reqwest::header::HeaderValue::from_str(value).is_err() {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!("Header value for '{}' contains invalid characters", name),
+                });
+            }
         }
 
         Ok(())
+    }
+
+    /// Check if any custom header sets an Authorization value.
+    ///
+    /// Used to skip OAuth token injection when the user has explicitly
+    /// configured an Authorization header (e.g. for API-key-based servers).
+    pub fn has_custom_auth_header(&self) -> bool {
+        self.headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("authorization"))
     }
 
     /// Check if this server requires authentication.
     ///
     /// Returns true if OAuth is pre-configured OR if this is a remote HTTPS server
     /// (which likely supports Dynamic Client Registration even without pre-configured OAuth).
+    ///
+    /// Non-HTTP transports (stdio, unix) never require auth.
     pub fn requires_auth(&self) -> bool {
+        // Non-HTTP transports don't use HTTP auth
+        if !matches!(self.effective_transport(), EffectiveTransport::Http) {
+            return false;
+        }
+
+        // Respect explicit user-provided Authorization headers. These servers
+        // are already configured with a credential, so the runtime must not
+        // initiate OAuth or DCR on top of that.
+        if self.has_custom_auth_header() {
+            return false;
+        }
+
         if self.oauth.is_some() {
             return true;
         }
@@ -108,13 +275,45 @@ impl McpServerConfig {
     }
 
     /// Get the secret name used to store the refresh token.
+    ///
+    /// Matches the convention used by the hosted OAuth flow in
+    /// `store_oauth_tokens`: `{token_secret_name}_refresh_token`.
     pub fn refresh_token_secret_name(&self) -> String {
+        format!("{}_refresh_token", self.token_secret_name())
+    }
+
+    /// Legacy secret name for access tokens (pre-hyphen-normalization).
+    ///
+    /// Before the factory normalised server names (hyphens→underscores),
+    /// tokens were stored under the original hyphenated name.  Used as a
+    /// fallback during lookup to avoid forcing re-auth on existing users.
+    /// Returns `None` when the name contains no underscores (nothing to
+    /// reverse).
+    pub fn legacy_token_secret_name(&self) -> Option<String> {
+        let hyphenated = self.name.replace('_', "-");
+        if hyphenated == self.name {
+            return None;
+        }
+        Some(format!("mcp_{}_access_token", hyphenated))
+    }
+
+    /// Legacy secret name for refresh tokens (pre-v0.22).
+    ///
+    /// Earlier versions stored refresh tokens as `mcp_{name}_refresh_token`
+    /// instead of `{token_secret_name}_refresh_token`. Used as a fallback
+    /// during lookup to avoid forcing re-auth on existing users.
+    pub fn legacy_refresh_token_secret_name(&self) -> String {
         format!("mcp_{}_refresh_token", self.name)
     }
 
     /// Get the secret name used to store the DCR client ID.
     pub fn client_id_secret_name(&self) -> String {
         format!("mcp_{}_client_id", self.name)
+    }
+
+    /// Get the secret name used to store the DCR client secret.
+    pub fn client_secret_secret_name(&self) -> String {
+        format!("mcp_{}_client_secret", self.name)
     }
 }
 
@@ -249,17 +448,133 @@ impl From<ConfigError> for ToolError {
     }
 }
 
+/// MCP server id (`registry/mcp-servers/nearai.json` → `name`, or this if the catalog is empty).
+pub const NEARAI_MCP_SERVER_NAME: &str = "nearai";
+
+const NEARAI_MCP_REGISTRY_KEY: &str = "mcp-servers/nearai";
+
+fn derive_nearai_mcp_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{}/mcp", base)
+}
+
+pub(crate) fn nearai_mcp_server_from_env() -> Result<Option<McpServerConfig>, ConfigError> {
+    let Some(base_url) = crate::config::helpers::env_or_override("NEARAI_BASE_URL") else {
+        return Ok(None);
+    };
+    let Some(api_key) = crate::config::helpers::env_or_override("NEARAI_API_KEY") else {
+        return Ok(None);
+    };
+
+    let catalog = crate::registry::embedded::load_embedded();
+    let manifest = catalog.get(NEARAI_MCP_REGISTRY_KEY);
+    let name = manifest
+        .map(|m| m.name.as_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(NEARAI_MCP_SERVER_NAME)
+        .to_string();
+    let description = manifest
+        .and_then(|m| (!m.description.is_empty()).then_some(m.description.clone()))
+        .unwrap_or_else(|| "Use NEAR AI built-in tools like web search".to_string());
+
+    let headers = HashMap::from([("Authorization".to_string(), format!("Bearer {}", api_key))]);
+    let server = McpServerConfig::new(name, derive_nearai_mcp_url(&base_url))
+        .with_headers(headers)
+        .with_description(description);
+
+    server
+        .validate()
+        .map_err(|err| ConfigError::InvalidConfig {
+            reason: format!("invalid NEAR AI MCP bootstrap config: {}", err),
+        })?;
+
+    Ok(Some(server))
+}
+
+pub async fn bootstrap_nearai_mcp_server(
+    db: Option<&dyn crate::db::Database>,
+    user_id: &str,
+) -> Result<bool, ConfigError> {
+    let Some(server) = nearai_mcp_server_from_env()? else {
+        return Ok(false);
+    };
+
+    let mut servers = match db {
+        Some(store) => load_mcp_servers_from_db(store, user_id).await?,
+        None => load_mcp_servers().await?,
+    };
+
+    if servers.get(&server.name).is_some() {
+        return Ok(false);
+    }
+    servers.upsert(server);
+
+    match db {
+        Some(store) => save_mcp_servers_to_db(store, user_id, &servers).await?,
+        None => save_mcp_servers(&servers).await?,
+    }
+    Ok(true)
+}
+
+/// Load MCP servers after bootstrapping NEAR AI MCP server (when env vars are set).
+pub async fn load_mcp_servers_ready(
+    db: Option<&dyn crate::db::Database>,
+    user_id: &str,
+) -> Result<McpServersFile, ConfigError> {
+    if let Err(e) = bootstrap_nearai_mcp_server(db, user_id).await {
+        tracing::warn!("Failed to bootstrap NEAR AI MCP server: {}", e);
+    }
+    match db {
+        Some(store) => load_mcp_servers_from_db(store, user_id).await,
+        None => load_mcp_servers().await,
+    }
+}
+
 /// Get the default MCP servers configuration path.
 pub fn default_config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ironclaw")
-        .join("mcp-servers.json")
+    ironclaw_base_dir().join("mcp-servers.json")
 }
 
 /// Load MCP server configurations from the default location.
 pub async fn load_mcp_servers() -> Result<McpServersFile, ConfigError> {
     load_mcp_servers_from(default_config_path()).await
+}
+
+/// In-place migrate a legacy server name whose length exceeds the
+/// [`MAX_MCP_SERVER_NAME_LEN`] cap introduced with the `McpServerName`
+/// newtype.
+///
+/// Before the newtype landed, `validate()` only enforced non-empty +
+/// `[A-Za-z0-9_-]` — there was no length bound. Delegating to
+/// `McpServerName::new` added a 64-byte cap that would otherwise silently
+/// drop legacy persisted configs via the `retain(...)` guard in the load
+/// paths. Truncating here keeps the entry usable while still bringing it
+/// within the new invariant on the next save.
+///
+/// Truncation is char-boundary safe: the loaded string may contain
+/// arbitrary UTF-8 even though the allowlist ultimately rejects non-ASCII,
+/// because this runs *before* `validate()`.
+fn migrate_legacy_server_name(name: &mut String) {
+    if name.len() <= MAX_MCP_SERVER_NAME_LEN {
+        return;
+    }
+    let original_len = name.len();
+    let mut end = MAX_MCP_SERVER_NAME_LEN;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = name[..end].to_string();
+    tracing::warn!(
+        original_name = %name,
+        truncated_name = %truncated,
+        original_len,
+        new_len = end,
+        max = MAX_MCP_SERVER_NAME_LEN,
+        "Truncating legacy MCP server name that exceeded the {MAX_MCP_SERVER_NAME_LEN}-byte cap \
+         introduced with McpServerName; re-save to persist the shorter form"
+    );
+    *name = truncated;
 }
 
 /// Load MCP server configurations from a specific path.
@@ -271,7 +586,24 @@ pub async fn load_mcp_servers_from(path: impl AsRef<Path>) -> Result<McpServersF
     }
 
     let content = fs::read_to_string(path).await?;
-    let config: McpServersFile = serde_json::from_str(&content)?;
+    let mut config: McpServersFile = serde_json::from_str(&content)?;
+
+    // Validate every server on load. Invalid entries are skipped with a
+    // warning instead of failing the entire config — this prevents legacy
+    // names (e.g. "My Server") from disabling all MCP integrations after
+    // an upgrade that tightened validation.
+    config.servers.retain_mut(|server| {
+        migrate_legacy_server_name(&mut server.name);
+        if let Err(e) = server.validate() {
+            tracing::warn!(
+                server_name = %server.name,
+                "Skipping MCP server with invalid config: {e}"
+            );
+            false
+        } else {
+            true
+        }
+    });
 
     Ok(config)
 }
@@ -294,7 +626,12 @@ pub async fn save_mcp_servers_to(
     }
 
     let content = serde_json::to_string_pretty(config)?;
-    fs::write(path, content).await?;
+
+    // Write to a temporary file first, then atomically rename to avoid
+    // corrupting the config if the process crashes during the write.
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, content).await?;
+    fs::rename(&tmp_path, path).await?;
 
     Ok(())
 }
@@ -348,7 +685,22 @@ pub async fn load_mcp_servers_from_db(
 ) -> Result<McpServersFile, ConfigError> {
     match store.get_setting(user_id, "mcp_servers").await {
         Ok(Some(value)) => {
-            let config: McpServersFile = serde_json::from_value(value)?;
+            let mut config: McpServersFile = serde_json::from_value(value)?;
+            // Validate every server on load. Invalid entries are skipped
+            // with a warning to avoid breaking all MCP integrations when
+            // legacy names don't pass tightened validation.
+            config.servers.retain_mut(|server| {
+                migrate_legacy_server_name(&mut server.name);
+                if let Err(e) = server.validate() {
+                    tracing::warn!(
+                        server_name = %server.name,
+                        "Skipping MCP server with invalid DB config: {e}"
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
             Ok(config)
         }
         Ok(None) => {
@@ -361,6 +713,45 @@ pub async fn load_mcp_servers_from_db(
                 e
             );
             load_mcp_servers().await
+        }
+    }
+}
+
+/// Load the MCP master config from the database and serialize it as a
+/// `serde_json::Value` ready to hand to the orchestrator's per-job MCP mount.
+///
+/// Returns `Ok(None)` when the user has no servers configured (so the caller
+/// can skip the per-job mount entirely instead of mounting an empty config),
+/// and degrades any I/O or serialization failure into `Ok(None)` after a
+/// `tracing::warn!` — the per-job MCP mount is best-effort and the caller
+/// should keep going rather than failing the whole job.
+///
+/// This is the shared implementation for callers that need to thread the
+/// master config through `JobCreationParams::master_mcp_config`. Centralizing
+/// it ensures the load + filter + serialize sequence stays consistent across
+/// the job tool, the gateway restart handler, and any future call site.
+pub async fn load_master_mcp_config_value(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+) -> Option<serde_json::Value> {
+    match load_mcp_servers_from_db(store, user_id).await {
+        Ok(file) if !file.servers.is_empty() => match serde_json::to_value(&file) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to serialize MCP master config; per-job MCP mount will be skipped"
+                );
+                None
+            }
+        },
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to load MCP master config from DB; per-job MCP mount will be skipped"
+            );
+            None
         }
     }
 }
@@ -416,7 +807,7 @@ pub async fn remove_mcp_server_db(
 ///
 /// Uses `url::Url` for proper parsing so edge cases (IPv6, userinfo, ports)
 /// are handled correctly without manual string splitting.
-fn is_localhost_url(url: &str) -> bool {
+pub(crate) fn is_localhost_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
@@ -426,6 +817,20 @@ fn is_localhost_url(url: &str) -> bool {
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
     }
+}
+
+/// Resolved transport type (borrows from config).
+#[derive(Debug)]
+pub enum EffectiveTransport<'a> {
+    Http,
+    Stdio {
+        command: &'a str,
+        args: &'a [String],
+        env: &'a HashMap<String, String>,
+    },
+    Unix {
+        socket_path: &'a str,
+    },
 }
 
 #[cfg(test)]
@@ -547,13 +952,58 @@ mod tests {
         assert!(config.servers.is_empty());
     }
 
+    #[tokio::test]
+    async fn test_load_skips_corrupted_headers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp-servers.json");
+
+        // Write a config with an invalid header name directly to disk,
+        // bypassing the add_mcp_server() validation path.
+        let corrupted = serde_json::json!({
+            "servers": [
+                {
+                    "name": "bad-server",
+                    "url": "https://mcp.example.com",
+                    "enabled": true,
+                    "headers": { "X Bad": "value" }
+                },
+                {
+                    "name": "good-server",
+                    "url": "https://mcp.good.com",
+                    "enabled": true,
+                    "headers": {}
+                }
+            ]
+        });
+        tokio::fs::write(&path, corrupted.to_string())
+            .await
+            .unwrap();
+
+        // Invalid entries are skipped, valid ones are kept
+        let result = load_mcp_servers_from(&path).await.unwrap();
+        assert_eq!(result.servers.len(), 1);
+        assert_eq!(result.servers[0].name, "good-server");
+    }
+
     #[test]
     fn test_token_secret_names() {
         let config = McpServerConfig::new("notion", "https://mcp.notion.com");
         assert_eq!(config.token_secret_name(), "mcp_notion_access_token");
+        // Refresh token name follows the hosted OAuth convention:
+        // {token_secret_name}_refresh_token
         assert_eq!(
             config.refresh_token_secret_name(),
+            "mcp_notion_access_token_refresh_token"
+        );
+        // Legacy name used before v0.22 — fallback lookup prevents forced re-auth
+        assert_eq!(
+            config.legacy_refresh_token_secret_name(),
             "mcp_notion_refresh_token"
+        );
+        assert_eq!(config.client_id_secret_name(), "mcp_notion_client_id");
+        assert_eq!(
+            config.client_secret_secret_name(),
+            "mcp_notion_client_secret"
         );
     }
 
@@ -594,5 +1044,722 @@ mod tests {
         // they wouldn't trigger HTTPS auth detection
         let config = McpServerConfig::new("bad", "http://mcp.example.com");
         assert!(!config.requires_auth());
+    }
+
+    #[test]
+    fn test_stdio_config_creation() {
+        let env = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        let config = McpServerConfig::new_stdio(
+            "my-server",
+            "npx",
+            vec!["-y".to_string(), "@modelcontextprotocol/server".to_string()],
+            env.clone(),
+        );
+
+        assert_eq!(config.name, "my-server");
+        assert!(config.url.is_empty());
+        assert!(config.enabled);
+        assert!(config.oauth.is_none());
+        assert!(config.headers.is_empty());
+
+        match &config.transport {
+            Some(McpTransportConfig::Stdio {
+                command,
+                args,
+                env: e,
+            }) => {
+                assert_eq!(command, "npx");
+                assert_eq!(
+                    args,
+                    &["-y".to_string(), "@modelcontextprotocol/server".to_string()]
+                );
+                assert_eq!(e, &env);
+            }
+            other => panic!("Expected Stdio transport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unix_config_creation() {
+        let config = McpServerConfig::new_unix("local-server", "/tmp/mcp.sock");
+
+        assert_eq!(config.name, "local-server");
+        assert!(config.url.is_empty());
+        assert!(config.enabled);
+
+        match &config.transport {
+            Some(McpTransportConfig::Unix { socket_path }) => {
+                assert_eq!(socket_path, "/tmp/mcp.sock");
+            }
+            other => panic!("Expected Unix transport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stdio_validation() {
+        // Valid stdio config
+        let config = McpServerConfig::new_stdio("server", "npx", vec![], HashMap::new());
+        assert!(config.validate().is_ok());
+
+        // Invalid: empty command
+        let config = McpServerConfig::new_stdio("server", "", vec![], HashMap::new());
+        assert!(config.validate().is_err());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("command"),
+            "Error should mention command: {}",
+            err
+        );
+
+        // Invalid: empty name
+        let config = McpServerConfig::new_stdio("", "npx", vec![], HashMap::new());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_unix_validation() {
+        // Valid unix config
+        let config = McpServerConfig::new_unix("server", "/tmp/mcp.sock");
+        assert!(config.validate().is_ok());
+
+        // Invalid: empty socket path
+        let config = McpServerConfig::new_unix("server", "");
+        assert!(config.validate().is_err());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("socket"),
+            "Error should mention socket: {}",
+            err
+        );
+
+        // Invalid: empty name
+        let config = McpServerConfig::new_unix("", "/tmp/mcp.sock");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_requires_auth_stdio_never() {
+        // Stdio transport should never require auth, even with OAuth configured
+        let mut config = McpServerConfig::new_stdio("server", "npx", vec![], HashMap::new());
+        assert!(!config.requires_auth());
+
+        // Even if OAuth is set, stdio doesn't use HTTP auth
+        config.oauth = Some(OAuthConfig::new("client-123"));
+        assert!(!config.requires_auth());
+    }
+
+    #[test]
+    fn test_requires_auth_unix_never() {
+        // Unix transport should never require auth
+        let mut config = McpServerConfig::new_unix("server", "/tmp/mcp.sock");
+        assert!(!config.requires_auth());
+
+        config.oauth = Some(OAuthConfig::new("client-123"));
+        assert!(!config.requires_auth());
+    }
+
+    #[test]
+    fn test_header_crlf_injection_rejected() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Good".to_string(), "safe".to_string());
+        headers.insert("X-Bad\r\nInjected: true".to_string(), "value".to_string());
+
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("not a valid HTTP header name"),
+            "Expected RFC 9110 error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_header_value_crlf_injection_rejected() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "X-Header".to_string(),
+            "value\r\nInjected: true".to_string(),
+        );
+
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("invalid characters"),
+            "Expected invalid characters error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_header_name_with_space_rejected() {
+        let headers = HashMap::from([("X Bad".to_string(), "value".to_string())]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_header_name_with_colon_rejected() {
+        let headers = HashMap::from([("X:Bad".to_string(), "value".to_string())]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_header_name_with_null_byte_rejected() {
+        let headers = HashMap::from([("X-Bad\0".to_string(), "value".to_string())]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_header_empty_name_rejected() {
+        let mut headers = HashMap::new();
+        headers.insert(String::new(), "value".to_string());
+
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("empty"),
+            "Expected empty name error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_has_custom_auth_header_case_insensitive() {
+        let headers = HashMap::from([("authorization".to_string(), "Bearer token".to_string())]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        assert!(config.has_custom_auth_header());
+
+        let headers = HashMap::from([("AUTHORIZATION".to_string(), "Bearer token".to_string())]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        assert!(config.has_custom_auth_header());
+
+        let headers = HashMap::from([("X-Api-Key".to_string(), "key".to_string())]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        assert!(!config.has_custom_auth_header());
+    }
+
+    #[test]
+    fn test_requires_auth_remote_https_without_authorization_header() {
+        let config = McpServerConfig::new("server", "https://mcp.example.com");
+        assert!(
+            config.requires_auth(),
+            "remote HTTPS MCP servers without explicit auth should still require auth handling"
+        );
+    }
+
+    #[test]
+    fn test_requires_auth_skips_remote_https_when_authorization_header_present() {
+        let headers = HashMap::from([("Authorization".to_string(), "Bearer sk-test".to_string())]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
+        assert!(
+            !config.requires_auth(),
+            "user-provided Authorization header must suppress OAuth/DCR auth handling"
+        );
+    }
+
+    #[test]
+    fn test_requires_auth_skips_oauth_when_authorization_header_present_case_insensitive() {
+        let headers = HashMap::from([("AUTHORIZATION".to_string(), "Bearer sk-test".to_string())]);
+        let config = McpServerConfig::new("server", "https://mcp.example.com")
+            .with_headers(headers)
+            .with_oauth(OAuthConfig::new("client-id"));
+        assert!(
+            !config.requires_auth(),
+            "Authorization header should win even when OAuth metadata is present"
+        );
+    }
+
+    #[test]
+    fn test_custom_headers() {
+        let headers = HashMap::from([
+            ("X-Api-Key".to_string(), "secret".to_string()),
+            ("Authorization".to_string(), "Bearer token".to_string()),
+        ]);
+        let config =
+            McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers.clone());
+
+        assert_eq!(config.headers, headers);
+        assert_eq!(config.headers.get("X-Api-Key").unwrap(), "secret");
+    }
+
+    #[test]
+    fn test_transport_config_serde_http() {
+        let transport = McpTransportConfig::Http;
+        let json = serde_json::to_string(&transport).unwrap();
+        assert!(json.contains("\"transport\":\"http\""));
+
+        let parsed: McpTransportConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, McpTransportConfig::Http));
+    }
+
+    #[test]
+    fn test_transport_config_serde_stdio() {
+        let transport = McpTransportConfig::Stdio {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "server".to_string()],
+            env: HashMap::from([("KEY".to_string(), "val".to_string())]),
+        };
+        let json = serde_json::to_string(&transport).unwrap();
+        assert!(json.contains("\"transport\":\"stdio\""));
+        assert!(json.contains("\"command\":\"npx\""));
+
+        let parsed: McpTransportConfig = serde_json::from_str(&json).unwrap();
+        match parsed {
+            McpTransportConfig::Stdio { command, args, env } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args, vec!["-y".to_string(), "server".to_string()]);
+                assert_eq!(env.get("KEY").unwrap(), "val");
+            }
+            other => panic!("Expected Stdio, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_transport_config_serde_unix() {
+        let transport = McpTransportConfig::Unix {
+            socket_path: "/tmp/mcp.sock".to_string(),
+        };
+        let json = serde_json::to_string(&transport).unwrap();
+        assert!(json.contains("\"transport\":\"unix\""));
+        assert!(json.contains("\"socket_path\":\"/tmp/mcp.sock\""));
+
+        let parsed: McpTransportConfig = serde_json::from_str(&json).unwrap();
+        match parsed {
+            McpTransportConfig::Unix { socket_path } => {
+                assert_eq!(socket_path, "/tmp/mcp.sock");
+            }
+            other => panic!("Expected Unix, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_backward_compat_no_transport_field() {
+        // Existing configs without transport field should still deserialize
+        let json = r#"{
+            "name": "notion",
+            "url": "https://mcp.notion.com",
+            "enabled": true
+        }"#;
+        let config: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.name, "notion");
+        assert_eq!(config.url, "https://mcp.notion.com");
+        assert!(config.transport.is_none());
+        assert!(config.headers.is_empty());
+        assert!(matches!(
+            config.effective_transport(),
+            EffectiveTransport::Http
+        ));
+    }
+
+    #[test]
+    fn test_config_roundtrip_with_transport() {
+        // Test full roundtrip with stdio transport
+        let config = McpServerConfig::new_stdio(
+            "test-server",
+            "node",
+            vec!["server.js".to_string()],
+            HashMap::from([("NODE_ENV".to_string(), "production".to_string())]),
+        )
+        .with_description("A test server");
+
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let parsed: McpServerConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.name, "test-server");
+        assert!(parsed.url.is_empty());
+        assert_eq!(parsed.description.as_deref(), Some("A test server"));
+
+        match &parsed.transport {
+            Some(McpTransportConfig::Stdio { command, args, env }) => {
+                assert_eq!(command, "node");
+                assert_eq!(args, &["server.js".to_string()]);
+                assert_eq!(env.get("NODE_ENV").unwrap(), "production");
+            }
+            other => panic!("Expected Stdio transport, got {:?}", other),
+        }
+
+        // Test full roundtrip with unix transport
+        let config = McpServerConfig::new_unix("unix-server", "/var/run/mcp.sock");
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let parsed: McpServerConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.name, "unix-server");
+        match &parsed.transport {
+            Some(McpTransportConfig::Unix { socket_path }) => {
+                assert_eq!(socket_path, "/var/run/mcp.sock");
+            }
+            other => panic!("Expected Unix transport, got {:?}", other),
+        }
+
+        // Test roundtrip with HTTP + headers
+        let headers = HashMap::from([("X-Custom".to_string(), "value".to_string())]);
+        let config =
+            McpServerConfig::new("http-server", "https://mcp.example.com").with_headers(headers);
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let parsed: McpServerConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.name, "http-server");
+        assert!(parsed.transport.is_none());
+        assert_eq!(parsed.headers.get("X-Custom").unwrap(), "value");
+    }
+
+    #[test]
+    fn test_config_roundtrip_preserves_cached_tools() {
+        let mut config = McpServerConfig::new("notion", "https://mcp.notion.com");
+        config.cached_tools = vec![crate::tools::mcp::McpTool {
+            name: "search".to_string(),
+            description: "Search Notion content".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                }
+            }),
+            annotations: None,
+        }];
+
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let parsed: McpServerConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.cached_tools.len(), 1);
+        assert_eq!(parsed.cached_tools[0].name, "search");
+        assert_eq!(parsed.cached_tools[0].description, "Search Notion content");
+        assert_eq!(
+            parsed.cached_tools[0].input_schema["properties"]["query"]["type"],
+            "string"
+        );
+    }
+
+    // --- Issue 3 regression: is_localhost_url rejects attacker subdomains ---
+
+    #[test]
+    fn test_is_localhost_url_rejects_attacker_subdomain() {
+        // Before the fix, url.contains("localhost") matched this.
+        assert!(
+            !is_localhost_url("http://evil.localhost.attacker.com:8080/mcp"),
+            "attacker subdomain containing 'localhost' must not be treated as local"
+        );
+    }
+
+    #[test]
+    fn test_is_localhost_url_accepts_real_localhost() {
+        assert!(is_localhost_url("http://localhost:8080/mcp"));
+        assert!(is_localhost_url("https://localhost/path"));
+    }
+
+    #[test]
+    fn test_is_localhost_url_accepts_loopback_ip() {
+        assert!(is_localhost_url("http://127.0.0.1:3000"));
+        assert!(is_localhost_url("http://[::1]:3000"));
+    }
+
+    #[test]
+    fn test_is_localhost_url_rejects_remote() {
+        assert!(!is_localhost_url("https://mcp.example.com"));
+        assert!(!is_localhost_url("http://192.168.1.1:8080"));
+    }
+
+    #[test]
+    fn test_derive_nearai_mcp_url_strips_v1_and_trailing_slash() {
+        assert_eq!(
+            derive_nearai_mcp_url("https://cloud-api.near.ai/v1"),
+            "https://cloud-api.near.ai/mcp"
+        );
+        assert_eq!(
+            derive_nearai_mcp_url("https://cloud-api.near.ai/v1/"),
+            "https://cloud-api.near.ai/mcp"
+        );
+        assert_eq!(
+            derive_nearai_mcp_url("https://private.near.ai"),
+            "https://private.near.ai/mcp"
+        );
+    }
+
+    #[test]
+    fn test_nearai_mcp_server_from_env_builds_standard_server() {
+        let _guard = crate::config::helpers::lock_env();
+        // SAFETY: Tests serialize env access with lock_env().
+        unsafe {
+            std::env::set_var("NEARAI_BASE_URL", "https://cloud-api.near.ai/v1/");
+            std::env::set_var("NEARAI_API_KEY", "test-nearai-key");
+        }
+
+        let server = nearai_mcp_server_from_env()
+            .expect("env-based NEAR AI MCP config should parse")
+            .expect("server from env");
+        let catalog = crate::registry::embedded::load_embedded();
+        let expected_description = catalog
+            .get(super::NEARAI_MCP_REGISTRY_KEY)
+            .and_then(|m| (!m.description.is_empty()).then_some(m.description.clone()))
+            .unwrap_or_else(|| "Use NEAR AI built-in tools like web search".to_string());
+        assert_eq!(server.name, NEARAI_MCP_SERVER_NAME);
+        assert_eq!(
+            server.description.as_deref(),
+            Some(expected_description.as_str())
+        );
+        assert_eq!(server.url, "https://cloud-api.near.ai/mcp");
+        assert_eq!(
+            server.headers.get("Authorization").map(String::as_str),
+            Some("Bearer test-nearai-key")
+        );
+
+        // SAFETY: Tests serialize env access with lock_env().
+        unsafe {
+            std::env::remove_var("NEARAI_BASE_URL");
+            std::env::remove_var("NEARAI_API_KEY");
+        }
+    }
+
+    #[test]
+    fn test_server_name_valid_characters_accepted() {
+        // Alphanumeric, dashes, and underscores are all valid
+        for name in ["notion", "my-server", "my_server", "MCP-1"] {
+            let config = McpServerConfig::new(name, "https://mcp.example.com");
+            assert!(
+                config.validate().is_ok(),
+                "Name '{}' should be accepted",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_server_name_shell_metacharacters_rejected() {
+        let dangerous_names = [
+            "server; rm -rf /",
+            "server$(whoami)",
+            "server`id`",
+            "server|cat /etc/passwd",
+            "server&bg",
+            "server>out",
+            "server<in",
+            "name with spaces",
+        ];
+        for name in dangerous_names {
+            let config = McpServerConfig::new(name, "https://mcp.example.com");
+            assert!(
+                config.validate().is_err(),
+                "Name '{}' should be rejected",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_server_name_path_separators_rejected() {
+        for name in ["../etc/passwd", "server/name", "server\\name"] {
+            let config = McpServerConfig::new(name, "https://mcp.example.com");
+            assert!(
+                config.validate().is_err(),
+                "Name '{}' should be rejected",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_server_name_null_byte_rejected() {
+        let config = McpServerConfig::new("server\0name", "https://mcp.example.com");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_server_name_dot_rejected() {
+        // Dots are rejected because server names are used as tool name
+        // prefixes and LLM providers require ^[a-zA-Z0-9_-]+$
+        let config = McpServerConfig::new("my.server", "https://mcp.example.com");
+        assert!(
+            config.validate().is_err(),
+            "Dot in server name should be rejected"
+        );
+    }
+
+    /// Regression for PR nearai/ironclaw#2681 review comment 3110617080.
+    ///
+    /// Before the `McpServerName` newtype landed, `McpServerConfig::validate()`
+    /// had no length cap. Delegating validation to `McpServerName::new` added
+    /// a 64-byte cap, which would have silently dropped legacy persisted
+    /// configs via the `retain(...)` guard in `load_mcp_servers_from*`. The
+    /// load path now truncates overlong legacy names at a char boundary and
+    /// keeps the entry usable instead of dropping it.
+    #[tokio::test]
+    async fn test_load_truncates_legacy_overlong_server_names() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp-servers.json");
+
+        // 100-byte valid-char name — passes the old empty+allowlist check
+        // but exceeds MAX_MCP_SERVER_NAME_LEN (64).
+        let long_name = "a".repeat(100);
+        let mixed = serde_json::json!({
+            "servers": [
+                {
+                    "name": long_name,
+                    "url": "https://mcp.good.com",
+                    "enabled": true,
+                    "headers": {}
+                },
+                {
+                    "name": "short-server",
+                    "url": "https://mcp.short.com",
+                    "enabled": true,
+                    "headers": {}
+                }
+            ]
+        });
+        tokio::fs::write(&path, mixed.to_string()).await.unwrap();
+
+        let result = load_mcp_servers_from(&path).await.unwrap();
+        assert_eq!(
+            result.servers.len(),
+            2,
+            "overlong legacy name must be migrated in place, not silently dropped"
+        );
+        let migrated = result
+            .servers
+            .iter()
+            .find(|s| s.name.starts_with('a'))
+            .expect("long-name server retained after migration");
+        assert!(
+            migrated.name.len() <= MAX_MCP_SERVER_NAME_LEN,
+            "migrated name must be within the new cap, got {} bytes",
+            migrated.name.len()
+        );
+        assert_eq!(
+            migrated.name.len(),
+            MAX_MCP_SERVER_NAME_LEN,
+            "ASCII-only overlong name should truncate to exactly the cap"
+        );
+    }
+
+    /// Char-boundary safety: an overlong name whose byte 64 falls in the
+    /// middle of a multi-byte UTF-8 sequence must not panic and must land
+    /// on a valid char boundary. The truncated name will then typically
+    /// fail the allowlist (non-ASCII) and be dropped by `retain`, which
+    /// is the same end state as before this PR — the guarantee here is
+    /// *no panic*, not acceptance.
+    #[tokio::test]
+    async fn test_load_truncation_is_char_boundary_safe() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp-servers.json");
+
+        // 63 ASCII bytes + multi-byte character that straddles byte 64.
+        let mut name = "a".repeat(63);
+        name.push('é'); // 2 bytes; now 65 bytes total, byte 64 is mid-char
+        name.push('é'); // extend further to ensure we're over the cap
+        let payload = serde_json::json!({
+            "servers": [
+                {
+                    "name": name,
+                    "url": "https://mcp.good.com",
+                    "enabled": true,
+                    "headers": {}
+                }
+            ]
+        });
+        tokio::fs::write(&path, payload.to_string()).await.unwrap();
+
+        // Must not panic during load (would have with naive `&name[..64]`).
+        let result = load_mcp_servers_from(&path).await.unwrap();
+        for s in &result.servers {
+            assert!(
+                s.name.is_char_boundary(s.name.len()),
+                "truncated name must sit on a valid UTF-8 boundary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_skips_invalid_server_names() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp-servers.json");
+
+        // Write a config with one invalid name and one valid name
+        let mixed = serde_json::json!({
+            "servers": [
+                {
+                    "name": "bad;server",
+                    "url": "https://mcp.evil.com",
+                    "enabled": true,
+                    "headers": {}
+                },
+                {
+                    "name": "good-server",
+                    "url": "https://mcp.good.com",
+                    "enabled": true,
+                    "headers": {}
+                }
+            ]
+        });
+        tokio::fs::write(&path, mixed.to_string()).await.unwrap();
+
+        // Invalid entry is skipped, valid one is kept
+        let result = load_mcp_servers_from(&path).await.unwrap();
+        assert_eq!(result.servers.len(), 1);
+        assert_eq!(result.servers[0].name, "good-server");
+    }
+
+    #[tokio::test]
+    async fn test_load_preserves_schema_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp-servers.json");
+
+        // Write a config with schema_version explicitly set
+        let config = serde_json::json!({
+            "servers": [
+                {
+                    "name": "good-server",
+                    "url": "https://mcp.good.com",
+                    "enabled": true,
+                    "headers": {}
+                },
+                {
+                    "name": "bad;server",
+                    "url": "https://mcp.evil.com",
+                    "enabled": true,
+                    "headers": {}
+                }
+            ],
+            "schema_version": 1
+        });
+        tokio::fs::write(&path, config.to_string()).await.unwrap();
+
+        // Filtering invalid servers must preserve the original schema_version
+        let result = load_mcp_servers_from(&path).await.unwrap();
+        assert_eq!(result.servers.len(), 1);
+        assert_eq!(
+            result.schema_version, 1,
+            "schema_version must be preserved when filtering invalid servers"
+        );
+    }
+
+    #[test]
+    fn test_nearai_mcp_server_from_env_reports_invalid_config() {
+        let _guard = crate::config::helpers::lock_env();
+        // SAFETY: Tests serialize env access with lock_env().
+        unsafe {
+            std::env::set_var("NEARAI_BASE_URL", "not a url");
+            std::env::set_var("NEARAI_API_KEY", "test-nearai-key");
+        }
+
+        let err = nearai_mcp_server_from_env().expect_err("invalid env should error");
+        assert!(
+            matches!(err, ConfigError::InvalidConfig { .. }),
+            "expected invalid config error, got {err:?}"
+        );
+
+        // SAFETY: Tests serialize env access with lock_env().
+        unsafe {
+            std::env::remove_var("NEARAI_BASE_URL");
+            std::env::remove_var("NEARAI_API_KEY");
+        }
     }
 }

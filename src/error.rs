@@ -48,6 +48,9 @@ pub enum Error {
 
     #[error("Worker error: {0}")]
     Worker(#[from] WorkerError),
+
+    #[error("Routine error: {0}")]
+    Routine(#[from] RoutineError),
 }
 
 /// Configuration-related errors.
@@ -67,6 +70,19 @@ pub enum ConfigError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<ironclaw_llm::LlmConfigError> for ConfigError {
+    fn from(err: ironclaw_llm::LlmConfigError) -> Self {
+        match err {
+            ironclaw_llm::LlmConfigError::MissingRequired { key, hint } => {
+                Self::MissingRequired { key, hint }
+            }
+            ironclaw_llm::LlmConfigError::InvalidValue { key, message } => {
+                Self::InvalidValue { key, message }
+            }
+        }
+    }
 }
 
 /// Database-related errors.
@@ -119,6 +135,9 @@ pub enum ChannelError {
     #[error("Failed to send response on channel {name}: {reason}")]
     SendFailed { name: String, reason: String },
 
+    #[error("Channel {name} is missing a routing target: {reason}")]
+    MissingRoutingTarget { name: String, reason: String },
+
     #[error("Invalid message format: {0}")]
     InvalidMessage(String),
 
@@ -135,45 +154,10 @@ pub enum ChannelError {
     HealthCheckFailed { name: String },
 }
 
-/// LLM provider errors.
-#[derive(Debug, thiserror::Error)]
-pub enum LlmError {
-    #[error("Provider {provider} request failed: {reason}")]
-    RequestFailed { provider: String, reason: String },
-
-    #[error("Provider {provider} rate limited, retry after {retry_after:?}")]
-    RateLimited {
-        provider: String,
-        retry_after: Option<Duration>,
-    },
-
-    #[error("Invalid response from {provider}: {reason}")]
-    InvalidResponse { provider: String, reason: String },
-
-    #[error("Context length exceeded: {used} tokens used, {limit} allowed")]
-    ContextLengthExceeded { used: usize, limit: usize },
-
-    #[error("Model {model} not available on provider {provider}")]
-    ModelNotAvailable { provider: String, model: String },
-
-    #[error("Authentication failed for provider {provider}")]
-    AuthFailed { provider: String },
-
-    #[error("Session expired for provider {provider}")]
-    SessionExpired { provider: String },
-
-    #[error("Session renewal failed for provider {provider}: {reason}")]
-    SessionRenewalFailed { provider: String, reason: String },
-
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
-
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-}
+// LlmError lives in `ironclaw_llm`; re-exported here so existing
+// `crate::error::LlmError` callers and the `Error::Llm(#[from] LlmError)`
+// variant keep working without churn.
+pub use ironclaw_llm::LlmError;
 
 /// Tool execution errors.
 #[derive(Debug, thiserror::Error)]
@@ -198,6 +182,15 @@ pub enum ToolError {
 
     #[error("Tool {name} requires authentication")]
     AuthRequired { name: String },
+
+    #[error("Tool {name} is not available for autonomous execution: {reason}")]
+    AutonomousUnavailable { name: String, reason: String },
+
+    #[error("Tool {name} is rate limited, retry after {retry_after:?}")]
+    RateLimited {
+        name: String,
+        retry_after: Option<Duration>,
+    },
 
     #[error("Tool builder failed: {0}")]
     BuilderFailed(String),
@@ -305,6 +298,9 @@ pub enum WorkspaceError {
     #[error("Document not found: {doc_type} for user {user_id}")]
     DocumentNotFound { doc_type: String, user_id: String },
 
+    // TODO: SearchFailed is used as a catch-all for metadata, versioning, and
+    // connection errors across both backends. A cleanup pass should introduce
+    // more specific variants (e.g. MetadataError, VersioningError).
     #[error("Search failed: {reason}")]
     SearchFailed { reason: String },
 
@@ -339,17 +335,14 @@ pub enum OrchestratorError {
     #[error("Container for job {job_id} is in unexpected state: {state}")]
     InvalidContainerState { job_id: Uuid, state: String },
 
-    #[error("Worker authentication failed: {reason}")]
-    AuthFailed { reason: String },
-
     #[error("Internal API error: {reason}")]
     ApiError { reason: String },
 
     #[error("Docker error: {reason}")]
     Docker { reason: String },
 
-    #[error("Job {job_id} timed out in container")]
-    ContainerTimeout { job_id: Uuid },
+    #[error("{mode} mode is not enabled")]
+    ModeDisabled { mode: String },
 }
 
 /// Worker errors (container-side execution).
@@ -374,5 +367,306 @@ pub enum WorkerError {
     MissingToken,
 }
 
+/// Routine-related errors.
+#[derive(Debug, thiserror::Error)]
+pub enum RoutineError {
+    #[error("Unknown trigger type: {trigger_type}")]
+    UnknownTriggerType { trigger_type: String },
+
+    #[error("Unknown action type: {action_type}")]
+    UnknownActionType { action_type: String },
+
+    #[error("Missing field in {context}: {field}")]
+    MissingField { context: String, field: String },
+
+    #[error("Invalid cron expression: {reason}")]
+    InvalidCron { reason: String },
+
+    #[error("Unknown run status: {status}")]
+    UnknownRunStatus { status: String },
+
+    #[error("Routine {name} is disabled")]
+    Disabled { name: String },
+
+    #[error("Routine not found: {id}")]
+    NotFound { id: Uuid },
+
+    #[error("Not authorized to trigger routine {id}")]
+    NotAuthorized { id: Uuid },
+
+    #[error("Routine {name} is in cooldown period")]
+    Cooldown { name: String },
+
+    #[error("Routine {name} at max concurrent runs")]
+    MaxConcurrent { name: String },
+
+    #[error("Database error: {reason}")]
+    Database { reason: String },
+
+    #[error("LLM call failed: {reason}")]
+    LlmFailed {
+        reason: String,
+        /// Partial token count consumed before the failure (if any).
+        /// Used to accumulate usage across retry attempts.
+        partial_tokens: Option<i32>,
+        /// Whether the underlying LLM error was classified as retryable.
+        /// Set at the `LlmError` → `RoutineError` conversion site using
+        /// `ironclaw_llm::retry::is_retryable()`, avoiding fragile substring
+        /// matching on the stringified reason.
+        retryable: bool,
+    },
+
+    #[error("Failed to dispatch full job: {reason}")]
+    JobDispatchFailed { reason: String },
+
+    #[error("LLM returned empty content")]
+    EmptyResponse {
+        /// Tokens consumed by the call that produced the empty response.
+        partial_tokens: Option<i32>,
+    },
+
+    #[error("LLM response truncated (finish_reason=length) with no content")]
+    TruncatedResponse {
+        /// Tokens consumed by the call that produced the truncated response.
+        partial_tokens: Option<i32>,
+    },
+}
+
+impl RoutineError {
+    /// Whether this error is transient and worth retrying with backoff.
+    ///
+    /// Retryable: LLM failures where the underlying `LlmError` was classified
+    /// as retryable by `ironclaw_llm::retry::is_retryable()`, empty responses,
+    /// and truncated responses.
+    /// Non-retryable: configuration errors, authorization, resource limits,
+    /// DB errors, and LLM failures caused by auth/content-policy/context-length.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            RoutineError::LlmFailed { retryable, .. } => *retryable,
+            RoutineError::EmptyResponse { .. } | RoutineError::TruncatedResponse { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 /// Result type alias for the agent.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_error_display() {
+        let err = ConfigError::MissingEnvVar("DATABASE_URL".to_string());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DATABASE_URL"),
+            "Should mention the variable name: {msg}"
+        );
+
+        let err = ConfigError::MissingRequired {
+            key: "llm.model".to_string(),
+            hint: "Set LLM_MODEL env var".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("llm.model"), "Should mention the key: {msg}");
+        assert!(
+            msg.contains("Set LLM_MODEL"),
+            "Should include the hint: {msg}"
+        );
+
+        let err = ConfigError::InvalidValue {
+            key: "port".to_string(),
+            message: "must be a number".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("port"), "Should mention the key: {msg}");
+    }
+
+    #[test]
+    fn database_error_display() {
+        let err = DatabaseError::NotFound {
+            entity: "conversation".to_string(),
+            id: "abc-123".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("conversation"), "Should mention entity: {msg}");
+        assert!(msg.contains("abc-123"), "Should mention id: {msg}");
+
+        let err = DatabaseError::Query("syntax error near SELECT".to_string());
+        assert!(err.to_string().contains("syntax error"));
+    }
+
+    #[test]
+    fn channel_error_display() {
+        let err = ChannelError::StartupFailed {
+            name: "telegram".to_string(),
+            reason: "invalid token".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("telegram"), "Should mention channel: {msg}");
+        assert!(
+            msg.contains("invalid token"),
+            "Should mention reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn job_error_display() {
+        let err = JobError::MaxJobsExceeded { max: 5 };
+        let msg = err.to_string();
+        assert!(msg.contains("5"), "Should mention max: {msg}");
+
+        let id = Uuid::new_v4();
+        let err = JobError::NotFound { id };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&id.to_string()),
+            "Should mention job id: {msg}"
+        );
+    }
+
+    #[test]
+    fn safety_error_display() {
+        let err = SafetyError::InjectionDetected {
+            pattern: "SYSTEM:".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("SYSTEM:"), "Should mention pattern: {msg}");
+    }
+
+    #[test]
+    fn workspace_error_display() {
+        let err = WorkspaceError::DocumentNotFound {
+            doc_type: "notes".to_string(),
+            user_id: "user1".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("notes"), "Should mention doc_type: {msg}");
+        assert!(msg.contains("user1"), "Should mention user_id: {msg}");
+    }
+
+    #[test]
+    fn routine_error_display() {
+        let err = RoutineError::InvalidCron {
+            reason: "bad format".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("bad format"), "Should mention reason: {msg}");
+    }
+
+    #[test]
+    fn routine_error_retryable_classification() {
+        // Transient errors should be retryable
+        assert!(
+            RoutineError::LlmFailed {
+                reason: "timeout".into(),
+                partial_tokens: None,
+                retryable: true,
+            }
+            .is_retryable()
+        );
+        // Non-retryable LLM error
+        assert!(
+            !RoutineError::LlmFailed {
+                reason: "timeout".into(),
+                partial_tokens: None,
+                retryable: false,
+            }
+            .is_retryable()
+        );
+        assert!(
+            RoutineError::EmptyResponse {
+                partial_tokens: None
+            }
+            .is_retryable()
+        );
+        assert!(
+            RoutineError::TruncatedResponse {
+                partial_tokens: None
+            }
+            .is_retryable()
+        );
+
+        // Hard failures should NOT be retryable
+        assert!(
+            !RoutineError::Disabled {
+                name: "test".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !RoutineError::JobDispatchFailed {
+                reason: "no docker".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !RoutineError::Database {
+                reason: "conn refused".into()
+            }
+            .is_retryable()
+        );
+        assert!(!RoutineError::NotFound { id: Uuid::new_v4() }.is_retryable());
+        assert!(!RoutineError::NotAuthorized { id: Uuid::new_v4() }.is_retryable());
+        assert!(
+            !RoutineError::MaxConcurrent {
+                name: "test".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !RoutineError::UnknownTriggerType {
+                trigger_type: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !RoutineError::UnknownActionType {
+                action_type: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !RoutineError::MissingField {
+                context: "c".into(),
+                field: "f".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !RoutineError::InvalidCron {
+                reason: "bad".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !RoutineError::UnknownRunStatus {
+                status: "bad".into()
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn top_level_error_from_conversions() {
+        let config_err = ConfigError::MissingEnvVar("TEST".to_string());
+        let err: Error = config_err.into();
+        assert!(matches!(err, Error::Config(_)));
+
+        let db_err = DatabaseError::Query("test".to_string());
+        let err: Error = db_err.into();
+        assert!(matches!(err, Error::Database(_)));
+
+        let job_err = JobError::MaxJobsExceeded { max: 1 };
+        let err: Error = job_err.into();
+        assert!(matches!(err, Error::Job(_)));
+
+        let safety_err = SafetyError::ValidationFailed {
+            reason: "test".to_string(),
+        };
+        let err: Error = safety_err.into();
+        assert!(matches!(err, Error::Safety(_)));
+    }
+}

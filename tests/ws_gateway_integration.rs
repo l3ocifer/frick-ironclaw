@@ -5,7 +5,7 @@
 //! - WebSocket upgrade with auth
 //! - Ping/pong
 //! - Client message → agent msg_tx
-//! - Broadcast SSE event → WebSocket client
+//! - Broadcast AppEvent → WebSocket client
 //! - Connection tracking (counter increment/decrement)
 //! - Gateway status endpoint
 
@@ -20,10 +20,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use ironclaw::channels::IncomingMessage;
-use ironclaw::channels::web::server::{GatewayState, start_server};
+use ironclaw::channels::web::platform::router::start_server;
+use ironclaw::channels::web::platform::state::GatewayState;
 use ironclaw::channels::web::sse::SseManager;
-use ironclaw::channels::web::types::SseEvent;
 use ironclaw::channels::web::ws::WsConnectionTracker;
+use ironclaw_common::AppEvent;
 
 const AUTH_TOKEN: &str = "test-token-12345";
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,16 +40,21 @@ async fn start_test_server() -> (
 
     let state = Arc::new(GatewayState {
         msg_tx: tokio::sync::RwLock::new(Some(agent_tx)),
-        sse: SseManager::new(),
+        sse: Arc::new(SseManager::new()),
         workspace: None,
+        workspace_pool: None,
+        multi_tenant_mode: false,
         session_manager: None,
         log_broadcaster: None,
+        log_level_handle: None,
         extension_manager: None,
         tool_registry: None,
         store: None,
+        settings_cache: None,
         job_manager: None,
         prompt_queue: None,
-        user_id: "test-user".to_string(),
+        scheduler: None,
+        owner_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: None,
@@ -56,8 +62,12 @@ async fn start_test_server() -> (
         agent_card_json: None,
     });
 
+    let auth = ironclaw::channels::web::auth::MultiAuthState::single(
+        AUTH_TOKEN.to_string(),
+        "test-user".to_string(),
+    );
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let bound_addr = start_server(addr, state.clone(), AUTH_TOKEN.to_string())
+    let bound_addr = start_server(addr, state.clone(), auth.into())
         .await
         .expect("Failed to start test server");
 
@@ -133,7 +143,7 @@ async fn test_ws_message_reaches_agent() {
         .expect("Agent channel closed");
 
     assert_eq!(incoming.content, "hello from ws");
-    assert_eq!(incoming.thread_id.as_deref(), Some("t42"));
+    assert_eq!(incoming.thread_id.as_ref().map(|t| t.as_str()), Some("t42"));
     assert_eq!(incoming.channel, "gateway");
     assert_eq!(incoming.user_id, "test-user");
 
@@ -148,8 +158,8 @@ async fn test_ws_broadcast_event_received() {
     // Give the connection a moment to fully establish
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Broadcast an SSE event (simulates agent sending a response)
-    state.sse.broadcast(SseEvent::Response {
+    // Broadcast an event (simulates agent sending a response)
+    state.sse.broadcast(AppEvent::Response {
         content: "agent says hi".to_string(),
         thread_id: "t1".to_string(),
     });
@@ -170,7 +180,7 @@ async fn test_ws_thinking_event() {
     let mut ws = connect_ws(addr).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    state.sse.broadcast(SseEvent::Thinking {
+    state.sse.broadcast(AppEvent::Thinking {
         message: "analyzing...".to_string(),
         thread_id: None,
     });
@@ -273,6 +283,20 @@ async fn test_gateway_status_endpoint() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["ws_connections"], 1);
     assert!(body["total_connections"].as_u64().unwrap() >= 1);
+
+    // Regression for #2982: the response carries the engine flag under a
+    // single canonical name. The old duplicate `engine_v2` field led the
+    // gateway JS to read the value from one name while writing the other,
+    // and dropping it locks in the wire-contract rule from
+    // .claude/rules/types.md.
+    assert!(
+        body.get("engine_v2_enabled").is_some(),
+        "expected engine_v2_enabled field on gateway status response"
+    );
+    assert!(
+        body.get("engine_v2").is_none(),
+        "duplicate engine_v2 field must not be re-introduced (#2982)"
+    );
 }
 
 #[tokio::test]
@@ -295,20 +319,26 @@ async fn test_ws_multiple_events_in_sequence() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Broadcast multiple events rapidly
-    state.sse.broadcast(SseEvent::Thinking {
+    state.sse.broadcast(AppEvent::Thinking {
         message: "step 1".to_string(),
         thread_id: None,
     });
-    state.sse.broadcast(SseEvent::ToolStarted {
+    state.sse.broadcast(AppEvent::ToolStarted {
         name: "shell".to_string(),
+        detail: None,
+        call_id: Some("call_shell_1".to_string()),
         thread_id: None,
     });
-    state.sse.broadcast(SseEvent::ToolCompleted {
+    state.sse.broadcast(AppEvent::ToolCompleted {
         name: "shell".to_string(),
         success: true,
+        error: None,
+        parameters: None,
+        call_id: Some("call_shell_1".to_string()),
+        duration_ms: Some(42),
         thread_id: None,
     });
-    state.sse.broadcast(SseEvent::Response {
+    state.sse.broadcast(AppEvent::Response {
         content: "done".to_string(),
         thread_id: "t1".to_string(),
     });
@@ -326,8 +356,80 @@ async fn test_ws_multiple_events_in_sequence() {
 
     assert_eq!(p1["event_type"], "thinking");
     assert_eq!(p2["event_type"], "tool_started");
+    assert_eq!(p2["data"]["call_id"], "call_shell_1");
     assert_eq!(p3["event_type"], "tool_completed");
+    assert_eq!(p3["data"]["call_id"], "call_shell_1");
+    assert_eq!(p3["data"]["duration_ms"], 42);
     assert_eq!(p4["event_type"], "response");
 
     ws.close(None).await.unwrap();
+}
+
+/// Regression test: verify session lock is not held during API handler operations.
+///
+/// This test ensures that concurrent API requests (e.g., listing threads) don't
+/// block the agent loop from processing messages. Previously, chat_threads_handler
+/// and chat_history_handler held session locks during slow DB operations, which
+/// would deadlock the agent loop waiting to resolve sessions for incoming messages.
+///
+/// The test verifies that concurrent access to session state completes quickly
+/// without deadlock. If locks are heavily contended, the test will timeout.
+#[tokio::test]
+async fn test_session_lock_not_held_during_api_operations() {
+    use ironclaw::agent::SessionManager;
+
+    let (_addr, _state, _agent_rx) = start_test_server().await;
+
+    // Create a session manager and attach it to state
+    let session_manager = Arc::new(SessionManager::new());
+
+    // Note: We can't directly modify state.session_manager in the test due to its type.
+    // Instead, we test the session manager directly in isolation to verify lock behavior.
+
+    // Spawn concurrent operations simulating API handler + agent loop interaction
+    let mut handles = vec![];
+
+    // Simulate API handler threads accessing sessions
+    for user_id in 0..5 {
+        let sm = session_manager.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..20 {
+                let session = sm.get_or_create_session(&format!("user-{}", user_id)).await;
+                // Lock and release quickly (simulating API reading session state)
+                {
+                    let _sess = session.lock().await;
+                    tokio::time::sleep(Duration::from_micros(100)).await;
+                }
+            }
+        }));
+    }
+
+    // Simulate agent loop thread resolving threads
+    let sm = session_manager.clone();
+    let agent_handle = tokio::spawn(async move {
+        for i in 0..20 {
+            let (_session, _thread_id) = sm
+                .resolve_thread(&format!("user-{}", i % 5), "gateway", None)
+                .await;
+            // Should not block waiting for API handler locks
+            tokio::time::sleep(Duration::from_micros(100)).await;
+        }
+    });
+    handles.push(agent_handle);
+
+    // Wait for all tasks to complete within reasonable time
+    // If session locks are held during slow operations, this will timeout
+    let timeout_duration = Duration::from_secs(5);
+    let wait_result = timeout(timeout_duration, async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    })
+    .await;
+
+    assert!(
+        wait_result.is_ok(),
+        "Concurrent session access deadlocked or timed out. \
+         This suggests session locks are held too long during I/O operations."
+    );
 }

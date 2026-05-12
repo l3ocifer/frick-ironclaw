@@ -69,7 +69,7 @@
 //! let runtime = WasmChannelRuntime::new(config)?;
 //!
 //! // Load channels from directory
-//! let loader = WasmChannelLoader::new(runtime);
+//! let loader = WasmChannelLoader::new(runtime, pairing_store, settings_store, owner_scope_id);
 //! let channels = loader.load_from_dir(Path::new("~/.ironclaw/channels/")).await?;
 //!
 //! // Add to channel manager
@@ -78,6 +78,7 @@
 //! }
 //! ```
 
+mod attachment_hydration;
 mod bundled;
 mod capabilities;
 mod error;
@@ -85,7 +86,13 @@ mod host;
 mod loader;
 mod router;
 mod runtime;
+mod runtime_config_keys;
 mod schema;
+pub mod setup;
+pub(crate) mod signature;
+#[allow(dead_code)]
+pub(crate) mod storage;
+mod telegram_host_config;
 mod wrapper;
 
 // Core types
@@ -99,7 +106,15 @@ pub use loader::{
 };
 pub use router::{RegisteredEndpoint, WasmChannelRouter, create_wasm_channel_router};
 pub use runtime::{PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig};
-pub use schema::{
-    ChannelCapabilitiesFile, ChannelConfig, SecretSetupSchema, SetupSchema, WebhookSchema,
+pub(crate) use runtime_config_keys::{
+    RUNTIME_CONFIG_KEY_BOT_USERNAME, RUNTIME_CONFIG_KEY_OWNER_ID, RUNTIME_CONFIG_KEY_TUNNEL_URL,
+    RUNTIME_CONFIG_KEY_WEBHOOK_SECRET, is_reserved_runtime_config_key,
 };
+pub use schema::{
+    ChannelCapabilitiesFile, ChannelConfig, SecretConfigMappingSchema, SecretSetupSchema,
+    SetupSchema, WebhookSchema,
+};
+pub use setup::{WasmChannelSetup, inject_channel_credentials, setup_wasm_channels};
+pub(crate) use setup::{is_reserved_wasm_channel_name, owner_id_from_capabilities};
+pub(crate) use telegram_host_config::{TELEGRAM_CHANNEL_NAME, bot_username_setting_key};
 pub use wrapper::{HttpResponse, SharedWasmChannel, WasmChannel};

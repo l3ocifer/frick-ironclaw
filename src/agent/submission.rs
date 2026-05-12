@@ -14,6 +14,7 @@ impl SubmissionParser {
     pub fn parse(content: &str) -> Submission {
         let trimmed = content.trim();
         let lower = trimmed.to_lowercase();
+        tracing::debug!("[SubmissionParser::parse] Parsing input: {:?}", trimmed);
 
         // Control commands (exact match or prefix)
         if lower == "/undo" {
@@ -40,6 +41,12 @@ impl SubmissionParser {
         if lower == "/suggest" {
             return Submission::Suggest;
         }
+        if lower.starts_with("/expected ") {
+            let description = trimmed["/expected ".len()..].trim().to_string();
+            if !description.is_empty() {
+                return Submission::Expected { description };
+            }
+        }
         if lower == "/thread new" || lower == "/new" {
             return Submission::NewThread;
         }
@@ -62,6 +69,23 @@ impl SubmissionParser {
                 args: vec![],
             };
         }
+        if lower == "/skills" {
+            return Submission::SystemCommand {
+                command: "skills".to_string(),
+                args: vec![],
+            };
+        }
+        if lower.starts_with("/skills ") {
+            let args: Vec<String> = trimmed
+                .split_whitespace()
+                .skip(1)
+                .map(|s| s.to_string())
+                .collect();
+            return Submission::SystemCommand {
+                command: "skills".to_string(),
+                args,
+            };
+        }
         if lower == "/ping" {
             return Submission::SystemCommand {
                 command: "ping".to_string(),
@@ -71,6 +95,24 @@ impl SubmissionParser {
         if lower == "/debug" {
             return Submission::SystemCommand {
                 command: "debug".to_string(),
+                args: vec![],
+            };
+        }
+        if lower == "/reasoning" || lower.starts_with("/reasoning ") {
+            let args: Vec<String> = trimmed
+                .split_whitespace()
+                .skip(1)
+                .map(|s| s.to_string())
+                .collect();
+            return Submission::SystemCommand {
+                command: "reasoning".to_string(),
+                args,
+            };
+        }
+        if lower == "/restart" {
+            tracing::debug!("[SubmissionParser::parse] Recognized /restart command");
+            return Submission::SystemCommand {
+                command: "restart".to_string(),
                 args: vec![],
             };
         }
@@ -90,6 +132,54 @@ impl SubmissionParser {
             return Submission::Quit;
         }
 
+        // Job commands
+        if lower == "/status" || lower == "/progress" {
+            return Submission::JobStatus { job_id: None };
+        }
+        if let Some(rest) = lower
+            .strip_prefix("/status ")
+            .or_else(|| lower.strip_prefix("/progress "))
+        {
+            let id = rest.trim().to_string();
+            if !id.is_empty() {
+                return Submission::JobStatus { job_id: Some(id) };
+            }
+        }
+        if lower == "/list" {
+            return Submission::JobStatus { job_id: None };
+        }
+        if let Some(rest) = lower.strip_prefix("/cancel ") {
+            let id = rest.trim().to_string();
+            if !id.is_empty() {
+                return Submission::JobCancel { job_id: id };
+            }
+        }
+
+        // `approve <channel> <code>` — claim a pairing code from the chat
+        // surface. The Telegram bot's pairing reply tells users to type
+        // exactly this; supporting it in chat closes the gap that #3317
+        // surfaced (users pasted the pairing code into TUI/CLI and got
+        // rejected by the LLM). The slash variant is also accepted so the
+        // command can't be intercepted as a UserInput at higher layers.
+        if let Some(rest) = lower
+            .strip_prefix("approve ")
+            .or_else(|| lower.strip_prefix("/approve "))
+        {
+            let mut parts = rest.split_whitespace();
+            if let (Some(channel), Some(code), None) = (parts.next(), parts.next(), parts.next()) {
+                let channel = channel.to_string();
+                // The parser already lowercased the input (`lower`), so both
+                // `channel` and `code` flow through in lowercase. The store
+                // layer is case-insensitive
+                // (`db.libsql.pairing` test_approve_pairing_case_insensitive),
+                // so the on-the-wire upper-case shape still matches.
+                let code = code.to_string();
+                if !channel.is_empty() && !code.is_empty() {
+                    return Submission::PairingClaim { channel, code };
+                }
+            }
+        }
+
         // /thread <uuid> - switch thread
         if let Some(rest) = lower.strip_prefix("/thread ") {
             let rest = rest.trim();
@@ -100,7 +190,10 @@ impl SubmissionParser {
             }
         }
 
-        // /resume <uuid> - resume from checkpoint
+        // /resume - show thread picker; /resume <uuid> - resume from checkpoint
+        if lower == "/resume" {
+            return Submission::ListThreads;
+        }
         if let Some(rest) = lower.strip_prefix("/resume ")
             && let Ok(id) = Uuid::parse_str(rest.trim())
         {
@@ -110,33 +203,102 @@ impl SubmissionParser {
         // Try structured JSON approval (from web gateway's /api/chat/approval endpoint)
         if trimmed.starts_with('{')
             && let Ok(submission) = serde_json::from_str::<Submission>(trimmed)
-            && matches!(submission, Submission::ExecApproval { .. })
+            && matches!(
+                submission,
+                Submission::ExecApproval { .. }
+                    | Submission::ExternalCallback { .. }
+                    | Submission::GateAuthResolution { .. }
+            )
         {
             return submission;
         }
 
-        // Approval responses (simple yes/no/always for pending approvals)
-        // These are short enough to check explicitly
+        // Approval responses (simple yes/no/always for pending approvals).
+        // The parser is stateless — it cannot check whether an approval is
+        // actually pending. The routing layer in agent_loop.rs downgrades bare
+        // keywords to UserInput when no approval is pending; slash-prefixed
+        // variants (e.g. /approve, /deny, /yes, /no, /always) always route
+        // as ApprovalResponse.
         match lower.as_str() {
-            "yes" | "y" | "approve" | "ok" => {
+            "yes" | "y" | "approve" | "ok" | "/approve" | "/yes" | "/y" => {
                 return Submission::ApprovalResponse {
                     approved: true,
                     always: false,
                 };
             }
-            "always" | "yes always" | "approve always" => {
+            "always" | "a" | "yes always" | "approve always" | "/always" | "/a" => {
                 return Submission::ApprovalResponse {
                     approved: true,
                     always: true,
                 };
             }
-            "no" | "n" | "deny" | "reject" | "cancel" => {
+            "no" | "n" | "deny" | "reject" | "cancel" | "/deny" | "/no" | "/n" => {
                 return Submission::ApprovalResponse {
                     approved: false,
                     always: false,
                 };
             }
             _ => {}
+        }
+
+        // Plan commands
+        if lower == "/plan" || lower == "/plan list" {
+            return Submission::Plan {
+                sub: PlanSubcommand::List,
+            };
+        }
+        if let Some(rest) = lower.strip_prefix("/plan ") {
+            let rest = rest.trim();
+            if rest == "list" {
+                return Submission::Plan {
+                    sub: PlanSubcommand::List,
+                };
+            }
+            if let Some(after) = rest.strip_prefix("approve") {
+                let plan_ref = after.trim();
+                return Submission::Plan {
+                    sub: PlanSubcommand::Approve {
+                        plan_ref: if plan_ref.is_empty() {
+                            None
+                        } else {
+                            Some(plan_ref.to_string())
+                        },
+                    },
+                };
+            }
+            if let Some(after) = rest.strip_prefix("status") {
+                let plan_ref = after.trim();
+                return Submission::Plan {
+                    sub: PlanSubcommand::Status {
+                        plan_ref: if plan_ref.is_empty() {
+                            None
+                        } else {
+                            Some(plan_ref.to_string())
+                        },
+                    },
+                };
+            }
+            if let Some(after) = rest.strip_prefix("revise") {
+                let after = after.trim();
+                // Try to split: first word is plan_ref, rest is feedback
+                let (plan_ref, feedback) = if let Some((first, rest)) = after.split_once(' ') {
+                    (Some(first.to_string()), rest.trim().to_string())
+                } else {
+                    (None, after.to_string())
+                };
+                if !feedback.is_empty() {
+                    return Submission::Plan {
+                        sub: PlanSubcommand::Revise { plan_ref, feedback },
+                    };
+                }
+            }
+            // Default: treat as plan creation
+            let description = trimmed["/plan ".len()..].trim().to_string();
+            if !description.is_empty() {
+                return Submission::Plan {
+                    sub: PlanSubcommand::Create { description },
+                };
+            }
         }
 
         // Default: user input
@@ -163,6 +325,20 @@ pub enum Submission {
         approved: bool,
         /// If true, auto-approve this tool for the rest of the session.
         always: bool,
+    },
+
+    /// External system resolved a pending gate (for example an OAuth callback).
+    ExternalCallback {
+        /// ID of the pending gate request being resolved.
+        request_id: Uuid,
+    },
+
+    /// Resolve an authentication gate with an exact request id.
+    GateAuthResolution {
+        /// ID of the pending authentication gate being resolved.
+        request_id: Uuid,
+        /// Credential submission or cancellation for the gate.
+        resolution: AuthGateResolution,
     },
 
     /// Simple approval response (yes/no/always) for the current pending approval.
@@ -203,6 +379,9 @@ pub enum Submission {
     /// Create a new thread.
     NewThread,
 
+    /// List threads for the interactive resume picker.
+    ListThreads,
+
     /// Trigger a manual heartbeat check.
     Heartbeat,
 
@@ -211,6 +390,25 @@ pub enum Submission {
 
     /// Suggest next steps based on the current thread.
     Suggest,
+
+    /// User-provided expected behavior for the last interaction.
+    /// Fires into the self-improvement pipeline with conversation context.
+    Expected {
+        /// What the user expected to happen.
+        description: String,
+    },
+
+    /// Check job status. No job_id shows all jobs; with job_id shows a specific job.
+    JobStatus {
+        /// Optional job ID (UUID or short prefix). If None, shows all jobs.
+        job_id: Option<String>,
+    },
+
+    /// Cancel a running job.
+    JobCancel {
+        /// Job ID (UUID or short prefix).
+        job_id: String,
+    },
 
     /// Quit the agent. Bypasses thread-state checks.
     Quit,
@@ -223,6 +421,53 @@ pub enum Submission {
         /// Arguments to the command.
         args: Vec<String>,
     },
+
+    /// Plan mode command (/plan).
+    /// All subcommands are rewritten to UserInput with [PLAN MODE] prefix
+    /// to activate the plan-mode skill.
+    Plan {
+        /// The plan subcommand.
+        sub: PlanSubcommand,
+    },
+
+    /// Claim a pairing code from any chat surface (e.g. `approve telegram CODE`).
+    ///
+    /// The user-facing pairing flow tells users to type exactly this in any
+    /// IronClaw chat. The handler delegates to the same pairing store and
+    /// extension-manager hooks that `POST /api/pairing/{channel}/approve`
+    /// uses, so the TUI/CLI/web/telegram surfaces all behave consistently.
+    PairingClaim {
+        /// Channel name (e.g. `telegram`, `slack-relay`).
+        channel: String,
+        /// Pairing code, lowercased by `SubmissionParser::parse`. The
+        /// pairing store is case-insensitive, so the wire-format
+        /// uppercase shape still matches.
+        code: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthGateResolution {
+    CredentialProvided { token: String },
+    Cancelled,
+}
+
+/// Subcommands for the /plan command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlanSubcommand {
+    /// Create a new plan: /plan <description>
+    Create { description: String },
+    /// Approve and execute a plan: /plan approve [ref]
+    Approve { plan_ref: Option<String> },
+    /// Check plan status: /plan status [ref]
+    Status { plan_ref: Option<String> },
+    /// Revise a plan with feedback: /plan revise [ref] <feedback>
+    Revise {
+        plan_ref: Option<String>,
+        feedback: String,
+    },
+    /// List all plans: /plan list
+    List,
 }
 
 impl Submission {
@@ -234,6 +479,7 @@ impl Submission {
     }
 
     /// Create an approval submission.
+    #[cfg(test)]
     pub fn approval(request_id: Uuid, approved: bool) -> Self {
         Self::ExecApproval {
             request_id,
@@ -243,6 +489,7 @@ impl Submission {
     }
 
     /// Create an "always approve" submission.
+    #[cfg(test)]
     pub fn always_approve(request_id: Uuid) -> Self {
         Self::ExecApproval {
             request_id,
@@ -252,26 +499,31 @@ impl Submission {
     }
 
     /// Create an interrupt submission.
+    #[cfg(test)]
     pub fn interrupt() -> Self {
         Self::Interrupt
     }
 
     /// Create a compact submission.
+    #[cfg(test)]
     pub fn compact() -> Self {
         Self::Compact
     }
 
     /// Create an undo submission.
+    #[cfg(test)]
     pub fn undo() -> Self {
         Self::Undo
     }
 
     /// Create a redo submission.
+    #[cfg(test)]
     pub fn redo() -> Self {
         Self::Redo
     }
 
     /// Check if this submission starts a new turn.
+    #[cfg(test)]
     pub fn starts_turn(&self) -> bool {
         matches!(self, Self::UserInput { .. })
     }
@@ -289,6 +541,8 @@ impl Submission {
                 | Self::Heartbeat
                 | Self::Summarize
                 | Self::Suggest
+                | Self::JobStatus { .. }
+                | Self::JobCancel { .. }
                 | Self::SystemCommand { .. }
         )
     }
@@ -313,6 +567,8 @@ pub enum SubmissionResult {
         description: String,
         /// Parameters being passed.
         parameters: serde_json::Value,
+        /// Whether "always" auto-approve should be offered to the user.
+        allow_always: bool,
     },
 
     /// Successfully processed (for control commands).
@@ -329,6 +585,9 @@ pub enum SubmissionResult {
 
     /// Turn was interrupted.
     Interrupted,
+
+    /// Auth flow initiated — config card sent, no text response needed.
+    AuthPending,
 }
 
 impl SubmissionResult {
@@ -340,6 +599,7 @@ impl SubmissionResult {
     }
 
     /// Create an OK result.
+    #[cfg(test)]
     pub fn ok() -> Self {
         Self::Ok { message: None }
     }
@@ -351,10 +611,23 @@ impl SubmissionResult {
         }
     }
 
+    /// Create an auth-pending result (suppresses text response).
+    pub fn auth_pending() -> Self {
+        Self::AuthPending
+    }
+
     /// Create an error result.
     pub fn error(message: impl Into<String>) -> Self {
         Self::Error {
             message: message.into(),
+        }
+    }
+
+    /// Create a non-error status message (e.g., for blocking states like approval waiting).
+    /// Uses Ok variant to avoid "Error:" prefix in rendering.
+    pub fn pending(message: impl Into<String>) -> Self {
+        Self::Ok {
+            message: Some(message.into()),
         }
     }
 }
@@ -476,6 +749,57 @@ mod tests {
     }
 
     #[test]
+    fn test_parser_approval_response_aliases() {
+        // approve once
+        assert!(matches!(
+            SubmissionParser::parse("y"),
+            Submission::ApprovalResponse {
+                approved: true,
+                always: false
+            }
+        ));
+        assert!(matches!(
+            SubmissionParser::parse("/approve"),
+            Submission::ApprovalResponse {
+                approved: true,
+                always: false
+            }
+        ));
+
+        // approve always
+        assert!(matches!(
+            SubmissionParser::parse("a"),
+            Submission::ApprovalResponse {
+                approved: true,
+                always: true
+            }
+        ));
+        assert!(matches!(
+            SubmissionParser::parse("/always"),
+            Submission::ApprovalResponse {
+                approved: true,
+                always: true
+            }
+        ));
+
+        // deny
+        assert!(matches!(
+            SubmissionParser::parse("n"),
+            Submission::ApprovalResponse {
+                approved: false,
+                always: false
+            }
+        ));
+        assert!(matches!(
+            SubmissionParser::parse("/deny"),
+            Submission::ApprovalResponse {
+                approved: false,
+                always: false
+            }
+        ));
+    }
+
+    #[test]
     fn test_parser_json_exec_approval() {
         let req_id = Uuid::new_v4();
         let json = serde_json::to_string(&Submission::ExecApproval {
@@ -557,6 +881,27 @@ mod tests {
     }
 
     #[test]
+    fn test_parser_json_gate_auth_resolution() {
+        let request_id = Uuid::new_v4();
+        let json = serde_json::to_string(&Submission::GateAuthResolution {
+            request_id,
+            resolution: AuthGateResolution::CredentialProvided {
+                token: "secret-token".to_string(),
+            },
+        })
+        .expect("serialize");
+
+        let parsed = SubmissionParser::parse(&json);
+        assert!(matches!(
+            parsed,
+            Submission::GateAuthResolution {
+                request_id: rid,
+                resolution: AuthGateResolution::CredentialProvided { token }
+            } if rid == request_id && token == "secret-token"
+        ));
+    }
+
+    #[test]
     fn test_parser_system_command_help() {
         let submission = SubmissionParser::parse("/help");
         assert!(
@@ -635,6 +980,86 @@ mod tests {
     }
 
     #[test]
+    fn test_parser_system_command_skills() {
+        let submission = SubmissionParser::parse("/skills");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, args } if command == "skills" && args.is_empty())
+        );
+
+        // Case insensitive
+        let submission = SubmissionParser::parse("/SKILLS");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, .. } if command == "skills")
+        );
+    }
+
+    #[test]
+    fn test_parser_system_command_skills_search() {
+        let submission = SubmissionParser::parse("/skills search markdown");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, args }
+                if command == "skills" && args == vec!["search", "markdown"])
+        );
+
+        // Multiple words in query
+        let submission = SubmissionParser::parse("/skills search code review tools");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, args }
+                if command == "skills" && args == vec!["search", "code", "review", "tools"])
+        );
+    }
+
+    #[test]
+    fn test_parser_job_status() {
+        // /status with no id → all jobs
+        let s = SubmissionParser::parse("/status");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+
+        // /progress alias
+        let s = SubmissionParser::parse("/progress");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+
+        // /status with id
+        let s = SubmissionParser::parse("/status abc123");
+        assert!(matches!(s, Submission::JobStatus { job_id: Some(id) } if id == "abc123"));
+
+        // /progress with id
+        let s = SubmissionParser::parse("/progress abc123");
+        assert!(matches!(s, Submission::JobStatus { job_id: Some(id) } if id == "abc123"));
+
+        // case insensitive
+        let s = SubmissionParser::parse("/STATUS");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+    }
+
+    #[test]
+    fn test_parser_job_list() {
+        // /list is an alias for /status with no job_id
+        let s = SubmissionParser::parse("/list");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+
+        let s = SubmissionParser::parse("/LIST");
+        assert!(matches!(s, Submission::JobStatus { job_id: None }));
+    }
+
+    #[test]
+    fn test_parser_job_cancel() {
+        let s = SubmissionParser::parse("/cancel abc123");
+        assert!(matches!(s, Submission::JobCancel { job_id } if job_id == "abc123"));
+
+        // /cancel with no id → falls through to UserInput
+        let s = SubmissionParser::parse("/cancel");
+        assert!(matches!(s, Submission::UserInput { .. }));
+    }
+
+    #[test]
+    fn test_job_commands_are_control() {
+        assert!(SubmissionParser::parse("/status").is_control());
+        assert!(SubmissionParser::parse("/list").is_control());
+        assert!(SubmissionParser::parse("/cancel abc").is_control());
+    }
+
+    #[test]
     fn test_parser_quit() {
         assert!(matches!(SubmissionParser::parse("/quit"), Submission::Quit));
         assert!(matches!(SubmissionParser::parse("/exit"), Submission::Quit));
@@ -644,5 +1069,73 @@ mod tests {
         ));
         assert!(matches!(SubmissionParser::parse("/QUIT"), Submission::Quit));
         assert!(matches!(SubmissionParser::parse("/Exit"), Submission::Quit));
+    }
+
+    #[test]
+    fn test_parser_expected() {
+        let submission =
+            SubmissionParser::parse("/expected should have logged in via GitHub OAuth");
+        assert!(
+            matches!(submission, Submission::Expected { description } if description == "should have logged in via GitHub OAuth")
+        );
+    }
+
+    #[test]
+    fn test_parser_expected_empty_is_user_input() {
+        // "/expected " with no description should fall through to user input
+        let submission = SubmissionParser::parse("/expected ");
+        assert!(matches!(submission, Submission::UserInput { .. }));
+    }
+
+    // Pairing-claim parser — regression tests for #3317. The Telegram bot's
+    // pairing reply tells users to type `approve telegram CODE` in any
+    // IronClaw chat surface; before this variant existed, the agent
+    // unhelpfully routed those to the LLM and answered "wrong place".
+    #[test]
+    fn test_parser_pairing_claim_bare() {
+        let submission = SubmissionParser::parse("approve telegram ABC12345");
+        assert!(matches!(
+            submission,
+            Submission::PairingClaim { ref channel, ref code }
+                if channel == "telegram" && code == "abc12345"
+        ));
+    }
+
+    #[test]
+    fn test_parser_pairing_claim_slash_prefix() {
+        let submission = SubmissionParser::parse("/approve telegram XYZ99");
+        assert!(matches!(
+            submission,
+            Submission::PairingClaim { ref channel, ref code }
+                if channel == "telegram" && code == "xyz99"
+        ));
+    }
+
+    #[test]
+    fn test_parser_pairing_claim_mixed_case_channel() {
+        // Channel name should round-trip lowercased (the parser uses `lower`).
+        let submission = SubmissionParser::parse("approve Telegram ABCD1234");
+        assert!(matches!(
+            submission,
+            Submission::PairingClaim { ref channel, .. } if channel == "telegram"
+        ));
+    }
+
+    #[test]
+    fn test_parser_pairing_claim_extra_args_falls_through() {
+        // Don't claim `approve foo bar baz` — extra tokens look like a sentence.
+        let submission = SubmissionParser::parse("approve telegram ABC EXTRA");
+        assert!(matches!(submission, Submission::UserInput { .. }));
+    }
+
+    #[test]
+    fn test_parser_approval_alone_is_still_approval() {
+        // `approve` by itself stays an ApprovalResponse; only the two-arg
+        // form is interpreted as a pairing claim.
+        let submission = SubmissionParser::parse("approve");
+        assert!(matches!(
+            submission,
+            Submission::ApprovalResponse { approved: true, .. }
+        ));
     }
 }

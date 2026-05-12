@@ -9,8 +9,26 @@ use wasmtime::ResourceLimiter;
 /// Default memory limit: 10 MB (conservative for untrusted code).
 pub const DEFAULT_MEMORY_LIMIT: u64 = 10 * 1024 * 1024;
 
-/// Default fuel limit: 10 million instructions.
-pub const DEFAULT_FUEL_LIMIT: u64 = 10_000_000;
+/// Default fuel limit: 500 million instructions.
+///
+/// Prior values in this file: 10M (pre-#2054), 100M (#2054). Config-path
+/// default (`src/config/wasm.rs`) was stuck at 10M in parallel — the
+/// divergence masked real fuel exhaustion in production. Both paths now
+/// agree at 500M.
+///
+/// Why 500M: WASM tools that make HTTP requests then parse/serialize
+/// JSON responses with serde_json burn 20-50M instructions per 30KB
+/// round-trip between the recursive-descent parser and the Value tree
+/// builder. Tools like `portfolio` parse ~235KB token price maps, which
+/// at ~1.5M instructions per KB needs 350M+. 500M provides headroom.
+///
+/// TODO(#2368): the 500M value is driven by a single tool (portfolio/near),
+/// but sets the ceiling for every WASM tool in the sandbox. A per-tool
+/// override — either capability-declared in `<tool>.capabilities.json` or
+/// surfaced via `ResourceLimits::with_fuel()` at dispatch — would let us
+/// keep a tighter default for the common case and only hand out the 500M
+/// budget to tools that prove they need it.
+pub const DEFAULT_FUEL_LIMIT: u64 = 500_000_000;
 
 /// Default execution timeout: 60 seconds.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -67,14 +85,8 @@ pub struct WasmResourceLimiter {
     memory_used: u64,
     /// Maximum tables allowed.
     max_tables: u32,
-    /// Current table count.
-    #[allow(dead_code)] // Reserved for table limit enforcement
-    tables_created: u32,
     /// Maximum instances allowed.
     max_instances: u32,
-    /// Current instance count.
-    #[allow(dead_code)] // Reserved for instance limit enforcement
-    instances_created: u32,
 }
 
 impl WasmResourceLimiter {
@@ -87,9 +99,7 @@ impl WasmResourceLimiter {
             memory_limit,
             memory_used: 0,
             max_tables: 10,
-            tables_created: 0,
             max_instances: 10, // Component model needs multiple instances for WASI
-            instances_created: 0,
         }
     }
 
@@ -110,7 +120,7 @@ impl ResourceLimiter for WasmResourceLimiter {
         current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, wasmtime::Error> {
         let desired_u64 = desired as u64;
 
         if desired_u64 > self.memory_limit {
@@ -138,7 +148,7 @@ impl ResourceLimiter for WasmResourceLimiter {
         current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, wasmtime::Error> {
         // Allow reasonable table growth
         if desired > 10_000 {
             tracing::warn!(

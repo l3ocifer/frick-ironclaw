@@ -17,12 +17,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{
+use ironclaw_llm::{
     ChatMessage, CompletionRequest, FinishReason, Role, ToolCall, ToolCompletionRequest,
     ToolDefinition,
 };
 
-use super::server::GatewayState;
+use super::platform::state::GatewayState;
+
+const MAX_MODEL_NAME_BYTES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // OpenAI request types
@@ -229,6 +231,8 @@ pub fn convert_messages(messages: &[OpenAiMessage]) -> Result<Vec<ChatMessage>, 
                                 name: tc.function.name.clone(),
                                 arguments: serde_json::from_str(&tc.function.arguments)
                                     .unwrap_or(serde_json::Value::Object(Default::default())),
+                                reasoning: None,
+                                signature: None,
                             })
                             .collect();
                         Ok(ChatMessage::assistant_with_tool_calls(
@@ -242,9 +246,11 @@ pub fn convert_messages(messages: &[OpenAiMessage]) -> Result<Vec<ChatMessage>, 
                 _ => Ok(ChatMessage {
                     role,
                     content: m.content.as_deref().unwrap_or("").to_string(),
+                    content_parts: Vec::new(),
                     tool_call_id: None,
                     name: m.name.clone(),
                     tool_calls: None,
+                    reasoning: None,
                 }),
             }
         })
@@ -380,6 +386,27 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+fn validate_model_name(model: &str) -> Result<(), String> {
+    let trimmed = model.trim();
+
+    if trimmed.is_empty() {
+        return Err("model must not be empty".to_string());
+    }
+    if trimmed != model {
+        return Err("model must not have leading or trailing whitespace".to_string());
+    }
+    if model.len() > MAX_MODEL_NAME_BYTES {
+        return Err(format!(
+            "model must be at most {} bytes",
+            MAX_MODEL_NAME_BYTES
+        ));
+    }
+    if model.chars().any(char::is_control) {
+        return Err("model contains control characters".to_string());
+    }
+    Ok(())
+}
+
 /// Extract stop sequences from the flexible `stop` field.
 fn parse_stop(val: &serde_json::Value) -> Option<Vec<String>> {
     match val {
@@ -395,15 +422,54 @@ fn parse_stop(val: &serde_json::Value) -> Option<Vec<String>> {
     }
 }
 
+fn build_completion_request(
+    req: &OpenAiChatRequest,
+    messages: Vec<ChatMessage>,
+) -> CompletionRequest {
+    let mut comp_req = CompletionRequest::new(messages).with_model(req.model.clone());
+    if let Some(t) = req.temperature {
+        comp_req = comp_req.with_temperature(t);
+    }
+    if let Some(mt) = req.max_tokens {
+        comp_req = comp_req.with_max_tokens(mt);
+    }
+    if let Some(stops) = req.stop.as_ref().and_then(parse_stop) {
+        comp_req.stop_sequences = Some(stops);
+    }
+    comp_req
+}
+
+fn build_tool_request(
+    req: &OpenAiChatRequest,
+    messages: Vec<ChatMessage>,
+) -> ToolCompletionRequest {
+    let tools = convert_tools(req.tools.as_deref().unwrap_or(&[]));
+    let mut tool_req = ToolCompletionRequest::new(messages, tools).with_model(req.model.clone());
+    if let Some(t) = req.temperature {
+        tool_req = tool_req.with_temperature(t);
+    }
+    if let Some(mt) = req.max_tokens {
+        tool_req = tool_req.with_max_tokens(mt);
+    }
+    if let Some(stops) = req.stop.as_ref().and_then(parse_stop) {
+        tool_req = tool_req.with_stop_sequences(stops);
+    }
+    if let Some(choice) = req.tool_choice.as_ref().and_then(normalize_tool_choice) {
+        tool_req = tool_req.with_tool_choice(choice);
+    }
+    tool_req
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
 pub async fn chat_completions_handler(
     State(state): State<Arc<GatewayState>>,
+    super::auth::AuthenticatedUser(user): super::auth::AuthenticatedUser,
     Json(req): Json<OpenAiChatRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<OpenAiErrorResponse>)> {
-    if !state.chat_rate_limiter.check() {
+    if !state.chat_rate_limiter.check(&user.user_id) {
         return Err(openai_error(
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded. Please try again later.",
@@ -426,29 +492,17 @@ pub async fn chat_completions_handler(
             "invalid_request_error",
         ));
     }
-
-    // Validate the requested model matches the active model.
-    // Per-request model switching is not yet supported (see GH issue).
-    let active_model = llm.active_model_name();
-    if req.model != active_model {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(OpenAiErrorResponse {
-                error: OpenAiErrorDetail {
-                    message: format!(
-                        "Model '{}' not found. The active model is '{}'.",
-                        req.model, active_model
-                    ),
-                    error_type: "invalid_request_error".to_string(),
-                    param: Some("model".to_string()),
-                    code: Some("model_not_found".to_string()),
-                },
-            }),
+    if let Err(e) = validate_model_name(&req.model) {
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            e,
+            "invalid_request_error",
         ));
     }
 
     let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
     let stream = req.stream.unwrap_or(false);
+    let requested_model = req.model.clone();
 
     if stream {
         return handle_streaming(llm.clone(), req, has_tools)
@@ -460,29 +514,17 @@ pub async fn chat_completions_handler(
 
     let messages = convert_messages(&req.messages)
         .map_err(|e| openai_error(StatusCode::BAD_REQUEST, e, "invalid_request_error"))?;
-    let model_name = llm.active_model_name();
     let id = chat_completion_id();
     let created = unix_timestamp();
 
     if has_tools {
-        let tools = convert_tools(req.tools.as_deref().unwrap_or(&[]));
-        let mut tool_req = ToolCompletionRequest::new(messages, tools);
-        if let Some(t) = req.temperature {
-            tool_req = tool_req.with_temperature(t);
-        }
-        if let Some(mt) = req.max_tokens {
-            tool_req = tool_req.with_max_tokens(mt);
-        }
-        if let Some(ref tc) = req.tool_choice
-            && let Some(choice) = normalize_tool_choice(tc)
-        {
-            tool_req = tool_req.with_tool_choice(choice);
-        }
+        let tool_req = build_tool_request(&req, messages);
 
         let resp = llm
             .complete_with_tools(tool_req)
             .await
             .map_err(map_llm_error)?;
+        let model_name = llm.effective_model_name(Some(requested_model.as_str()));
 
         let tool_calls_openai = if resp.tool_calls.is_empty() {
             None
@@ -515,18 +557,10 @@ pub async fn chat_completions_handler(
 
         Ok(Json(response).into_response())
     } else {
-        let mut comp_req = CompletionRequest::new(messages);
-        if let Some(t) = req.temperature {
-            comp_req = comp_req.with_temperature(t);
-        }
-        if let Some(mt) = req.max_tokens {
-            comp_req = comp_req.with_max_tokens(mt);
-        }
-        if let Some(ref stop_val) = req.stop {
-            comp_req.stop_sequences = parse_stop(stop_val);
-        }
+        let comp_req = build_completion_request(&req, messages);
 
         let resp = llm.complete(comp_req).await.map_err(map_llm_error)?;
+        let model_name = llm.effective_model_name(Some(requested_model.as_str()));
 
         let response = OpenAiChatResponse {
             id,
@@ -563,14 +597,14 @@ pub async fn chat_completions_handler(
 /// proper HTTP errors instead of SSE error events. True token streaming can be
 /// added later by extending `LlmProvider` with a `complete_stream()` method.
 async fn handle_streaming(
-    llm: Arc<dyn crate::llm::LlmProvider>,
+    llm: Arc<dyn ironclaw_llm::LlmProvider>,
     req: OpenAiChatRequest,
     has_tools: bool,
 ) -> Result<Response, (StatusCode, Json<OpenAiErrorResponse>)> {
     let messages = convert_messages(&req.messages)
         .map_err(|e| openai_error(StatusCode::BAD_REQUEST, e, "invalid_request_error"))?;
 
-    let model_name = llm.active_model_name();
+    let requested_model = req.model.clone();
     let id = chat_completion_id();
     let created = unix_timestamp();
 
@@ -578,42 +612,22 @@ async fn handle_streaming(
     // Since streaming is simulated (LlmProvider returns complete responses),
     // this lets us return proper HTTP errors on failure.
     enum LlmResult {
-        Simple(crate::llm::CompletionResponse),
-        WithTools(crate::llm::ToolCompletionResponse),
+        Simple(ironclaw_llm::CompletionResponse),
+        WithTools(ironclaw_llm::ToolCompletionResponse),
     }
 
     let llm_result = if has_tools {
-        let tools = convert_tools(req.tools.as_deref().unwrap_or(&[]));
-        let mut tool_req = ToolCompletionRequest::new(messages, tools);
-        if let Some(t) = req.temperature {
-            tool_req = tool_req.with_temperature(t);
-        }
-        if let Some(mt) = req.max_tokens {
-            tool_req = tool_req.with_max_tokens(mt);
-        }
-        if let Some(ref tc) = req.tool_choice
-            && let Some(choice) = normalize_tool_choice(tc)
-        {
-            tool_req = tool_req.with_tool_choice(choice);
-        }
+        let tool_req = build_tool_request(&req, messages);
         LlmResult::WithTools(
             llm.complete_with_tools(tool_req)
                 .await
                 .map_err(map_llm_error)?,
         )
     } else {
-        let mut comp_req = CompletionRequest::new(messages);
-        if let Some(t) = req.temperature {
-            comp_req = comp_req.with_temperature(t);
-        }
-        if let Some(mt) = req.max_tokens {
-            comp_req = comp_req.with_max_tokens(mt);
-        }
-        if let Some(ref stop_val) = req.stop {
-            comp_req.stop_sequences = parse_stop(stop_val);
-        }
+        let comp_req = build_completion_request(&req, messages);
         LlmResult::Simple(llm.complete(comp_req).await.map_err(map_llm_error)?)
     };
+    let model_name = llm.effective_model_name(Some(requested_model.as_str()));
 
     // LLM succeeded — emit the response as SSE chunks
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
@@ -943,6 +957,8 @@ mod tests {
             id: "call_abc".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"query": "rust"}),
+            reasoning: None,
+            signature: None,
         }];
 
         let converted = convert_tool_calls_to_openai(&calls);
@@ -1090,5 +1106,19 @@ mod tests {
     fn test_parse_stop_null() {
         let v = serde_json::Value::Null;
         assert_eq!(parse_stop(&v), None);
+    }
+
+    #[test]
+    fn test_validate_model_name_rejects_leading_or_trailing_whitespace() {
+        let err = validate_model_name(" gpt-4").unwrap_err();
+        assert!(err.contains("leading or trailing whitespace"));
+
+        let err = validate_model_name("gpt-4 ").unwrap_err();
+        assert!(err.contains("leading or trailing whitespace"));
+    }
+
+    #[test]
+    fn test_validate_model_name_accepts_normal_name() {
+        assert!(validate_model_name("gpt-4").is_ok());
     }
 }

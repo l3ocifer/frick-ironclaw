@@ -11,12 +11,24 @@ use std::io::{self, Write};
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, ClearType},
 };
 use secrecy::SecretString;
+
+/// Drain any residual key events already queued in the terminal buffer.
+///
+/// On Windows, transitioning between raw mode and cooked mode (or between
+/// successive raw-mode prompts) can leave stale events (e.g. the Release
+/// half of an Enter keypress) in the queue. Consuming them with a
+/// non-blocking poll prevents the next prompt from mis-firing.
+fn drain_pending_events() {
+    while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+        let _ = event::read();
+    }
+}
 
 /// Display a numbered menu and get user selection.
 ///
@@ -94,6 +106,7 @@ pub fn select_many(prompt: &str, options: &[(&str, bool)]) -> io::Result<Vec<usi
     let mut cursor_pos = 0;
 
     terminal::enable_raw_mode()?;
+    drain_pending_events();
     execute!(stdout, cursor::Hide)?;
 
     let result = (|| {
@@ -110,34 +123,54 @@ pub fn select_many(prompt: &str, options: &[(&str, bool)]) -> io::Result<Vec<usi
             writeln!(stdout, "\r")?;
 
             for (i, (label, _)) in options.iter().enumerate() {
-                let checkbox = if selected[i] { "[x]" } else { "[ ]" };
-                let prefix = if i == cursor_pos { ">" } else { " " };
-
                 if i == cursor_pos {
+                    // Cursor line: cyan cursor, then colored checkbox
                     execute!(stdout, SetForegroundColor(Color::Cyan))?;
-                    writeln!(stdout, "  {} {} {}\r", prefix, checkbox, label)?;
+                    write!(stdout, "  \u{25b8} ")?;
+                    if selected[i] {
+                        execute!(stdout, SetForegroundColor(Color::Green))?;
+                        write!(stdout, "[\u{2713}]")?;
+                    } else {
+                        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+                        write!(stdout, "[\u{00b7}]")?;
+                    }
+                    execute!(stdout, SetForegroundColor(Color::Cyan))?;
+                    writeln!(stdout, " {}\r", label)?;
                     execute!(stdout, ResetColor)?;
                 } else {
-                    writeln!(stdout, "  {} {} {}\r", prefix, checkbox, label)?;
+                    write!(stdout, "    ")?;
+                    if selected[i] {
+                        execute!(stdout, SetForegroundColor(Color::Green))?;
+                        write!(stdout, "[\u{2713}]")?;
+                        execute!(stdout, ResetColor)?;
+                    } else {
+                        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+                        write!(stdout, "[\u{00b7}]")?;
+                        execute!(stdout, ResetColor)?;
+                    }
+                    writeln!(stdout, " {}\r", label)?;
                 }
             }
 
             stdout.flush()?;
 
-            // Read key
+            // Read key — only act on Press events to avoid double-firing
+            // from Release/Repeat events on Windows.
             if let Event::Key(KeyEvent {
-                code, modifiers, ..
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
             }) = event::read()?
             {
                 match code {
                     KeyCode::Up => {
                         cursor_pos = cursor_pos.saturating_sub(1);
                     }
-                    KeyCode::Down => {
-                        if cursor_pos < options.len() - 1 {
-                            cursor_pos += 1;
-                        }
+                    KeyCode::Down if cursor_pos < options.len() - 1 => {
+                        cursor_pos += 1;
                     }
+                    KeyCode::Down => {}
                     KeyCode::Char(' ') => {
                         selected[cursor_pos] = !selected[cursor_pos];
                     }
@@ -200,22 +233,28 @@ fn read_secret_line() -> io::Result<SecretString> {
     let mut input = String::new();
     let mut stdout = io::stdout();
 
+    drain_pending_events();
+
     loop {
+        // Only act on Press events to avoid double-firing from
+        // Release/Repeat events on Windows.
         if let Event::Key(KeyEvent {
-            code, modifiers, ..
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            ..
         }) = event::read()?
         {
             match code {
                 KeyCode::Enter => {
                     break;
                 }
-                KeyCode::Backspace => {
-                    if !input.is_empty() {
-                        input.pop();
-                        execute!(stdout, Print("\x08 \x08"))?;
-                        stdout.flush()?;
-                    }
+                KeyCode::Backspace if !input.is_empty() => {
+                    input.pop();
+                    execute!(stdout, Print("\x08 \x08"))?;
+                    stdout.flush()?;
                 }
+                KeyCode::Backspace => {}
                 KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "Ctrl-C"));
                 }
@@ -260,6 +299,14 @@ pub fn confirm(prompt: &str, default: bool) -> io::Result<bool> {
     })
 }
 
+/// Print a minimal wordmark banner.
+pub fn print_banner() {
+    use crate::cli::fmt;
+    println!();
+    println!("  {}ironclaw{}", fmt::bold_accent(), fmt::reset());
+    println!();
+}
+
 /// Print a styled header box.
 ///
 /// # Example
@@ -272,40 +319,75 @@ pub fn print_header(text: &str) {
     let border = "─".repeat(width);
 
     println!();
-    println!("╭{}╮", border);
+    println!("┌{}┐", border);
     println!("│  {}  │", text);
-    println!("╰{}╯", border);
+    println!("└{}┘", border);
     println!();
 }
 
-/// Print a step indicator.
+/// Print a compact dot-based step indicator.
+///
+/// `●` = completed (green/success), `◉` = current (accent), `○` = remaining (dim).
 ///
 /// # Example
 ///
 /// ```ignore
-/// print_step(1, 3, "NEAR AI Authentication");
-/// // Output: Step 1/3: NEAR AI Authentication
-/// //         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// print_step(3, 5, "Model Selection");
+/// // Output:   ● ● ◉ ○ ○   Model Selection
 /// ```
 pub fn print_step(current: usize, total: usize, name: &str) {
-    println!("Step {}/{}: {}", current, total, name);
-    println!("{}", "━".repeat(32));
+    use crate::cli::fmt;
+    let mut dots = String::new();
+    for i in 1..=total {
+        if i > 1 {
+            dots.push(' ');
+        }
+        if i < current {
+            dots.push_str(&format!("{}\u{25CF}{}", fmt::success(), fmt::reset())); // ● green
+        } else if i == current {
+            dots.push_str(&format!("{}\u{25C9}{}", fmt::accent(), fmt::reset())); // ◉ accent
+        } else {
+            dots.push_str(&format!("{}\u{25CB}{}", fmt::dim(), fmt::reset())); // ○ dim
+        }
+    }
+    println!("  {}   {}", dots, name);
     println!();
 }
 
-/// Print a success message with checkmark.
+/// Print a success message with green checkmark.
 pub fn print_success(message: &str) {
-    println!("✓ {}", message);
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, SetForegroundColor(Color::Green));
+    print!("✓");
+    let _ = execute!(stdout, ResetColor);
+    println!(" {}", message);
 }
 
-/// Print an error message.
+/// Print an error message with red X.
 pub fn print_error(message: &str) {
-    eprintln!("✗ {}", message);
+    let mut stderr = io::stderr();
+    let _ = execute!(stderr, SetForegroundColor(Color::Red));
+    eprint!("✗");
+    let _ = execute!(stderr, ResetColor);
+    eprintln!(" {}", message);
 }
 
-/// Print an info message.
+/// Print a warning message with yellow exclamation.
+pub fn print_warning(message: &str) {
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, SetForegroundColor(Color::Yellow));
+    print!("!");
+    let _ = execute!(stdout, ResetColor);
+    println!(" {}", message);
+}
+
+/// Print an info message with blue info icon.
 pub fn print_info(message: &str) {
-    println!("  {}", message);
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, SetForegroundColor(Color::Blue));
+    print!("ℹ");
+    let _ = execute!(stdout, ResetColor);
+    println!(" {}", message);
 }
 
 /// Read a simple line of input with a prompt.
@@ -357,5 +439,16 @@ mod tests {
     fn test_step_indicator() {
         super::print_step(1, 3, "Test Step");
         super::print_step(3, 3, "Final Step");
+    }
+
+    #[test]
+    fn test_print_functions_do_not_panic() {
+        super::print_success("operation completed");
+        super::print_error("something went wrong");
+        super::print_info("here is some information");
+        // Also test with empty strings
+        super::print_success("");
+        super::print_error("");
+        super::print_info("");
     }
 }

@@ -6,6 +6,17 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// AWS Bedrock parameters needed by the embedding provider.
+///
+/// Defined here rather than re-using `ironclaw_llm::BedrockConfig` so the
+/// embeddings layer does not depend on LLM-side config types. Callers
+/// (which already hold an `LlmConfig`) translate at the boundary.
+#[derive(Debug, Clone)]
+pub struct BedrockEmbeddingSetup {
+    pub region: String,
+    pub profile: Option<String>,
+}
+
 /// Error type for embedding operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddingError {
@@ -60,12 +71,18 @@ pub trait EmbeddingProvider: Send + Sync {
     }
 }
 
+/// Default base URL for the OpenAI API.
+const OPENAI_API_BASE_URL: &str = "https://api.openai.com";
+
 /// OpenAI embedding provider using text-embedding-ada-002 or text-embedding-3-small.
+///
+/// Supports any OpenAI-compatible embedding endpoint via [`with_base_url`](Self::with_base_url).
 pub struct OpenAiEmbeddings {
     client: reqwest::Client,
     api_key: String,
     model: String,
     dimension: usize,
+    base_url: String,
 }
 
 impl OpenAiEmbeddings {
@@ -78,6 +95,7 @@ impl OpenAiEmbeddings {
             api_key: api_key.into(),
             model: "text-embedding-3-small".to_string(),
             dimension: 1536,
+            base_url: OPENAI_API_BASE_URL.to_string(),
         }
     }
 
@@ -88,6 +106,7 @@ impl OpenAiEmbeddings {
             api_key: api_key.into(),
             model: "text-embedding-ada-002".to_string(),
             dimension: 1536,
+            base_url: OPENAI_API_BASE_URL.to_string(),
         }
     }
 
@@ -98,6 +117,7 @@ impl OpenAiEmbeddings {
             api_key: api_key.into(),
             model: "text-embedding-3-large".to_string(),
             dimension: 3072,
+            base_url: OPENAI_API_BASE_URL.to_string(),
         }
     }
 
@@ -112,7 +132,34 @@ impl OpenAiEmbeddings {
             api_key: api_key.into(),
             model: model.into(),
             dimension,
+            base_url: OPENAI_API_BASE_URL.to_string(),
         }
+    }
+
+    /// Set a custom base URL for OpenAI-compatible embedding providers.
+    ///
+    /// The URL must use `http://` or `https://` scheme. If no scheme is present,
+    /// `https://` is prepended automatically. Trailing slashes are stripped.
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        let url = base_url.trim();
+
+        // Auto-prepend https:// if no scheme is present.
+        let mut url = if !url.starts_with("http://") && !url.starts_with("https://") {
+            tracing::debug!(
+                "No scheme in embedding base URL '{}', prepending https://",
+                url
+            );
+            format!("https://{url}")
+        } else {
+            url.to_string()
+        };
+
+        while url.ends_with('/') {
+            url.pop();
+        }
+
+        self.base_url = url;
+        self
     }
 }
 
@@ -173,9 +220,11 @@ impl EmbeddingProvider for OpenAiEmbeddings {
             input: texts,
         };
 
+        let url = format!("{}/v1/embeddings", self.base_url);
+
         let response = self
             .client
-            .post("https://api.openai.com/v1/embeddings")
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&request)
             .send()
@@ -188,12 +237,9 @@ impl EmbeddingProvider for OpenAiEmbeddings {
         }
 
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(std::time::Duration::from_secs);
+            let retry_after = Some(ironclaw_llm::retry::parse_retry_after(
+                response.headers().get("retry-after"),
+            ));
             return Err(EmbeddingError::RateLimited { retry_after });
         }
 
@@ -219,7 +265,7 @@ impl EmbeddingProvider for OpenAiEmbeddings {
 pub struct NearAiEmbeddings {
     client: reqwest::Client,
     base_url: String,
-    session: std::sync::Arc<crate::llm::SessionManager>,
+    session: std::sync::Arc<ironclaw_llm::SessionManager>,
     model: String,
     dimension: usize,
 }
@@ -230,7 +276,7 @@ impl NearAiEmbeddings {
     /// Uses the same session manager as the LLM provider for auth.
     pub fn new(
         base_url: impl Into<String>,
-        session: std::sync::Arc<crate::llm::SessionManager>,
+        session: std::sync::Arc<ironclaw_llm::SessionManager>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -329,12 +375,9 @@ impl EmbeddingProvider for NearAiEmbeddings {
         }
 
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(std::time::Duration::from_secs);
+            let retry_after = Some(ironclaw_llm::retry::parse_retry_after(
+                response.headers().get("retry-after"),
+            ));
             return Err(EmbeddingError::RateLimited { retry_after });
         }
 
@@ -351,6 +394,263 @@ impl EmbeddingProvider for NearAiEmbeddings {
         })?;
 
         Ok(result.data.into_iter().map(|d| d.embedding).collect())
+    }
+}
+
+/// AWS Bedrock embedding provider using Titan Text Embeddings V2.
+#[cfg(feature = "bedrock")]
+pub struct BedrockEmbeddings {
+    client: aws_sdk_bedrockruntime::Client,
+    model: String,
+    dimension: usize,
+}
+
+#[cfg(feature = "bedrock")]
+impl BedrockEmbeddings {
+    /// Create a new Bedrock embedding provider.
+    pub async fn new(
+        setup: &BedrockEmbeddingSetup,
+        model: impl Into<String>,
+        dimension: usize,
+    ) -> Result<Self, EmbeddingError> {
+        let mut builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(setup.region.clone()));
+        if let Some(ref profile) = setup.profile {
+            builder = builder.profile_name(profile);
+        }
+
+        let sdk_config = builder.load().await;
+        Ok(Self {
+            client: aws_sdk_bedrockruntime::Client::new(&sdk_config),
+            model: model.into(),
+            dimension,
+        })
+    }
+}
+
+#[cfg(feature = "bedrock")]
+#[derive(Debug, Serialize)]
+struct BedrockTitanEmbeddingRequest<'a> {
+    #[serde(rename = "inputText")]
+    input_text: &'a str,
+    dimensions: usize,
+    normalize: bool,
+}
+
+#[cfg(feature = "bedrock")]
+#[derive(Debug, Deserialize)]
+struct BedrockTitanEmbeddingResponse {
+    embedding: Vec<f32>,
+}
+
+#[cfg(feature = "bedrock")]
+fn map_bedrock_invoke_model_error<R: std::fmt::Debug>(
+    error: &aws_sdk_bedrockruntime::error::SdkError<
+        aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError,
+        R,
+    >,
+) -> EmbeddingError {
+    use aws_sdk_bedrockruntime::error::SdkError;
+    use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
+
+    match error {
+        SdkError::ServiceError(service_err) => match service_err.err() {
+            InvokeModelError::ThrottlingException(_) => {
+                EmbeddingError::RateLimited { retry_after: None }
+            }
+            InvokeModelError::AccessDeniedException(_) => EmbeddingError::AuthFailed,
+            InvokeModelError::ValidationException(e) => EmbeddingError::InvalidResponse(format!(
+                "Bedrock validation error: {}",
+                e.message().unwrap_or("unknown")
+            )),
+            InvokeModelError::ModelNotReadyException(e) => EmbeddingError::HttpError(format!(
+                "Bedrock model not ready: {}",
+                e.message().unwrap_or("unknown")
+            )),
+            other => EmbeddingError::HttpError(format!("Bedrock service error: {other:?}")),
+        },
+        SdkError::TimeoutError(_) => {
+            EmbeddingError::HttpError("Bedrock request timed out".to_string())
+        }
+        other => EmbeddingError::HttpError(format!("Bedrock request failed: {other:?}")),
+    }
+}
+
+#[cfg(feature = "bedrock")]
+#[async_trait]
+impl EmbeddingProvider for BedrockEmbeddings {
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    fn max_input_length(&self) -> usize {
+        32_000
+    }
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        if text.len() > self.max_input_length() {
+            return Err(EmbeddingError::TextTooLong {
+                length: text.len(),
+                max: self.max_input_length(),
+            });
+        }
+
+        let request = BedrockTitanEmbeddingRequest {
+            input_text: text,
+            dimensions: self.dimension,
+            normalize: true,
+        };
+
+        let body = serde_json::to_vec(&request).map_err(|e| {
+            EmbeddingError::InvalidResponse(format!("Failed to serialize request: {}", e))
+        })?;
+
+        let response = self
+            .client
+            .invoke_model()
+            .model_id(&self.model)
+            .content_type("application/json")
+            .accept("application/json")
+            .body(aws_smithy_types::Blob::new(body))
+            .send()
+            .await
+            .map_err(|e| map_bedrock_invoke_model_error(&e))?;
+
+        let result: BedrockTitanEmbeddingResponse = serde_json::from_slice(response.body.as_ref())
+            .map_err(|e| {
+                EmbeddingError::InvalidResponse(format!("Failed to parse response: {}", e))
+            })?;
+
+        if result.embedding.len() != self.dimension {
+            return Err(EmbeddingError::InvalidResponse(format!(
+                "Bedrock returned embedding of dimension {}, expected {}",
+                result.embedding.len(),
+                self.dimension,
+            )));
+        }
+
+        Ok(result.embedding)
+    }
+}
+
+/// Ollama embedding provider using a local Ollama instance.
+///
+/// Ollama serves embedding models (e.g. `nomic-embed-text`, `mxbai-embed-large`)
+/// via a REST API, typically at `http://localhost:11434`.
+pub struct OllamaEmbeddings {
+    client: reqwest::Client,
+    base_url: String,
+    model: String,
+    dimension: usize,
+}
+
+impl OllamaEmbeddings {
+    /// Create a new Ollama embedding provider.
+    ///
+    /// Defaults to `nomic-embed-text` (768 dimensions).
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into(),
+            model: "nomic-embed-text".to_string(),
+            dimension: 768,
+        }
+    }
+
+    /// Use a specific model with a given dimension.
+    pub fn with_model(mut self, model: impl Into<String>, dimension: usize) -> Self {
+        self.model = model.into();
+        self.dimension = dimension;
+        self
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaEmbedRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaEmbedResponse {
+    embeddings: Vec<Vec<f32>>,
+}
+
+#[async_trait]
+impl EmbeddingProvider for OllamaEmbeddings {
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    fn max_input_length(&self) -> usize {
+        // Most Ollama embedding models support 8192 tokens (~32k chars)
+        32_000
+    }
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        if text.len() > self.max_input_length() {
+            return Err(EmbeddingError::TextTooLong {
+                length: text.len(),
+                max: self.max_input_length(),
+            });
+        }
+
+        let embeddings = self.embed_batch(&[text.to_string()]).await?;
+        embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| EmbeddingError::InvalidResponse("No embedding returned".to_string()))
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let request = OllamaEmbedRequest {
+            model: &self.model,
+            input: texts,
+        };
+
+        let url = format!("{}/api/embed", self.base_url);
+
+        let response = self.client.post(&url).json(&request).send().await?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(EmbeddingError::HttpError(format!(
+                "Ollama returned HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        let result: OllamaEmbedResponse = response.json().await.map_err(|e| {
+            EmbeddingError::InvalidResponse(format!("Failed to parse Ollama response: {}", e))
+        })?;
+
+        // Validate that returned embeddings match the configured dimension.
+        for (i, emb) in result.embeddings.iter().enumerate() {
+            if emb.len() != self.dimension {
+                return Err(EmbeddingError::InvalidResponse(format!(
+                    "Ollama returned embedding of dimension {}, expected {} at index {}",
+                    emb.len(),
+                    self.dimension,
+                    i
+                )));
+            }
+        }
+
+        Ok(result.embeddings)
     }
 }
 
@@ -458,9 +758,37 @@ mod tests {
         let provider = OpenAiEmbeddings::new("test-key");
         assert_eq!(provider.dimension(), 1536);
         assert_eq!(provider.model_name(), "text-embedding-3-small");
+        assert_eq!(provider.base_url, OPENAI_API_BASE_URL);
 
         let provider = OpenAiEmbeddings::large("test-key");
         assert_eq!(provider.dimension(), 3072);
         assert_eq!(provider.model_name(), "text-embedding-3-large");
+        assert_eq!(provider.base_url, OPENAI_API_BASE_URL);
+    }
+
+    #[test]
+    fn test_openai_with_base_url_valid() {
+        let provider =
+            OpenAiEmbeddings::new("test-key").with_base_url("https://custom.example.com");
+        assert_eq!(provider.base_url, "https://custom.example.com");
+    }
+
+    #[test]
+    fn test_openai_with_base_url_strips_trailing_slashes() {
+        let provider =
+            OpenAiEmbeddings::new("test-key").with_base_url("https://custom.example.com///");
+        assert_eq!(provider.base_url, "https://custom.example.com");
+    }
+
+    #[test]
+    fn test_openai_with_base_url_http_scheme() {
+        let provider = OpenAiEmbeddings::new("test-key").with_base_url("http://localhost:8080");
+        assert_eq!(provider.base_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_openai_with_base_url_schemeless_prepends_https() {
+        let provider = OpenAiEmbeddings::new("test-key").with_base_url("custom.example.com/v1");
+        assert_eq!(provider.base_url, "https://custom.example.com/v1");
     }
 }

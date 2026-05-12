@@ -9,6 +9,13 @@ pub struct SandboxConfig {
     pub enabled: bool,
     /// Security policy for sandbox execution.
     pub policy: SandboxPolicy,
+    /// Whether `FullAccess` policy is explicitly allowed.
+    ///
+    /// When `policy` is `FullAccess` but this field is `false`, the manager
+    /// will return `SandboxError::Config` and refuse to execute. This is an
+    /// intentional double opt-in to prevent accidental host execution.
+    /// Set via `SANDBOX_ALLOW_FULL_ACCESS=true` env var.
+    pub allow_full_access: bool,
     /// Default timeout for command execution.
     pub timeout: Duration,
     /// Memory limit in megabytes.
@@ -28,13 +35,14 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            enabled: false, // Disabled by default until Docker is confirmed available
+            enabled: true, // Startup check disables gracefully if Docker unavailable
             policy: SandboxPolicy::ReadOnly,
+            allow_full_access: false,
             timeout: Duration::from_secs(120),
             memory_limit_mb: 2048,
             cpu_shares: 1024,
             network_allowlist: default_allowlist(),
-            image: "ghcr.io/nearai/sandbox:latest".to_string(),
+            image: "ironclaw-worker:latest".to_string(),
             auto_pull_image: true,
             proxy_port: 0,
         }
@@ -66,7 +74,16 @@ pub enum SandboxPolicy {
     WorkspaceWrite,
 
     /// Full access (no sandbox). Use with extreme caution.
-    /// This bypasses all isolation and runs directly on host.
+    ///
+    /// **BLAST RADIUS**: This bypasses Docker entirely and executes commands
+    /// via `sh -c` directly on the host with the agent process's full
+    /// privileges. If prompt injection bypasses tool approval, arbitrary
+    /// host shell commands can run. File system, network, and environment
+    /// are completely unrestricted.
+    ///
+    /// Requires `SANDBOX_ALLOW_FULL_ACCESS=true` as a second opt-in.
+    /// Without it, the sandbox manager will return `SandboxError::Config`
+    /// and refuse to execute.
     FullAccess,
 }
 
@@ -159,56 +176,14 @@ pub fn default_allowlist() -> Vec<String> {
     ]
 }
 
-/// Credential injection configuration.
-#[derive(Debug, Clone)]
-pub struct CredentialMapping {
-    /// Domain this credential applies to.
-    pub domain: String,
-    /// Name of the secret to inject.
-    pub secret_name: String,
-    /// Where to inject the credential.
-    pub location: CredentialLocation,
-}
-
-/// Where to inject a credential in an HTTP request.
-#[derive(Debug, Clone)]
-pub enum CredentialLocation {
-    /// Inject as Authorization: Bearer <token>
-    AuthorizationBearer,
-    /// Inject as a custom header.
-    Header(String),
-    /// Inject as a query parameter.
-    QueryParam(String),
-}
-
-impl Default for CredentialMapping {
-    fn default() -> Self {
-        Self {
-            domain: String::new(),
-            secret_name: String::new(),
-            location: CredentialLocation::AuthorizationBearer,
-        }
-    }
-}
-
 /// Default credential mappings for common APIs.
-pub fn default_credential_mappings() -> Vec<CredentialMapping> {
+pub fn default_credential_mappings() -> Vec<crate::secrets::CredentialMapping> {
+    use crate::secrets::CredentialMapping;
+
     vec![
-        CredentialMapping {
-            domain: "api.openai.com".to_string(),
-            secret_name: "OPENAI_API_KEY".to_string(),
-            location: CredentialLocation::AuthorizationBearer,
-        },
-        CredentialMapping {
-            domain: "api.anthropic.com".to_string(),
-            secret_name: "ANTHROPIC_API_KEY".to_string(),
-            location: CredentialLocation::Header("x-api-key".to_string()),
-        },
-        CredentialMapping {
-            domain: "api.near.ai".to_string(),
-            secret_name: "NEARAI_API_KEY".to_string(),
-            location: CredentialLocation::AuthorizationBearer,
-        },
+        CredentialMapping::bearer("OPENAI_API_KEY", "api.openai.com"),
+        CredentialMapping::header("ANTHROPIC_API_KEY", "x-api-key", "api.anthropic.com"),
+        CredentialMapping::bearer("NEARAI_API_KEY", "api.near.ai"),
     ]
 }
 

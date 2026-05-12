@@ -4,12 +4,12 @@
 //! This matches NEAR blockchain patterns for deterministic, isolated execution.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
-use wasmtime::{Config, Engine, OptLevel};
+use wasmtime::{Cache, Config, Engine, OptLevel};
 
 use crate::tools::wasm::error::WasmError;
 use crate::tools::wasm::limits::{FuelConfig, ResourceLimits};
@@ -17,6 +17,60 @@ use crate::tools::wasm::limits::{FuelConfig, ResourceLimits};
 /// Default epoch tick interval. Each tick increments the engine's epoch counter,
 /// which causes any store with an expired epoch deadline to trap.
 pub const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Enable Wasmtime's persistent compilation cache for a [`Config`].
+///
+/// If `explicit_dir` is `Some`, this writes a small cache TOML file pointing
+/// at that directory and loads it with [`Cache::from_file`].
+///
+/// If `explicit_dir` is `None`, we load Wasmtime's default cache configuration
+/// by calling `Cache::from_file(None)`.
+///
+/// On Windows, the caller typically passes an engine-specific directory keyed
+/// by `label` to avoid OS error 33 (`ERROR_LOCK_VIOLATION`) when multiple
+/// engines memory-map files in the same cache directory. See #448.
+pub fn enable_compilation_cache(
+    wasmtime_config: &mut Config,
+    label: &str,
+    explicit_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    // If the caller provided an explicit directory, or we're on Windows and
+    // need per-engine isolation, write a TOML config with a custom directory.
+    let custom_dir = match explicit_dir {
+        Some(dir) => Some(dir.to_path_buf()),
+        #[cfg(windows)]
+        None => {
+            let base = dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("ironclaw");
+            Some(base.join(format!("wasmtime-{}", label)))
+        }
+        #[cfg(not(windows))]
+        None => {
+            let _ = label;
+            None
+        }
+    };
+
+    match custom_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir)?;
+            let toml_path = dir.join("wasmtime-cache.toml");
+            let escaped = dir
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            let toml_content = format!("[cache]\ndirectory = \"{}\"\n", escaped);
+            std::fs::write(&toml_path, toml_content)?;
+            wasmtime_config.cache(Some(Cache::from_file(Some(&toml_path))?));
+            Ok(())
+        }
+        None => {
+            wasmtime_config.cache(Some(Cache::from_file(None)?));
+            Ok(())
+        }
+    }
+}
 
 /// Configuration for the WASM runtime.
 #[derive(Debug, Clone)]
@@ -64,25 +118,37 @@ impl WasmRuntimeConfig {
 /// A compiled WASM component ready for instantiation.
 ///
 /// Contains the pre-compiled component plus cached metadata extracted
-/// from the component during preparation.
-#[derive(Debug)]
+/// from the component during preparation. Stores the compiled `Component`
+/// directly so instantiation doesn't require recompilation.
 pub struct PreparedModule {
     /// Tool name.
     pub name: String,
     /// Tool description (cached from component).
     pub description: String,
-    /// Parameter schema JSON (cached from component).
+    /// Full parameter schema JSON extracted from the component.
+    /// Used for discovery and coercion, not necessarily for the compact
+    /// schema advertised in the main tools array.
     pub schema: serde_json::Value,
-    /// Compiled component bytes (can be serialized for caching).
-    component_bytes: Vec<u8>,
+    /// Pre-compiled component (cheaply cloneable via internal Arc).
+    component: wasmtime::component::Component,
     /// Resource limits for this tool.
     pub limits: ResourceLimits,
 }
 
 impl PreparedModule {
-    /// Get the compiled component bytes.
-    pub fn component_bytes(&self) -> &[u8] {
-        &self.component_bytes
+    /// Get the pre-compiled component for instantiation.
+    pub fn component(&self) -> &wasmtime::component::Component {
+        &self.component
+    }
+}
+
+impl std::fmt::Debug for PreparedModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedModule")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("limits", &self.limits)
+            .finish()
     }
 }
 
@@ -122,6 +188,20 @@ impl WasmToolRuntime {
 
         // Disable debug info in production for smaller modules
         wasmtime_config.debug_info(false);
+
+        // Enable persistent compilation cache. Wasmtime serializes compiled native
+        // code to disk (~/.cache/wasmtime by default), so subsequent startups
+        // deserialize instead of recompiling — typically 10-50x faster.
+        //
+        // On Windows, each Engine gets its own cache subdirectory to avoid
+        // OS error 33 (ERROR_LOCK_VIOLATION) when multiple engines share the
+        // default cache and Windows holds exclusive locks on memory-mapped
+        // files. See #448.
+        if let Err(e) =
+            enable_compilation_cache(&mut wasmtime_config, "tools", config.cache_dir.as_deref())
+        {
+            tracing::warn!("Failed to enable wasmtime compilation cache: {}", e);
+        }
 
         let engine = Engine::new(&wasmtime_config).map_err(|e| {
             WasmError::EngineCreationFailed(format!("Failed to create Wasmtime engine: {}", e))
@@ -189,17 +269,35 @@ impl WasmToolRuntime {
             let component = wasmtime::component::Component::new(&engine, &wasm_bytes)
                 .map_err(|e| WasmError::CompilationFailed(e.to_string()))?;
 
-            // We need to instantiate briefly to extract metadata.
-            // In a full implementation, we'd use WIT bindgen to get typed access.
-            // For now, we extract what we can from the component.
-            let description = extract_tool_description(&engine, &component)?;
-            let schema = extract_tool_schema(&engine, &component)?;
+            // Briefly instantiate to extract metadata (description + schema)
+            // from the tool's exports, analogous to MCP's list_tools().
+            let effective_limits = limits.clone().unwrap_or(default_limits.clone());
+            let (description, schema) = crate::tools::wasm::wrapper::extract_wasm_metadata(
+                &engine,
+                &component,
+                &effective_limits,
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    name = %name,
+                    error = %e,
+                    "WASM metadata extraction failed, using fallbacks"
+                );
+                (
+                    "WASM sandboxed tool".to_string(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true
+                    }),
+                )
+            });
 
             Ok::<_, WasmError>(PreparedModule {
                 name: name.clone(),
                 description,
                 schema,
-                component_bytes: wasm_bytes,
+                component,
                 limits: limits.unwrap_or(default_limits),
             })
         })
@@ -216,7 +314,7 @@ impl WasmToolRuntime {
                 .insert(prepared.name.clone(), Arc::clone(&prepared));
         }
 
-        tracing::info!(
+        tracing::debug!(
             name = %prepared.name,
             "Prepared WASM tool for execution"
         );
@@ -243,36 +341,6 @@ impl WasmToolRuntime {
     pub async fn clear(&self) {
         self.modules.write().await.clear();
     }
-}
-
-/// Extract tool description from a compiled component.
-///
-/// In a full implementation, this would use WIT bindgen to call the description() export.
-/// For now, we return a placeholder since we can't easily introspect without more setup.
-fn extract_tool_description(
-    _engine: &Engine,
-    _component: &wasmtime::component::Component,
-) -> Result<String, WasmError> {
-    // TODO: Use WIT bindgen to properly extract description
-    // This requires instantiating with a linker, which needs host functions.
-    // For now, tools should have their description set externally.
-    Ok("WASM sandboxed tool".to_string())
-}
-
-/// Extract tool schema from a compiled component.
-///
-/// In a full implementation, this would use WIT bindgen to call the schema() export.
-fn extract_tool_schema(
-    _engine: &Engine,
-    _component: &wasmtime::component::Component,
-) -> Result<serde_json::Value, WasmError> {
-    // TODO: Use WIT bindgen to properly extract schema
-    // For now, return a minimal schema that accepts any object.
-    Ok(serde_json::json!({
-        "type": "object",
-        "properties": {},
-        "additionalProperties": true
-    }))
 }
 
 impl std::fmt::Debug for WasmToolRuntime {
@@ -329,5 +397,75 @@ mod tests {
 
         assert_eq!(limits.memory_bytes, 5 * 1024 * 1024);
         assert_eq!(limits.fuel, 500_000);
+    }
+
+    /// Per-engine cache directories must work correctly to avoid file lock
+    /// conflicts on Windows where multiple engines sharing a single cache
+    /// directory triggers OS error 33 (ERROR_LOCK_VIOLATION). Regression test
+    /// for #448: `enable_compilation_cache` must create a subdirectory and
+    /// produce a valid TOML config that wasmtime can load.
+    #[test]
+    fn test_enable_compilation_cache_with_explicit_dir() {
+        use crate::tools::wasm::runtime::enable_compilation_cache;
+
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let cache_dir = tmp.path().join("custom-cache");
+
+        let mut config = wasmtime::Config::new();
+        enable_compilation_cache(&mut config, "test-engine", Some(cache_dir.as_path()))
+            .expect("enable_compilation_cache should succeed with explicit dir");
+
+        // The cache directory should have been created.
+        assert!(cache_dir.exists(), "cache directory should be created");
+
+        // A TOML config file should have been written inside.
+        let toml_path = cache_dir.join("wasmtime-cache.toml");
+        assert!(toml_path.exists(), "TOML config should be written");
+
+        let content = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(
+            content.contains("directory = \""),
+            "TOML must contain directory key-value setting"
+        );
+    }
+
+    /// Two engines with different labels must get independent cache directories
+    /// so that their file locks do not conflict. Regression test for #448.
+    #[test]
+    fn test_enable_compilation_cache_label_isolation() {
+        use crate::tools::wasm::runtime::enable_compilation_cache;
+
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let base = tmp.path().join("isolation");
+
+        let dir_a = base.join("engine-a");
+        let dir_b = base.join("engine-b");
+
+        let mut config_a = wasmtime::Config::new();
+        enable_compilation_cache(&mut config_a, "a", Some(dir_a.as_path()))
+            .expect("cache A should succeed");
+
+        let mut config_b = wasmtime::Config::new();
+        enable_compilation_cache(&mut config_b, "b", Some(dir_b.as_path()))
+            .expect("cache B should succeed");
+
+        // Both directories must exist and be distinct.
+        assert!(dir_a.exists());
+        assert!(dir_b.exists());
+        assert_ne!(dir_a, dir_b);
+    }
+
+    /// The WASM runtime (Wasmtime engine) must initialise successfully even
+    /// when no tools directory exists on disk. The engine only configures the
+    /// compiler and epoch ticker — loading modules from a directory is a
+    /// separate step. Regression test for a bug where the runtime was gated
+    /// on `tools_dir.exists()`, causing extensions installed after startup
+    /// (e.g. via the web UI) to fail with "WASM runtime not available".
+    #[test]
+    fn test_runtime_creation_without_tools_dir() {
+        let config = WasmRuntimeConfig::for_testing();
+        // Runtime should succeed even though no tools directory exists.
+        let runtime = WasmToolRuntime::new(config).expect("runtime should init without tools dir");
+        assert!(runtime.config().fuel_config.enabled);
     }
 }

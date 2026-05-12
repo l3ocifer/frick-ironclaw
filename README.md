@@ -1,11 +1,28 @@
 <p align="center">
-  <img src="ironclaw.png" alt="IronClaw" width="200"/>
+  <img src="ironclaw.png?v=2" alt="IronClaw" width="200"/>
 </p>
 
 <h1 align="center">IronClaw</h1>
 
 <p align="center">
   <strong>Your secure personal AI assistant, always on your side</strong>
+</p>
+
+<p align="center">
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
+  <a href="https://t.me/ironclawAI"><img src="https://img.shields.io/badge/Telegram-%40ironclawAI-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @ironclawAI" /></a>
+  <a href="https://www.reddit.com/r/ironclawAI/"><img src="https://img.shields.io/badge/Reddit-r%2FironclawAI-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/ironclawAI" /></a>
+  <a href="https://gitcgr.com/nearai/ironclaw">
+    <img src="https://gitcgr.com/badge/nearai/ironclaw.svg" alt="gitcgr" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> |
+  <a href="README.zh-CN.md">简体中文</a> |
+  <a href="README.ru.md">Русский</a> |
+  <a href="README.ja.md">日本語</a> |
+  <a href="README.ko.md">한국어</a>
 </p>
 
 <p align="center">
@@ -89,6 +106,7 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 - Rust 1.90+
 - PostgreSQL 15+ with [pgvector](https://github.com/pgvector/pgvector) extension
 - NEAR AI account (authentication handled via setup wizard)
+- `libclang` and a working C toolchain if you build the WeChat voice/SILK path from source
 
 ## Download or Build
 
@@ -119,6 +137,15 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nearai/ironclaw/release
 </details>
 
 <details>
+  <summary>Install via Homebrew (macOS/Linux)</summary>
+
+```sh
+brew install ironclaw
+```
+
+</details>
+
+<details>
   <summary>Compile the source code (Cargo on Windows, Linux, macOS)</summary>
 
 Install it with `cargo`, just make sure you have [Rust](https://rustup.rs) installed on your computer.
@@ -136,6 +163,14 @@ cargo test
 ```
 
 For **full release** (after modifying channel sources), run `./scripts/build-all.sh` to rebuild channels first.
+
+> **Optional:** WeChat voice notes (`audio/silk`) require the standalone
+> `ironclaw-silk-decoder` helper to be transcribable. It's excluded from the
+> default workspace build because `silk-codec` pulls in `bindgen`/`libclang`.
+> Build it separately with `./crates/ironclaw_silk_decoder/build.sh` (needs
+> libclang + a C toolchain) and put the resulting binary on `$PATH`, beside
+> the `ironclaw` binary, or pointed at by `IRONCLAW_SILK_DECODER`. Without
+> it, voice messages are still delivered — just as raw `audio/silk` blobs.
 
 </details>
 
@@ -268,6 +303,8 @@ External content passes through multiple security layers:
 
 ## Usage
 
+Engine v2 is opt-in right now. If you want to run the new engine instead of the legacy agent loop, start IronClaw with `ENGINE_V2=true`. See [Engine v2 architecture](docs/internal/engine-v2-architecture.md#enabling-engine-v2) for more details.
+
 ```bash
 # First-time setup (configures database, auth, etc.)
 ironclaw onboard
@@ -275,8 +312,11 @@ ironclaw onboard
 # Start interactive REPL
 cargo run
 
-# With debug logging
-RUST_LOG=ironclaw=debug cargo run
+# Start interactive REPL with engine v2
+ENGINE_V2=true cargo run
+
+# Engine v2 with debug logging
+ENGINE_V2=true RUST_LOG=ironclaw=debug cargo run
 ```
 
 ## Development
@@ -296,7 +336,7 @@ cargo test
 cargo test test_name
 ```
 
-- **Telegram channel**: See [docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md) for setup and DM pairing.
+- **Channels**: See [docs/channels/overview.mdx](docs/channels/overview.mdx) for setup of Telegram, Discord, and other channels.
 - **Changing channel sources**: Run `./channels-src/telegram/build.sh` before `cargo build` so the updated WASM is bundled.
 
 ## LLM Provider Configuration

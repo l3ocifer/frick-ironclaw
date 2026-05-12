@@ -2,27 +2,21 @@
 //!
 //! Commands for installing, listing, removing, and authenticating WASM tools.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
 use clap::Subcommand;
 use tokio::fs;
 
-use crate::config::Config;
-#[allow(unused_imports)]
-use crate::db::Database;
-#[cfg(feature = "postgres")]
-use crate::secrets::PostgresSecretsStore;
-use crate::secrets::{CreateSecretParams, SecretsCrypto, SecretsStore};
+use crate::bootstrap::ironclaw_base_dir;
+use crate::secrets::{CreateSecretParams, SecretsStore};
 use crate::tools::wasm::{CapabilitiesFile, compute_binary_hash};
 
 /// Default tools directory.
 fn default_tools_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".ironclaw").join("tools"))
-        .unwrap_or_else(|| PathBuf::from(".ironclaw/tools"))
+    ironclaw_base_dir().join("tools")
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -86,10 +80,28 @@ pub enum ToolCommand {
         /// Directory to look for tool (default: ~/.ironclaw/tools/)
         #[arg(short, long)]
         dir: Option<PathBuf>,
+
+        /// User ID for checking credential status (default: "default")
+        #[arg(short, long, default_value = "default")]
+        user: String,
     },
 
     /// Configure authentication for a tool
     Auth {
+        /// Name of the tool
+        name: String,
+
+        /// Directory to look for tool (default: ~/.ironclaw/tools/)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+
+        /// User ID for storing the secret (default: "default")
+        #[arg(short, long, default_value = "default")]
+        user: String,
+    },
+
+    /// Configure required secrets for a tool (from setup.required_secrets)
+    Setup {
         /// Name of the tool
         name: String,
 
@@ -117,8 +129,13 @@ pub async fn run_tool_command(cmd: ToolCommand) -> anyhow::Result<()> {
         } => install_tool(path, name, capabilities, target, release, skip_build, force).await,
         ToolCommand::List { dir, verbose } => list_tools(dir, verbose).await,
         ToolCommand::Remove { name, dir } => remove_tool(name, dir).await,
-        ToolCommand::Info { name_or_path, dir } => show_tool_info(name_or_path, dir).await,
+        ToolCommand::Info {
+            name_or_path,
+            dir,
+            user,
+        } => show_tool_info(name_or_path, dir, user).await,
         ToolCommand::Auth { name, dir, user } => auth_tool(name, dir, user).await,
+        ToolCommand::Setup { name, dir, user } => setup_tool(name, dir, user).await,
     }
 }
 
@@ -155,11 +172,18 @@ async fn install_tool(
         };
 
         // Build the WASM component if not skipping
+        let profile = if release { "release" } else { "debug" };
         let wasm_path = if skip_build {
             // Look for existing wasm file
-            find_wasm_artifact(&path, &tool_name, release)?
+            crate::registry::artifacts::find_wasm_artifact(&path, &tool_name, profile)
+                .or_else(|| crate::registry::artifacts::find_any_wasm_artifact(&path, profile))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No .wasm artifact found. Run without --skip-build to build first."
+                    )
+                })?
         } else {
-            build_wasm_component(&path, release)?
+            crate::registry::artifacts::build_wasm_component_sync(&path, release)?
         };
 
         // Look for capabilities file
@@ -244,176 +268,13 @@ async fn install_tool(
     println!("  Name: {}", tool_name);
     println!("  WASM: {}", target_wasm.display());
     println!("  Size: {} bytes", wasm_bytes.len());
-    println!("  Hash: {}", &hash_hex[..16]); // Show first 16 chars
+    println!("  Hash: {}", &hash_hex[..16]); // Show first 16 chars // safety: hex digest is ASCII.
 
     if target_caps.exists() {
         println!("  Caps: {}", target_caps.display());
     }
 
     Ok(())
-}
-
-/// Build a WASM component using cargo-component.
-fn build_wasm_component(source_dir: &Path, release: bool) -> anyhow::Result<PathBuf> {
-    println!("Building WASM component in {}...", source_dir.display());
-
-    // Check if cargo-component is available
-    let check = ProcessCommand::new("cargo")
-        .args(["component", "--version"])
-        .output();
-
-    if check.is_err() || !check.unwrap().status.success() {
-        anyhow::bail!(
-            "cargo-component not found. Install with: cargo install cargo-component\n\
-             Or use --skip-build with an existing .wasm file."
-        );
-    }
-
-    // Build command
-    let mut cmd = ProcessCommand::new("cargo");
-    cmd.current_dir(source_dir).args(["component", "build"]);
-
-    if release {
-        cmd.arg("--release");
-    }
-
-    println!(
-        "  Running: cargo component build{}",
-        if release { " --release" } else { "" }
-    );
-
-    let output = cmd.output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Build failed:\n{}", stderr);
-    }
-
-    // Find the output wasm file
-    // cargo-component may output to wasm32-wasip1 or wasm32-wasip2 depending on version
-    let profile = if release { "release" } else { "debug" };
-    let candidates = [
-        source_dir
-            .join("target")
-            .join("wasm32-wasip1")
-            .join(profile),
-        source_dir
-            .join("target")
-            .join("wasm32-wasip2")
-            .join(profile),
-        source_dir
-            .join("target")
-            .join("wasm32-unknown-unknown")
-            .join(profile),
-    ];
-
-    let target_dir = candidates.iter().find(|p| p.exists()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No WASM target directory found. Expected one of: {}",
-            candidates
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
-
-    // Look for .wasm files in target dir
-    let entries: Vec<_> = std::fs::read_dir(target_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "wasm")
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if entries.is_empty() {
-        anyhow::bail!(
-            "No .wasm file found in {}. Build may have failed.",
-            target_dir.display()
-        );
-    }
-
-    if entries.len() > 1 {
-        println!(
-            "  Warning: Multiple .wasm files found, using first: {}",
-            entries[0].path().display()
-        );
-    }
-
-    let wasm_path = entries[0].path();
-    println!("  Built: {}", wasm_path.display());
-
-    Ok(wasm_path)
-}
-
-/// Find an existing WASM artifact without building.
-fn find_wasm_artifact(source_dir: &Path, name: &str, release: bool) -> anyhow::Result<PathBuf> {
-    let profile = if release { "release" } else { "debug" };
-
-    // cargo-component may output to wasm32-wasip1 or wasm32-wasip2 depending on version
-    let target_dirs = [
-        source_dir
-            .join("target")
-            .join("wasm32-wasip1")
-            .join(profile),
-        source_dir
-            .join("target")
-            .join("wasm32-wasip2")
-            .join(profile),
-        source_dir
-            .join("target")
-            .join("wasm32-unknown-unknown")
-            .join(profile),
-    ];
-
-    let snake_name = name.replace('-', "_");
-
-    // Try exact name match in any target dir first
-    for target_dir in &target_dirs {
-        let candidates = [
-            target_dir.join(format!("{}.wasm", name)),
-            target_dir.join(format!("{}.wasm", snake_name)),
-        ];
-        for candidate in &candidates {
-            if candidate.exists() {
-                return Ok(candidate.clone());
-            }
-        }
-    }
-
-    // Find a target dir that exists
-    let target_dir = target_dirs.iter().find(|p| p.exists()).ok_or_else(|| {
-        anyhow::anyhow!("No target directory found. Run without --skip-build to build first.")
-    })?;
-
-    // Fall back to any .wasm file
-    let entries: Vec<_> = std::fs::read_dir(target_dir)
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Target directory not found: {}. Run without --skip-build.",
-                target_dir.display()
-            )
-        })?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "wasm")
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if entries.is_empty() {
-        anyhow::bail!(
-            "No .wasm file found in {}. Build the project first or remove --skip-build.",
-            target_dir.display()
-        );
-    }
-
-    Ok(entries[0].path())
 }
 
 /// Extract crate name from Cargo.toml.
@@ -536,7 +397,11 @@ async fn remove_tool(name: String, dir: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// Show information about a tool.
-async fn show_tool_info(name_or_path: String, dir: Option<PathBuf>) -> anyhow::Result<()> {
+async fn show_tool_info(
+    name_or_path: String,
+    dir: Option<PathBuf>,
+    user_id: String,
+) -> anyhow::Result<()> {
     let wasm_path = if name_or_path.ends_with(".wasm") {
         PathBuf::from(&name_or_path)
     } else {
@@ -571,7 +436,37 @@ async fn show_tool_info(name_or_path: String, dir: Option<PathBuf>) -> anyhow::R
         println!("\nCapabilities ({}):", caps_path.display());
         let content = fs::read_to_string(&caps_path).await?;
         match CapabilitiesFile::from_json(&content) {
-            Ok(caps) => print_capabilities_detail(&caps),
+            Ok(caps) => {
+                // Lazily init secrets store only when auth secrets need checking.
+                let has_auth = caps.auth.is_some()
+                    || caps
+                        .setup
+                        .as_ref()
+                        .is_some_and(|s| !s.required_secrets.is_empty())
+                    || caps
+                        .http
+                        .as_ref()
+                        .is_some_and(|h| !h.credentials.is_empty());
+                let secrets_store = if has_auth {
+                    match init_secrets_store().await {
+                        Ok(store) => Some(store),
+                        Err(e) => {
+                            eprintln!("  Warning: could not init secrets store: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                print_capabilities_detail(
+                    &caps,
+                    secrets_store
+                        .as_ref()
+                        .map(|s| s.as_ref() as &(dyn SecretsStore + Send + Sync)),
+                    &user_id,
+                )
+                .await;
+            }
             Err(e) => println!("  Error parsing: {}", e),
         }
     } else {
@@ -624,8 +519,89 @@ fn print_capabilities_summary(caps: &CapabilitiesFile) {
     }
 }
 
+/// Per-secret info collected from all auth-related capability sections.
+struct AuthSecretInfo {
+    secret_name: String,
+    /// Human-readable label (from auth.display_name or setup prompt).
+    description: Option<String>,
+    /// Injection location (from http.credentials).
+    location: Option<String>,
+}
+
+/// Collected auth secrets and the set of secret names they cover.
+struct CollectedAuthSecrets {
+    secrets: Vec<AuthSecretInfo>,
+    /// Secret names present in `secrets`, for filtering the Secrets capability section.
+    seen_names: HashSet<String>,
+}
+
+/// Collect and deduplicate auth secrets from all auth-related capability sections.
+///
+/// Priority for the description label: auth.display_name > setup.required_secrets.prompt.
+/// Injection location is merged from http.credentials.
+fn collect_auth_secrets(caps: &CapabilitiesFile) -> CollectedAuthSecrets {
+    let mut secrets: Vec<AuthSecretInfo> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+
+    // auth.display_name is the best label — seed first.
+    if let Some(ref auth) = caps.auth {
+        let index = secrets.len();
+        seen.insert(auth.secret_name.clone(), index);
+        secrets.push(AuthSecretInfo {
+            secret_name: auth.secret_name.clone(),
+            description: auth.display_name.clone(),
+            location: None,
+        });
+    }
+
+    // setup.required_secrets.prompt is second-best label.
+    if let Some(ref setup) = caps.setup {
+        for secret in &setup.required_secrets {
+            if !seen.contains_key(&secret.name) {
+                let index = secrets.len();
+                seen.insert(secret.name.clone(), index);
+                secrets.push(AuthSecretInfo {
+                    secret_name: secret.name.clone(),
+                    description: Some(secret.prompt.clone()),
+                    location: None,
+                });
+            }
+        }
+    }
+
+    // Merge injection location from http.credentials.
+    if let Some(ref http) = caps.http {
+        for cred in http.credentials.values() {
+            let loc = format!("{:?}", cred.location);
+            if let Some(&index) = seen.get(&cred.secret_name) {
+                secrets[index].location = Some(loc);
+            } else {
+                let index = secrets.len();
+                seen.insert(cred.secret_name.clone(), index);
+                secrets.push(AuthSecretInfo {
+                    secret_name: cred.secret_name.clone(),
+                    description: None,
+                    location: Some(loc),
+                });
+            }
+        }
+    }
+
+    let seen_names = seen.into_keys().collect();
+    CollectedAuthSecrets {
+        secrets,
+        seen_names,
+    }
+}
+
 /// Print detailed capabilities.
-fn print_capabilities_detail(caps: &CapabilitiesFile) {
+async fn print_capabilities_detail(
+    caps: &CapabilitiesFile,
+    secrets_store: Option<&(dyn SecretsStore + Send + Sync)>,
+    user_id: &str,
+) {
+    let mut collected = collect_auth_secrets(caps);
+
     if let Some(ref http) = caps.http {
         println!("  HTTP:");
         for endpoint in &http.allowlist {
@@ -638,13 +614,6 @@ fn print_capabilities_detail(caps: &CapabilitiesFile) {
             println!("    {} {} {}", methods, endpoint.host, path);
         }
 
-        if !http.credentials.is_empty() {
-            println!("  Credentials:");
-            for (key, cred) in &http.credentials {
-                println!("    {}: {} -> {:?}", key, cred.secret_name, cred.location);
-            }
-        }
-
         if let Some(ref rate) = http.rate_limit {
             println!(
                 "  Rate limit: {}/min, {}/hour",
@@ -653,12 +622,24 @@ fn print_capabilities_detail(caps: &CapabilitiesFile) {
         }
     }
 
+    // Filter secrets already covered by the auth section (always rendered when non-empty).
     if let Some(ref secrets) = caps.secrets
         && !secrets.allowed_names.is_empty()
     {
-        println!("  Secrets (existence check only):");
-        for name in &secrets.allowed_names {
-            println!("    {}", name);
+        let extra: Vec<_> = if collected.secrets.is_empty() {
+            secrets.allowed_names.iter().collect()
+        } else {
+            secrets
+                .allowed_names
+                .iter()
+                .filter(|name| !collected.seen_names.contains(name.as_str()))
+                .collect()
+        };
+        if !extra.is_empty() {
+            println!("  Secrets (existence check only):");
+            for name in extra {
+                println!("    {}", name);
+            }
         }
     }
 
@@ -679,10 +660,64 @@ fn print_capabilities_detail(caps: &CapabilitiesFile) {
             println!("    {}", prefix);
         }
     }
+
+    // Consolidated auth status — sorted by secret name for deterministic output.
+    if !collected.secrets.is_empty() {
+        collected
+            .secrets
+            .sort_by(|a, b| a.secret_name.cmp(&b.secret_name));
+        println!("  Auth:");
+        for info in &collected.secrets {
+            let (icon, label) = match secrets_store {
+                Some(store) => match store.exists(user_id, &info.secret_name).await {
+                    Ok(true) => ("\u{2713}", "configured"),
+                    Ok(false) => ("\u{2717}", "missing"),
+                    Err(e) => {
+                        eprintln!(
+                            "  Warning: failed to check secret `{}`: {}",
+                            info.secret_name, e
+                        );
+                        ("?", "unknown")
+                    }
+                },
+                None => ("?", "unknown"),
+            };
+            let mut parts = info.secret_name.clone();
+            if let Some(ref desc) = info.description {
+                parts = format!("{} ({})", parts, desc);
+            }
+            if let Some(ref loc) = info.location {
+                parts = format!("{} -> {}", parts, loc);
+            }
+            println!("    {}  {} {}", parts, icon, label);
+        }
+    }
+}
+
+/// Validate a tool name to prevent path traversal.
+fn validate_tool_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.contains('\0')
+    {
+        anyhow::bail!(
+            "Invalid tool name '{}': must not contain path separators or '..'",
+            name
+        );
+    }
+    Ok(())
+}
+
+/// Initialize the secrets store from environment config.
+async fn init_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Sync>> {
+    crate::cli::init_secrets_store().await
 }
 
 /// Configure authentication for a tool.
 async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyhow::Result<()> {
+    validate_tool_name(&name)?;
     let tools_dir = dir.unwrap_or_else(default_tools_dir);
     let caps_path = tools_dir.join(format!("{}.capabilities.json", name));
 
@@ -717,66 +752,7 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
 
-    // Initialize secrets store
-    let config = Config::from_env().await?;
-    let master_key = config.secrets.master_key().ok_or_else(|| {
-        anyhow::anyhow!(
-            "SECRETS_MASTER_KEY not set. Run 'ironclaw onboard' first or set it in .env"
-        )
-    })?;
-
-    let crypto = SecretsCrypto::new(master_key.clone())?;
-
-    let secrets_store: Arc<dyn SecretsStore + Send + Sync> = {
-        #[cfg(feature = "postgres")]
-        {
-            let store = crate::history::Store::new(&config.database).await?;
-            store.run_migrations().await?;
-            Arc::new(PostgresSecretsStore::new(store.pool(), Arc::new(crypto)))
-        }
-        #[cfg(all(feature = "libsql", not(feature = "postgres")))]
-        {
-            use crate::db::Database as _;
-            use crate::db::libsql_backend::LibSqlBackend;
-            use secrecy::ExposeSecret as _;
-
-            let default_path = crate::config::default_libsql_path();
-            let db_path = config
-                .database
-                .libsql_path
-                .as_deref()
-                .unwrap_or(&default_path);
-
-            let backend = if let Some(ref url) = config.database.libsql_url {
-                let token = config.database.libsql_auth_token.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("LIBSQL_AUTH_TOKEN is required when LIBSQL_URL is set")
-                })?;
-                LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?
-            } else {
-                LibSqlBackend::new_local(db_path)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?
-            };
-            backend
-                .run_migrations()
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-            Arc::new(crate::secrets::LibSqlSecretsStore::new(
-                backend.shared_db(),
-                Arc::new(crypto),
-            ))
-        }
-        #[cfg(not(any(feature = "postgres", feature = "libsql")))]
-        {
-            let _ = crypto;
-            anyhow::bail!(
-                "No database backend available for secrets. Enable 'postgres' or 'libsql' feature."
-            );
-        }
-    };
+    let secrets_store = init_secrets_store().await?;
 
     // Check if already configured
     let already_configured = secrets_store
@@ -836,8 +812,8 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
 
     // Check for OAuth configuration
     if let Some(ref oauth) = auth.oauth {
-        // For providers with shared tokens (e.g., all Google tools share google_oauth_token),
-        // combine scopes from all installed tools so one auth covers everything.
+        // For providers with shared tokens, combine scopes from all installed
+        // tools so one auth covers everything.
         let combined = combine_provider_scopes(&tools_dir, &auth.secret_name, oauth).await;
         if combined.scopes.len() > oauth.scopes.len() {
             let extra = combined.scopes.len() - oauth.scopes.len();
@@ -855,15 +831,14 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
 }
 
 /// Scan the tools directory for all capabilities files sharing the same secret_name
-/// and combine their OAuth scopes. This way, authing any Google tool requests scopes
-/// for ALL installed Google tools, so one login covers everything.
+/// and combine their OAuth scopes so one authorization covers the full shared
+/// credential set.
 async fn combine_provider_scopes(
     tools_dir: &Path,
     secret_name: &str,
     base_oauth: &crate::tools::wasm::OAuthConfigSchema,
 ) -> crate::tools::wasm::OAuthConfigSchema {
-    let mut all_scopes: std::collections::HashSet<String> =
-        base_oauth.scopes.iter().cloned().collect();
+    let mut all_scopes: HashSet<String> = base_oauth.scopes.iter().cloned().collect();
 
     if let Ok(mut entries) = tokio::fs::read_dir(tools_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -903,16 +878,12 @@ async fn auth_tool_oauth(
     auth: &crate::tools::wasm::AuthCapabilitySchema,
     oauth: &crate::tools::wasm::OAuthConfigSchema,
 ) -> anyhow::Result<()> {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use rand::RngCore;
-    use sha2::{Digest, Sha256};
-
-    use crate::cli::oauth_defaults::{self, OAUTH_CALLBACK_PORT};
+    use crate::auth::oauth;
 
     let display_name = auth.display_name.as_deref().unwrap_or(&auth.secret_name);
 
     // Get client_id: capabilities file > runtime env var > built-in defaults
-    let builtin = oauth_defaults::builtin_credentials(&auth.secret_name);
+    let builtin = oauth::builtin_credentials(&auth.secret_name);
 
     let client_id = oauth
         .client_id
@@ -925,11 +896,16 @@ async fn auth_tool_oauth(
         })
         .or_else(|| builtin.as_ref().map(|c| c.client_id.to_string()))
         .ok_or_else(|| {
-            anyhow::anyhow!(
+            let mut message = format!(
                 "OAuth client_id not configured.\n\
-                 Set {} env var, or build with IRONCLAW_GOOGLE_CLIENT_ID.",
+                 Set {} env var",
                 oauth.client_id_env.as_deref().unwrap_or("the client_id")
-            )
+            );
+            if let Some(override_env) = oauth::builtin_client_id_override_env(&auth.secret_name) {
+                message.push_str(&format!(", or build with {override_env}"));
+            }
+            message.push('.');
+            anyhow::anyhow!(message)
         })?;
 
     // Get client_secret: capabilities file > runtime env var > built-in defaults
@@ -947,143 +923,71 @@ async fn auth_tool_oauth(
     println!("  Starting OAuth authentication...");
     println!();
 
-    let listener = oauth_defaults::bind_callback_listener().await?;
-    let redirect_uri = format!("http://localhost:{}/callback", OAUTH_CALLBACK_PORT);
+    let listener = oauth::bind_callback_listener().await?;
+    let redirect_uri = format!("{}/callback", oauth::callback_url());
 
-    // Generate PKCE verifier and challenge
-    let (code_verifier, code_challenge) = if oauth.use_pkce {
-        let mut verifier_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut verifier_bytes);
-        let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
-
-        let mut hasher = Sha256::new();
-        hasher.update(verifier.as_bytes());
-        let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
-
-        (Some(verifier), Some(challenge))
-    } else {
-        (None, None)
-    };
-
-    // Build authorization URL
-    let mut auth_url = format!(
-        "{}?client_id={}&response_type=code&redirect_uri={}",
-        oauth.authorization_url,
-        urlencoding::encode(&client_id),
-        urlencoding::encode(&redirect_uri)
-    );
-
-    if !oauth.scopes.is_empty() {
-        auth_url.push_str(&format!(
-            "&scope={}",
-            urlencoding::encode(&oauth.scopes.join(" "))
-        ));
-    }
-
-    if let Some(ref challenge) = code_challenge {
-        auth_url.push_str(&format!(
-            "&code_challenge={}&code_challenge_method=S256",
-            challenge
-        ));
-    }
-
-    // Add extra params
-    for (key, value) in &oauth.extra_params {
-        auth_url.push_str(&format!(
-            "&{}={}",
-            urlencoding::encode(key),
-            urlencoding::encode(value)
-        ));
-    }
+    // Build authorization URL with PKCE and CSRF state
+    let oauth_result = oauth::build_oauth_url(
+        &oauth.authorization_url,
+        &client_id,
+        &redirect_uri,
+        &oauth.scopes,
+        oauth.use_pkce,
+        &oauth.extra_params,
+    )
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let code_verifier = oauth_result.code_verifier;
 
     println!("  Opening browser for {} login...", display_name);
     println!();
 
-    if let Err(e) = open::that(&auth_url) {
+    if let Err(e) = open::that(&oauth_result.url) {
         println!("  Could not open browser: {}", e);
         println!("  Please open this URL manually:");
-        println!("  {}", auth_url);
+        println!("  {}", oauth_result.url);
     }
 
     println!("  Waiting for authorization...");
 
-    let code =
-        oauth_defaults::wait_for_callback(listener, "/callback", "code", display_name).await?;
+    let code = oauth::wait_for_callback(
+        listener,
+        "/callback",
+        "code",
+        display_name,
+        Some(&oauth_result.state),
+    )
+    .await?;
 
     println!();
     println!("  Exchanging code for token...");
 
     // Exchange code for token
-    let client = reqwest::Client::new();
-    let mut token_params = vec![
-        ("grant_type", "authorization_code".to_string()),
-        ("code", code),
-        ("redirect_uri", redirect_uri),
-    ];
-
-    if let Some(ref verifier) = code_verifier {
-        token_params.push(("code_verifier", verifier.to_string()));
-    }
-
-    // Build token request
-    let mut request = client.post(&oauth.token_url);
-
-    // Use Basic auth if client_secret is provided, otherwise include client_id in body
-    if let Some(ref secret) = client_secret {
-        request = request.basic_auth(&client_id, Some(secret));
-    } else {
-        token_params.push(("client_id", client_id));
-    }
-
-    let token_response = request.form(&token_params).send().await?;
-
-    if !token_response.status().is_success() {
-        let status = token_response.status();
-        let body = token_response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!(
-            "Token exchange failed: {} - {}",
-            status,
-            body
-        ));
-    }
-
-    let token_data: serde_json::Value = token_response.json().await?;
-    let access_token = token_data
-        .get(&oauth.access_token_field)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No {} in token response: {:?}",
-                oauth.access_token_field,
-                token_data
-            )
-        })?;
-
-    let refresh_token = token_data.get("refresh_token").and_then(|v| v.as_str());
-    let expires_in = token_data.get("expires_in").and_then(|v| v.as_u64());
-
-    // Save the token (with refresh token and expiry if provided)
-    save_token(
-        store,
-        user_id,
-        auth,
-        access_token,
-        refresh_token,
-        expires_in,
+    let token_response = oauth::exchange_oauth_code(
+        &oauth.token_url,
+        &client_id,
+        client_secret.as_deref(),
+        &code,
+        &redirect_uri,
+        code_verifier.as_deref(),
+        &oauth.access_token_field,
     )
     .await?;
 
-    // Extract any additional info for display
-    let workspace_name = token_data
-        .get("workspace_name")
-        .and_then(|v| v.as_str())
-        .or_else(|| token_data.get("team_name").and_then(|v| v.as_str()));
+    // Save tokens (access + refresh + scopes)
+    oauth::store_oauth_tokens(
+        store,
+        user_id,
+        &auth.secret_name,
+        auth.provider.as_deref(),
+        &token_response.access_token,
+        token_response.refresh_token.as_deref(),
+        token_response.expires_in,
+        &oauth.scopes,
+    )
+    .await?;
 
     println!();
     println!("  ✓ {} connected!", display_name);
-    if let Some(workspace) = workspace_name {
-        println!("    Workspace: {}", workspace);
-    }
     println!();
     println!("  The tool can now access the API.");
     println!();
@@ -1196,13 +1100,12 @@ fn read_hidden_input() -> anyhow::Result<String> {
                 KeyCode::Enter => {
                     break;
                 }
-                KeyCode::Backspace => {
-                    if !input.is_empty() {
-                        input.pop();
-                        print!("\x08 \x08");
-                        std::io::stdout().flush()?;
-                    }
+                KeyCode::Backspace if !input.is_empty() => {
+                    input.pop();
+                    print!("\x08 \x08");
+                    std::io::stdout().flush()?;
                 }
+                KeyCode::Backspace => {}
                 KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                     terminal::disable_raw_mode()?;
                     return Err(anyhow::anyhow!("Interrupted"));
@@ -1228,46 +1131,15 @@ async fn validate_token(
     validation: &crate::tools::wasm::ValidationEndpointSchema,
     _secret_name: &str,
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
-    // Build request based on method
-    let request = match validation.method.to_uppercase().as_str() {
-        "GET" => client.get(&validation.url),
-        "POST" => client.post(&validation.url),
-        _ => client.get(&validation.url),
-    };
-
-    // Add authorization header (assume Bearer for now, could be extended)
-    let response = request
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Notion-Version", "2022-06-28") // Notion-specific, but harmless for others
-        .send()
-        .await?;
-
-    if response.status().as_u16() == validation.success_status {
-        Ok(())
-    } else {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        Err(anyhow::anyhow!(
-            "HTTP {} (expected {}): {}",
-            status,
-            validation.success_status,
-            if body.len() > 100 {
-                format!("{}...", &body[..100])
-            } else {
-                body
-            }
-        ))
-    }
+    crate::auth::oauth::validate_oauth_token(token, validation)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 /// Save token to secrets store.
 ///
-/// Optionally stores a refresh token (as `{secret_name}_refresh_token`) and
-/// sets `expires_at` on the access token so the runtime can auto-refresh.
+/// Delegates to the shared `store_oauth_tokens` for OAuth tokens, or stores
+/// directly for manual/env-var tokens (no scopes or refresh token).
 async fn save_token(
     store: &(dyn SecretsStore + Send + Sync),
     user_id: &str,
@@ -1276,36 +1148,18 @@ async fn save_token(
     refresh_token: Option<&str>,
     expires_in: Option<u64>,
 ) -> anyhow::Result<()> {
-    let mut params = CreateSecretParams::new(&auth.secret_name, token);
-
-    if let Some(ref provider) = auth.provider {
-        params = params.with_provider(provider);
-    }
-
-    if let Some(secs) = expires_in {
-        let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
-        params = params.with_expiry(expires_at);
-    }
-
-    store
-        .create(user_id, params)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to save token: {}", e))?;
-
-    // Store refresh token separately (no expiry, it's long-lived)
-    if let Some(rt) = refresh_token {
-        let refresh_name = format!("{}_refresh_token", auth.secret_name);
-        let mut refresh_params = CreateSecretParams::new(&refresh_name, rt);
-        if let Some(ref provider) = auth.provider {
-            refresh_params = refresh_params.with_provider(provider);
-        }
-        store
-            .create(user_id, refresh_params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to save refresh token: {}", e))?;
-    }
-
-    Ok(())
+    crate::auth::oauth::store_oauth_tokens(
+        store,
+        user_id,
+        &auth.secret_name,
+        auth.provider.as_deref(),
+        token,
+        refresh_token,
+        expires_in,
+        &[], // No scopes for manual/env-var tokens
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 /// Print success message.
@@ -1317,9 +1171,122 @@ fn print_success(display_name: &str) {
     println!();
 }
 
+/// Configure required secrets for a tool via its `setup.required_secrets` schema.
+async fn setup_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyhow::Result<()> {
+    validate_tool_name(&name)?;
+    let tools_dir = dir.unwrap_or_else(default_tools_dir);
+    let caps_path = tools_dir.join(format!("{}.capabilities.json", name));
+
+    if !caps_path.exists() {
+        anyhow::bail!(
+            "Tool '{}' not found or has no capabilities file at {}",
+            name,
+            caps_path.display()
+        );
+    }
+
+    let content = fs::read_to_string(&caps_path).await?;
+    let caps = CapabilitiesFile::from_json(&content)
+        .map_err(|e| anyhow::anyhow!("Invalid capabilities file: {}", e))?;
+
+    let setup = caps.setup.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Tool '{}' has no setup configuration.\n\
+             The tool may not require setup, or setup is not defined.\n\
+             Try 'ironclaw tool auth {}' for OAuth-based authentication.",
+            name,
+            name
+        )
+    })?;
+
+    if setup.required_secrets.is_empty() {
+        println!("Tool '{}' has no required secrets.", name);
+        return Ok(());
+    }
+
+    let display_name = caps
+        .auth
+        .as_ref()
+        .and_then(|a| a.display_name.as_deref())
+        .unwrap_or(&name);
+
+    println!();
+    println!("╔════════════════════════════════════════════════════════════════╗");
+    println!("║  {:^62}║", format!("{} Setup", display_name));
+    println!("╚════════════════════════════════════════════════════════════════╝");
+    println!();
+
+    let secrets_store = init_secrets_store().await?;
+
+    let mut any_saved = false;
+
+    for secret in &setup.required_secrets {
+        let already_exists = secrets_store
+            .exists(&user_id, &secret.name)
+            .await
+            .unwrap_or(false);
+
+        if already_exists {
+            println!("  ✓ {} (already configured)", secret.prompt);
+
+            print!("    Replace? [y/N]: ");
+            std::io::stdout().flush()?;
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+
+            if !input.trim().eq_ignore_ascii_case("y") {
+                continue;
+            }
+            print!("  {}: ", secret.prompt);
+        } else if secret.optional {
+            print!("  {} (optional, Enter to skip): ", secret.prompt);
+        } else {
+            print!("  {}: ", secret.prompt);
+        }
+
+        std::io::stdout().flush()?;
+        let value = read_hidden_input()?;
+        println!();
+
+        if value.is_empty() {
+            if secret.optional {
+                println!("    Skipped.");
+            } else {
+                println!(
+                    "    Warning: empty value for required secret '{}'.",
+                    secret.name
+                );
+            }
+            continue;
+        }
+
+        let params = CreateSecretParams::new(&secret.name, &value).with_provider(name.to_string());
+        secrets_store
+            .create(&user_id, params)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to save secret: {}", e))?;
+
+        println!("    ✓ Saved.");
+        any_saved = true;
+    }
+
+    println!();
+    if any_saved {
+        println!("  ✓ {} setup complete!", display_name);
+    } else {
+        println!("  No changes made.");
+    }
+    println!();
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::{CreateSecretParams, SecretsStore};
+    use crate::testing::credentials::test_secrets_store;
 
     #[test]
     fn test_format_size() {
@@ -1335,5 +1302,97 @@ mod tests {
         let dir = default_tools_dir();
         assert!(dir.to_string_lossy().contains(".ironclaw"));
         assert!(dir.to_string_lossy().contains("tools"));
+    }
+
+    /// Verify that auth secrets are deduplicated across auth, setup, and http.credentials,
+    /// and that credential status is checked against the secrets store.
+    #[tokio::test]
+    async fn test_auth_secret_dedup_and_status() {
+        let caps = CapabilitiesFile::from_json(
+            r#"{
+                "auth": {
+                    "secret_name": "gh_token",
+                    "display_name": "GitHub"
+                },
+                "setup": {
+                    "required_secrets": [
+                        { "name": "gh_token", "prompt": "GitHub PAT" },
+                        { "name": "extra_key", "prompt": "Extra API Key" }
+                    ]
+                },
+                "http": {
+                    "allowlist": [{ "host": "api.github.com" }],
+                    "credentials": {
+                        "github": {
+                            "secret_name": "gh_token",
+                            "location": { "type": "bearer" },
+                            "host_patterns": ["api.github.com"]
+                        }
+                    }
+                },
+                "secrets": {
+                    "allowed_names": ["gh_token", "gh_*"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let collected = collect_auth_secrets(&caps);
+
+        // gh_token should appear once (from auth), with location merged from credentials.
+        // extra_key should appear once (from setup).
+        assert_eq!(collected.secrets.len(), 2);
+        let gh = collected
+            .secrets
+            .iter()
+            .find(|s| s.secret_name == "gh_token")
+            .unwrap();
+        assert_eq!(gh.description.as_deref(), Some("GitHub"));
+        assert!(
+            gh.location.is_some(),
+            "location should be merged from http.credentials"
+        );
+
+        let extra = collected
+            .secrets
+            .iter()
+            .find(|s| s.secret_name == "extra_key")
+            .unwrap();
+        assert_eq!(extra.description.as_deref(), Some("Extra API Key"));
+        assert!(extra.location.is_none());
+
+        // Secrets section should filter gh_token (in seen_names) but keep gh_* (wildcard).
+        let secrets = caps.secrets.as_ref().unwrap();
+        let extra_secrets: Vec<_> = secrets
+            .allowed_names
+            .iter()
+            .filter(|name| !collected.seen_names.contains(name.as_str()))
+            .collect();
+        assert_eq!(extra_secrets, vec!["gh_*"]);
+
+        // Verify store check: missing secret -> exists returns false.
+        let store = test_secrets_store();
+        assert!(!store.exists("default", "gh_token").await.unwrap());
+
+        // Store gh_token and verify it's found.
+        store
+            .create(
+                "default",
+                CreateSecretParams::new("gh_token", "ghp_test123"),
+            )
+            .await
+            .unwrap();
+        assert!(store.exists("default", "gh_token").await.unwrap());
+        // extra_key still missing.
+        assert!(!store.exists("default", "extra_key").await.unwrap());
+    }
+
+    /// No auth sections → collect_auth_secrets returns empty.
+    #[test]
+    fn test_collect_auth_secrets_empty_caps() {
+        let caps = CapabilitiesFile::default();
+        let collected = collect_auth_secrets(&caps);
+        assert!(collected.secrets.is_empty());
+        assert!(collected.seen_names.is_empty());
     }
 }

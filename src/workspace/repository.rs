@@ -11,10 +11,13 @@ use uuid::Uuid;
 
 use crate::error::WorkspaceError;
 
-use crate::workspace::document::{MemoryChunk, MemoryDocument, WorkspaceEntry};
-use crate::workspace::search::{RankedResult, SearchConfig, SearchResult, reciprocal_rank_fusion};
+use crate::workspace::document::{
+    ChunkWrite, DocumentVersion, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
+};
+use crate::workspace::search::{RankedResult, SearchConfig, SearchResult, fuse_results};
 
 /// Database repository for workspace operations.
+#[derive(Clone)]
 pub struct Repository {
     pool: Pool,
 }
@@ -326,6 +329,97 @@ impl Repository {
         Ok(id)
     }
 
+    /// Atomically replace all chunks for a document.
+    ///
+    /// Runs `DELETE` + N `INSERT`s inside a single transaction so two
+    /// concurrent reindexers for the same document cannot race each other
+    /// into a `UNIQUE (document_id, chunk_index)` violation. Passing an
+    /// empty slice is equivalent to `delete_chunks(document_id)`.
+    ///
+    /// Postgres-specific concurrency note: bundling DELETE + INSERTs in one
+    /// transaction is **not** sufficient on Postgres. Two concurrent
+    /// reindexers running under separate snapshots can both DELETE (each
+    /// sees its own pre-delete state, neither sees the other's), then race
+    /// to INSERT chunk_index 0 — at which point one side hits the
+    /// `UNIQUE (document_id, chunk_index)` constraint. We serialize
+    /// per-document by acquiring a row lock on the parent `memory_documents`
+    /// row at the start of the transaction. The lock is released
+    /// automatically on commit/rollback. The `FOR UPDATE` row exists in the
+    /// schema with an FK from `memory_chunks.document_id`, so the lookup is
+    /// always cheap and always finds a row (callers wouldn't be reindexing
+    /// chunks for a document that doesn't exist).
+    pub async fn replace_chunks(
+        &self,
+        document_id: Uuid,
+        chunks: &[ChunkWrite],
+    ) -> Result<(), WorkspaceError> {
+        let mut conn = self.conn().await?;
+
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| WorkspaceError::ChunkingFailed {
+                reason: format!("Begin transaction failed: {e}"),
+            })?;
+
+        // Per-document serialization: block any other reindexer of the
+        // same document until this transaction commits. Pinned by
+        // `concurrent_writes_to_same_doc_do_not_collide_on_chunk_index`
+        // (the libsql variant of the same regression test).
+        let locked = tx
+            .execute(
+                "SELECT 1 FROM memory_documents WHERE id = $1 FOR UPDATE",
+                &[&document_id],
+            )
+            .await
+            .map_err(|e| WorkspaceError::ChunkingFailed {
+                reason: format!("Acquire row lock failed: {e}"),
+            })?;
+        if locked == 0 {
+            return Err(WorkspaceError::ChunkingFailed {
+                reason: format!(
+                    "Document {document_id} not found — cannot acquire per-document lock for chunk replacement"
+                ),
+            });
+        }
+
+        tx.execute(
+            "DELETE FROM memory_chunks WHERE document_id = $1",
+            &[&document_id],
+        )
+        .await
+        .map_err(|e| WorkspaceError::ChunkingFailed {
+            reason: format!("Delete failed: {}", e),
+        })?;
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let id = Uuid::new_v4();
+            let chunk_index = index as i32;
+            let embedding_vec = chunk.embedding.as_ref().map(|e| Vector::from(e.clone()));
+            let content = chunk.content.as_str();
+
+            tx.execute(
+                r#"
+                INSERT INTO memory_chunks (id, document_id, chunk_index, content, embedding)
+                VALUES ($1, $2, $3, $4, $5)
+                "#,
+                &[&id, &document_id, &chunk_index, &content, &embedding_vec],
+            )
+            .await
+            .map_err(|e| WorkspaceError::ChunkingFailed {
+                reason: format!("Insert failed: {}", e),
+            })?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| WorkspaceError::ChunkingFailed {
+                reason: format!("Commit failed: {e}"),
+            })?;
+
+        Ok(())
+    }
+
     /// Update a chunk's embedding.
     pub async fn update_chunk_embedding(
         &self,
@@ -415,7 +509,7 @@ impl Repository {
             Vec::new()
         };
 
-        Ok(reciprocal_rank_fusion(fts_results, vector_results, config))
+        Ok(fuse_results(fts_results, vector_results, config))
     }
 
     /// Full-text search using PostgreSQL ts_rank_cd.
@@ -431,7 +525,7 @@ impl Repository {
         let rows = conn
             .query(
                 r#"
-                SELECT c.id as chunk_id, c.document_id, c.content,
+                SELECT c.id as chunk_id, c.document_id, d.path as document_path, c.content,
                        ts_rank_cd(c.content_tsv, plainto_tsquery('english', $3)) as rank
                 FROM memory_chunks c
                 JOIN memory_documents d ON d.id = c.document_id
@@ -453,6 +547,7 @@ impl Repository {
             .map(|(i, row)| RankedResult {
                 chunk_id: row.get("chunk_id"),
                 document_id: row.get("document_id"),
+                document_path: row.get("document_path"),
                 content: row.get("content"),
                 rank: (i + 1) as u32,
             })
@@ -473,7 +568,7 @@ impl Repository {
         let rows = conn
             .query(
                 r#"
-                SELECT c.id as chunk_id, c.document_id, c.content,
+                SELECT c.id as chunk_id, c.document_id, d.path as document_path, c.content,
                        1 - (c.embedding <=> $3) as similarity
                 FROM memory_chunks c
                 JOIN memory_documents d ON d.id = c.document_id
@@ -495,6 +590,7 @@ impl Repository {
             .map(|(i, row)| RankedResult {
                 chunk_id: row.get("chunk_id"),
                 document_id: row.get("document_id"),
+                document_path: row.get("document_path"),
                 content: row.get("content"),
                 rank: (i + 1) as u32,
             })

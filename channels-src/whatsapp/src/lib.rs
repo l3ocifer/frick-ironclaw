@@ -32,7 +32,7 @@ use exports::near::agent::channel::{
     AgentResponse, ChannelConfig, Guest, HttpEndpointConfig, IncomingHttpRequest,
     OutgoingHttpResponse, StatusUpdate,
 };
-use near::agent::channel_host::{self, EmittedMessage};
+use near::agent::channel_host::{self, EmittedMessage, InboundAttachment};
 
 // ============================================================================
 // WhatsApp Cloud API Types
@@ -137,8 +137,44 @@ struct WhatsAppMessage {
     /// Text content (if type is "text")
     text: Option<TextContent>,
 
+    /// Image content
+    image: Option<WhatsAppMedia>,
+
+    /// Audio content
+    audio: Option<WhatsAppMedia>,
+
+    /// Video content
+    video: Option<WhatsAppMedia>,
+
+    /// Document content
+    document: Option<WhatsAppDocument>,
+
     /// Context for replies
     context: Option<MessageContext>,
+}
+
+/// WhatsApp media attachment (image, audio, video).
+#[derive(Debug, Deserialize)]
+struct WhatsAppMedia {
+    /// Media ID (use to download via Graph API)
+    id: String,
+    /// MIME type
+    mime_type: Option<String>,
+    /// Caption text
+    caption: Option<String>,
+}
+
+/// WhatsApp document attachment.
+#[derive(Debug, Deserialize)]
+struct WhatsAppDocument {
+    /// Media ID
+    id: String,
+    /// MIME type
+    mime_type: Option<String>,
+    /// Filename
+    filename: Option<String>,
+    /// Caption text
+    caption: Option<String>,
 }
 
 /// Text message content.
@@ -226,6 +262,15 @@ struct WhatsAppMessageMetadata {
     timestamp: String,
 }
 
+/// Workspace path for persisting owner_id across WASM callbacks.
+const OWNER_ID_PATH: &str = "state/owner_id";
+/// Workspace path for persisting dm_policy across WASM callbacks.
+const DM_POLICY_PATH: &str = "state/dm_policy";
+/// Workspace path for persisting allow_from (JSON array) across WASM callbacks.
+const ALLOW_FROM_PATH: &str = "state/allow_from";
+/// Channel name for pairing store (used by pairing host APIs).
+const CHANNEL_NAME: &str = "whatsapp";
+
 /// Channel configuration from capabilities file.
 #[derive(Debug, Deserialize)]
 struct WhatsAppConfig {
@@ -236,6 +281,15 @@ struct WhatsAppConfig {
     /// Whether to reply to the original message (thread context)
     #[serde(default = "default_reply_to_message")]
     reply_to_message: bool,
+
+    #[serde(default)]
+    owner_id: Option<String>,
+
+    #[serde(default)]
+    dm_policy: Option<String>,
+
+    #[serde(default)]
+    allow_from: Option<Vec<String>>,
 }
 
 fn default_api_version() -> String {
@@ -264,6 +318,9 @@ impl Guest for WhatsAppChannel {
                 WhatsAppConfig {
                     api_version: default_api_version(),
                     reply_to_message: default_reply_to_message(),
+                    owner_id: None,
+                    dm_policy: None,
+                    allow_from: None,
                 }
             }
         };
@@ -278,6 +335,24 @@ impl Guest for WhatsAppChannel {
 
         // Persist api_version in workspace so on_respond() can read it
         let _ = channel_host::workspace_write("channels/whatsapp/api_version", &config.api_version);
+
+        // Persist permission config for handle_message
+        if let Some(ref owner_id) = config.owner_id {
+            let _ = channel_host::workspace_write(OWNER_ID_PATH, owner_id);
+            channel_host::log(
+                channel_host::LogLevel::Info,
+                &format!("Owner restriction enabled: user {}", owner_id),
+            );
+        } else {
+            let _ = channel_host::workspace_write(OWNER_ID_PATH, "");
+        }
+
+        let dm_policy = config.dm_policy.as_deref().unwrap_or("pairing");
+        let _ = channel_host::workspace_write(DM_POLICY_PATH, dm_policy);
+
+        let allow_from_json = serde_json::to_string(&config.allow_from.unwrap_or_default())
+            .unwrap_or_else(|_| "[]".to_string());
+        let _ = channel_host::workspace_write(ALLOW_FROM_PATH, &allow_from_json);
 
         // WhatsApp Cloud API is webhook-only, no polling available
         Ok(ChannelConfig {
@@ -437,6 +512,10 @@ impl Guest for WhatsAppChannel {
 
     fn on_status(_update: StatusUpdate) {}
 
+    fn on_broadcast(_user_id: String, _response: AgentResponse) -> Result<(), String> {
+        Err("broadcast not yet implemented for WhatsApp channel".to_string())
+    }
+
     fn on_shutdown() {
         channel_host::log(
             channel_host::LogLevel::Info,
@@ -579,30 +658,115 @@ fn handle_incoming_message(req: &IncomingHttpRequest) -> OutgoingHttpResponse {
     json_response(200, serde_json::json!({"status": "ok"}))
 }
 
+/// Extract attachments from a WhatsApp message.
+fn extract_whatsapp_attachments(message: &WhatsAppMessage) -> Vec<InboundAttachment> {
+    let mut attachments = Vec::new();
+
+    if let Some(ref img) = message.image {
+        attachments.push(InboundAttachment {
+            id: img.id.clone(),
+            mime_type: img
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "image/jpeg".to_string()),
+            filename: None,
+            size_bytes: None,
+            source_url: None, // WhatsApp requires Graph API call with media ID to get URL
+            storage_key: None,
+            extracted_text: img.caption.clone(),
+            extras_json: String::new(),
+        });
+    }
+
+    if let Some(ref audio) = message.audio {
+        attachments.push(InboundAttachment {
+            id: audio.id.clone(),
+            mime_type: audio
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "audio/ogg".to_string()),
+            filename: None,
+            size_bytes: None,
+            source_url: None,
+            storage_key: None,
+            extracted_text: audio.caption.clone(),
+            extras_json: String::new(),
+        });
+    }
+
+    if let Some(ref video) = message.video {
+        attachments.push(InboundAttachment {
+            id: video.id.clone(),
+            mime_type: video
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "video/mp4".to_string()),
+            filename: None,
+            size_bytes: None,
+            source_url: None,
+            storage_key: None,
+            extracted_text: video.caption.clone(),
+            extras_json: String::new(),
+        });
+    }
+
+    if let Some(ref doc) = message.document {
+        attachments.push(InboundAttachment {
+            id: doc.id.clone(),
+            mime_type: doc
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            filename: doc.filename.clone(),
+            size_bytes: None,
+            source_url: None,
+            storage_key: None,
+            extracted_text: doc.caption.clone(),
+            extras_json: String::new(),
+        });
+    }
+
+    attachments
+}
+
 /// Process a single WhatsApp message.
 fn handle_message(
     message: &WhatsAppMessage,
     phone_number_id: &str,
     contact_names: &std::collections::HashMap<String, String>,
 ) {
-    // Only handle text messages for now
-    // TODO: Add support for image, audio, video, document, etc.
-    if message.message_type != "text" {
-        channel_host::log(
-            channel_host::LogLevel::Debug,
-            &format!("Skipping non-text message type: {}", message.message_type),
-        );
-        return;
-    }
+    let attachments = extract_whatsapp_attachments(message);
 
-    // Extract text content
+    // Extract text content (from text body or media captions)
     let text = match &message.text {
         Some(t) if !t.body.is_empty() => t.body.clone(),
-        _ => return,
+        _ => {
+            // Try to use caption from media messages as content
+            let caption = message
+                .image
+                .as_ref()
+                .and_then(|m| m.caption.clone())
+                .or_else(|| message.video.as_ref().and_then(|m| m.caption.clone()))
+                .or_else(|| message.document.as_ref().and_then(|m| m.caption.clone()));
+            match caption {
+                Some(c) if !c.is_empty() => c,
+                _ if !attachments.is_empty() => String::new(),
+                _ => return,
+            }
+        }
     };
 
     // Look up sender's name from contacts
     let user_name = contact_names.get(&message.from).cloned();
+
+    // Permission check (WhatsApp is always DM)
+    if !check_sender_permission(
+        &message.from,
+        user_name.as_deref(),
+        phone_number_id,
+    ) {
+        return;
+    }
 
     // Build metadata for response routing
     // This is critical - the response handler uses this to know where to send
@@ -622,6 +786,7 @@ fn handle_message(
         content: text,
         thread_id: None, // WhatsApp doesn't have threads like Slack/Discord
         metadata_json,
+        attachments,
     });
 
     channel_host::log(
@@ -636,6 +801,147 @@ fn handle_message(
 // ============================================================================
 // Utilities
 // ============================================================================
+
+// ============================================================================
+// Permission & Pairing
+// ============================================================================
+
+/// Check if a sender is permitted. Returns true if allowed.
+/// WhatsApp is always 1-to-1 (DM), so dm_policy always applies.
+fn check_sender_permission(
+    sender_phone: &str,
+    user_name: Option<&str>,
+    phone_number_id: &str,
+) -> bool {
+    // 1. Owner check (highest priority)
+    let owner_id = channel_host::workspace_read(OWNER_ID_PATH).filter(|s| !s.is_empty());
+    if let Some(ref owner) = owner_id {
+        if sender_phone != owner {
+            channel_host::log(
+                channel_host::LogLevel::Debug,
+                &format!(
+                    "Dropping message from non-owner {} (owner: {})",
+                    sender_phone, owner
+                ),
+            );
+            return false;
+        }
+        return true;
+    }
+
+    // 2. DM policy (WhatsApp is always DM)
+    let dm_policy =
+        channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(|| "pairing".to_string());
+
+    if dm_policy == "open" {
+        return true;
+    }
+
+    // 3. Build merged allow list
+    let mut allowed: Vec<String> = channel_host::workspace_read(ALLOW_FROM_PATH)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    if let Ok(store_allowed) = channel_host::pairing_read_allow_from(CHANNEL_NAME) {
+        allowed.extend(store_allowed);
+    }
+
+    // 4. Check sender (phone number or name)
+    let is_allowed = allowed.contains(&"*".to_string())
+        || allowed.contains(&sender_phone.to_string())
+        || user_name.is_some_and(|u| allowed.contains(&u.to_string()));
+
+    if is_allowed {
+        return true;
+    }
+
+    // 5. Not allowed — handle by policy
+    if dm_policy == "pairing" {
+        let meta = serde_json::json!({
+            "phone": sender_phone,
+            "name": user_name,
+        })
+        .to_string();
+
+        match channel_host::pairing_upsert_request(CHANNEL_NAME, sender_phone, &meta) {
+            Ok(result) => {
+                channel_host::log(
+                    channel_host::LogLevel::Info,
+                    &format!(
+                        "Pairing request for {}: code {}",
+                        sender_phone, result.code
+                    ),
+                );
+                let _ = send_pairing_reply(sender_phone, phone_number_id, &result.code);
+            }
+            Err(e) => {
+                channel_host::log(
+                    channel_host::LogLevel::Error,
+                    &format!("Pairing upsert failed: {}", e),
+                );
+            }
+        }
+    }
+    false
+}
+
+/// Send a pairing code message via WhatsApp Cloud API.
+fn send_pairing_reply(
+    recipient_phone: &str,
+    phone_number_id: &str,
+    code: &str,
+) -> Result<(), String> {
+    let api_version = channel_host::workspace_read("channels/whatsapp/api_version")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "v18.0".to_string());
+
+    let url = format!(
+        "https://graph.facebook.com/{}/{}/messages",
+        api_version, phone_number_id
+    );
+
+    let payload = serde_json::json!({
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_phone,
+        "type": "text",
+        "text": {
+            "preview_url": false,
+            "body": format!(
+                "Enter this code in IronClaw to pair your whatsapp account: {}. CLI fallback: ironclaw pairing approve whatsapp {}",
+                code, code
+            )
+        }
+    });
+
+    let payload_bytes =
+        serde_json::to_vec(&payload).map_err(|e| format!("Failed to serialize: {}", e))?;
+
+    let headers = serde_json::json!({
+        "Content-Type": "application/json",
+        "Authorization": "Bearer {WHATSAPP_ACCESS_TOKEN}"
+    });
+
+    let result = channel_host::http_request(
+        "POST",
+        &url,
+        &headers.to_string(),
+        Some(&payload_bytes),
+        None,
+    );
+
+    match result {
+        Ok(response) if response.status >= 200 && response.status < 300 => Ok(()),
+        Ok(response) => {
+            let body_str = String::from_utf8_lossy(&response.body);
+            Err(format!(
+                "WhatsApp API error: {} - {}",
+                response.status, body_str
+            ))
+        }
+        Err(e) => Err(format!("HTTP request failed: {}", e)),
+    }
+}
 
 /// Create a JSON HTTP response.
 fn json_response(status: u16, value: serde_json::Value) -> OutgoingHttpResponse {
@@ -755,5 +1061,139 @@ mod tests {
 
         assert_eq!(parsed.phone_number_id, "123456");
         assert_eq!(parsed.sender_phone, "15551234567");
+    }
+
+    // === Attachment extraction fixture tests ===
+
+    #[test]
+    fn test_extract_whatsapp_image_attachment() {
+        let msg = WhatsAppMessage {
+            id: "msg1".to_string(),
+            from: "15551234567".to_string(),
+            timestamp: "1234567890".to_string(),
+            message_type: "image".to_string(),
+            text: None,
+            image: Some(WhatsAppMedia {
+                id: "media_img_1".to_string(),
+                mime_type: Some("image/jpeg".to_string()),
+                caption: Some("Look at this".to_string()),
+            }),
+            audio: None,
+            video: None,
+            document: None,
+            context: None,
+        };
+
+        let attachments = extract_whatsapp_attachments(&msg);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, "media_img_1");
+        assert_eq!(attachments[0].mime_type, "image/jpeg");
+        assert_eq!(
+            attachments[0].extracted_text,
+            Some("Look at this".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_whatsapp_document_attachment() {
+        let msg = WhatsAppMessage {
+            id: "msg2".to_string(),
+            from: "15551234567".to_string(),
+            timestamp: "1234567890".to_string(),
+            message_type: "document".to_string(),
+            text: None,
+            image: None,
+            audio: None,
+            video: None,
+            document: Some(WhatsAppDocument {
+                id: "media_doc_1".to_string(),
+                mime_type: Some("application/pdf".to_string()),
+                filename: Some("report.pdf".to_string()),
+                caption: None,
+            }),
+            context: None,
+        };
+
+        let attachments = extract_whatsapp_attachments(&msg);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, "media_doc_1");
+        assert_eq!(attachments[0].mime_type, "application/pdf");
+        assert_eq!(
+            attachments[0].filename,
+            Some("report.pdf".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_whatsapp_audio_video_attachments() {
+        let msg = WhatsAppMessage {
+            id: "msg3".to_string(),
+            from: "15551234567".to_string(),
+            timestamp: "1234567890".to_string(),
+            message_type: "audio".to_string(),
+            text: None,
+            image: None,
+            audio: Some(WhatsAppMedia {
+                id: "media_audio_1".to_string(),
+                mime_type: Some("audio/ogg".to_string()),
+                caption: None,
+            }),
+            video: Some(WhatsAppMedia {
+                id: "media_video_1".to_string(),
+                mime_type: Some("video/mp4".to_string()),
+                caption: None,
+            }),
+            document: None,
+            context: None,
+        };
+
+        let attachments = extract_whatsapp_attachments(&msg);
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].id, "media_audio_1");
+        assert_eq!(attachments[1].id, "media_video_1");
+    }
+
+    #[test]
+    fn test_extract_whatsapp_text_only_no_attachments() {
+        let msg = WhatsAppMessage {
+            id: "msg4".to_string(),
+            from: "15551234567".to_string(),
+            timestamp: "1234567890".to_string(),
+            message_type: "text".to_string(),
+            text: Some(TextContent {
+                body: "Hello".to_string(),
+            }),
+            image: None,
+            audio: None,
+            video: None,
+            document: None,
+            context: None,
+        };
+
+        let attachments = extract_whatsapp_attachments(&msg);
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn test_parse_whatsapp_image_message() {
+        let json = r#"{
+            "id": "wamid.123",
+            "from": "15551234567",
+            "timestamp": "1234567890",
+            "type": "image",
+            "image": {
+                "id": "media_img_abc",
+                "mime_type": "image/jpeg",
+                "caption": "Check this"
+            }
+        }"#;
+
+        let msg: WhatsAppMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.message_type, "image");
+        assert!(msg.image.is_some());
+
+        let attachments = extract_whatsapp_attachments(&msg);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, "media_img_abc");
     }
 }

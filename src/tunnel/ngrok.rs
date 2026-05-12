@@ -54,7 +54,7 @@ impl Tunnel for NgrokTunnel {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture ngrok stdout"))?;
-
+        let stderr = child.stderr.take();
         let mut reader = tokio::io::BufReader::new(stdout).lines();
         let mut public_url = String::new();
 
@@ -84,16 +84,62 @@ impl Tunnel for NgrokTunnel {
         }
 
         if public_url.is_empty() {
+            let error_detail = if let Some(stderr) = stderr {
+                let mut err_reader = tokio::io::BufReader::new(stderr).lines();
+                let mut lines = Vec::new();
+                while lines.len() < 10 {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(1),
+                        err_reader.next_line(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(line))) => lines.push(line),
+                        _ => break,
+                    }
+                }
+                lines.join("\n")
+            } else {
+                String::new()
+            };
             child.kill().await.ok();
-            bail!("ngrok did not produce a public URL within 15s. Is the auth token valid?");
+            if error_detail.is_empty() {
+                bail!("ngrok did not produce a public URL within 15s");
+            } else {
+                bail!("ngrok failed to start: {error_detail}");
+            }
         }
 
         if let Ok(mut guard) = self.url.write() {
             *guard = Some(public_url.clone());
         }
 
+        // We took ownership of ngrok's stdout pipe above to parse the URL.
+        // ngrok continues writing logs to stdout for its entire lifetime.
+        // If we drop the reader, the pipe closes and ngrok gets SIGPIPE on
+        // its next write → process dies. We can't just store the reader
+        // without reading — the OS pipe buffer (~64KB) fills up and ngrok
+        // blocks. So we drain it in a background task. The task exits
+        // naturally when ngrok is killed (EOF on the pipe).
+        let drain_handle = tokio::spawn(async move {
+            while let Ok(Some(line)) = reader.next_line().await {
+                tracing::trace!("ngrok: {line}");
+            }
+        });
+
+        // Drain stderr silently to prevent SIGPIPE/buffer stalls.
+        if let Some(stderr) = stderr {
+            tokio::spawn(async move {
+                let mut err_reader = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(_)) = err_reader.next_line().await {}
+            });
+        }
+
         let mut guard = self.proc.lock().await;
-        *guard = Some(TunnelProcess { child });
+        *guard = Some(TunnelProcess {
+            child,
+            _pipe_drain: Some(drain_handle),
+        });
 
         Ok(public_url)
     }

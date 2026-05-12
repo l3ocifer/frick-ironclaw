@@ -73,14 +73,24 @@
 //! let output = tool.execute(serde_json::json!({"input": "test"}), &ctx).await?;
 //! ```
 
+/// Host WIT version for tool extensions.
+///
+/// Extensions declaring a `wit_version` in their capabilities file are checked
+/// against this at load time: same major, not greater than host.
+pub const WIT_TOOL_VERSION: &str = "0.3.0";
+
+/// Host WIT version for channel extensions.
+pub const WIT_CHANNEL_VERSION: &str = "0.3.0";
+
 mod allowlist;
 mod capabilities;
 mod capabilities_schema;
-mod credential_injector;
+pub(crate) mod credential_injector;
 mod error;
 mod host;
+mod http_security;
 mod limits;
-mod loader;
+pub(crate) mod loader;
 mod rate_limiter;
 mod runtime;
 mod storage;
@@ -88,24 +98,33 @@ pub mod verification;
 mod wrapper;
 
 // Core types
-pub use error::{TrapCode, TrapInfo, WasmError};
+pub use error::WasmError;
 pub use host::{HostState, LogEntry, LogLevel};
 pub use limits::{
     DEFAULT_FUEL_LIMIT, DEFAULT_MEMORY_LIMIT, DEFAULT_TIMEOUT, FuelConfig, ResourceLimits,
     WasmResourceLimiter,
 };
-pub use runtime::{PreparedModule, WasmRuntimeConfig, WasmToolRuntime};
+pub use runtime::{PreparedModule, WasmRuntimeConfig, WasmToolRuntime, enable_compilation_cache};
 pub use wrapper::{OAuthRefreshConfig, WasmToolWrapper};
 
 // Capabilities (V2)
 pub use capabilities::{
     Capabilities, EndpointPattern, HttpCapability, RateLimitConfig, SecretsCapability,
-    ToolInvokeCapability, WorkspaceCapability, WorkspaceReader,
+    ToolInvokeCapability, WebhookCapability, WorkspaceCapability, WorkspaceReader,
 };
 
 // Security components (V2)
 pub use allowlist::{AllowlistResult, AllowlistValidator, DenyReason};
-pub use credential_injector::{CredentialInjector, InjectedCredentials, InjectionError};
+pub(crate) use credential_injector::inject_credential;
+pub use credential_injector::{
+    CredentialInjector, InjectedCredentials, InjectionError, SharedCredentialRegistry,
+};
+#[cfg(test)]
+pub(crate) use http_security::is_private_ip;
+pub(crate) use http_security::{
+    reject_private_ip, ssrf_safe_client_builder, ssrf_safe_client_builder_for_target,
+    validate_and_resolve_http_target,
+};
 pub use rate_limiter::{LimitType, RateLimitError, RateLimitResult, RateLimiter};
 
 // Storage (V2)
@@ -120,14 +139,15 @@ pub use storage::{
 
 // Loader
 pub use loader::{
-    DiscoveredTool, LoadResults, WasmLoadError, WasmToolLoader, discover_dev_tools, discover_tools,
-    load_dev_tools,
+    DiscoveredTool, LoadResults, WasmLoadError, WasmToolLoader, check_wit_version_compat,
+    discover_dev_tools, discover_tools, load_dev_tools, resolve_wasm_target_dir,
+    wasm_artifact_path,
 };
 
 // Capabilities schema (for parsing *.capabilities.json files)
 pub use capabilities_schema::{
     AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema, RateLimitSchema,
-    ValidationEndpointSchema,
+    ToolFieldSetupSchema, ToolSetupFieldInputType, ToolSetupSchema, ValidationEndpointSchema,
 };
 
 // Checksum verification

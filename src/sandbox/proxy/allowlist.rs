@@ -144,41 +144,16 @@ impl Default for DomainAllowlist {
 
 /// Parse host from a URL string.
 pub fn extract_host(url: &str) -> Option<String> {
-    // Determine scheme and extract the rest
-    let rest = if let Some(stripped) = url.strip_prefix("https://") {
-        stripped
-    } else if let Some(stripped) = url.strip_prefix("http://") {
-        stripped
-    } else {
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return None;
-    };
-
-    // Find the end of the host (start of path, query, or end of string)
-    let host_end = rest.find('/').unwrap_or(rest.len());
-    let host_and_port = &rest[..host_end];
-
-    // Remove port if present
-    let host = if let Some(bracket_idx) = host_and_port.find('[') {
-        // IPv6 address
-        let close_bracket = host_and_port.find(']')?;
-        &host_and_port[bracket_idx + 1..close_bracket]
-    } else if let Some(colon_idx) = host_and_port.rfind(':') {
-        // Check if this is a port (all digits after colon)
-        let after_colon = &host_and_port[colon_idx + 1..];
-        if after_colon.chars().all(|c| c.is_ascii_digit()) {
-            &host_and_port[..colon_idx]
-        } else {
-            host_and_port
-        }
-    } else {
-        host_and_port
-    };
-
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_lowercase())
     }
+    parsed.host_str().map(|h| {
+        h.strip_prefix('[')
+            .and_then(|v| v.strip_suffix(']'))
+            .unwrap_or(h)
+            .to_lowercase()
+    })
 }
 
 #[cfg(test)]
@@ -246,6 +221,115 @@ mod tests {
             extract_host("https://EXAMPLE.COM"),
             Some("example.com".to_string())
         );
+        assert_eq!(
+            extract_host("https://user:pass@api.example.com:443/path"),
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(
+            extract_host("http://[::1]:8080/path"),
+            Some("::1".to_string())
+        );
         assert_eq!(extract_host("not-a-url"), None);
+        assert_eq!(extract_host("ftp://example.com/file"), None);
+    }
+
+    // === QA Plan P1 - 4.5: Adversarial allowlist tests ===
+
+    #[test]
+    fn test_subdomain_bypass_attempt() {
+        let allowlist = DomainAllowlist::new(&["api.example.com".to_string()]);
+
+        // Exact match should work
+        assert!(allowlist.is_allowed("api.example.com").is_allowed());
+
+        // Subdomain of exact match should NOT be allowed
+        assert!(!allowlist.is_allowed("evil.api.example.com").is_allowed());
+
+        // Similar-looking domains should NOT be allowed
+        assert!(
+            !allowlist
+                .is_allowed("api.example.com.evil.com")
+                .is_allowed()
+        );
+        assert!(!allowlist.is_allowed("api-example.com").is_allowed());
+        assert!(!allowlist.is_allowed("notapi.example.com").is_allowed());
+    }
+
+    #[test]
+    fn test_wildcard_depth() {
+        let allowlist = DomainAllowlist::new(&["*.github.com".to_string()]);
+
+        // Direct subdomain
+        assert!(allowlist.is_allowed("api.github.com").is_allowed());
+        // Multi-level subdomain
+        assert!(allowlist.is_allowed("a.b.c.github.com").is_allowed());
+        // Base domain itself
+        assert!(allowlist.is_allowed("github.com").is_allowed());
+
+        // But NOT a completely different domain
+        assert!(!allowlist.is_allowed("github.com.evil.com").is_allowed());
+        assert!(!allowlist.is_allowed("notgithub.com").is_allowed());
+    }
+
+    #[test]
+    fn test_case_insensitive_domains() {
+        let allowlist = DomainAllowlist::new(&["crates.io".to_string()]);
+
+        assert!(allowlist.is_allowed("CRATES.IO").is_allowed());
+        assert!(allowlist.is_allowed("Crates.Io").is_allowed());
+        assert!(allowlist.is_allowed("cRaTeS.iO").is_allowed());
+    }
+
+    #[test]
+    fn test_extract_host_with_credentials_in_url() {
+        // Credentials in URL should not affect host extraction
+        assert_eq!(
+            extract_host("https://secret_key:password@evil.com/exfil"),
+            Some("evil.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_host_port_ignored() {
+        // Port should not affect host extraction
+        assert_eq!(
+            extract_host("https://api.example.com:9999/path"),
+            Some("api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_empty_and_single_pattern() {
+        // Empty allowlist denies everything
+        let empty = DomainAllowlist::empty();
+        assert!(!empty.is_allowed("localhost").is_allowed());
+        assert!(!empty.is_allowed("127.0.0.1").is_allowed());
+
+        // Single wildcard should allow subdomains but not unrelated domains
+        let single = DomainAllowlist::new(&["*.example.com".to_string()]);
+        assert!(single.is_allowed("any.example.com").is_allowed());
+        assert!(!single.is_allowed("other.org").is_allowed());
+    }
+
+    #[test]
+    fn test_ip_address_not_matched_by_domain() {
+        let allowlist = DomainAllowlist::new(&["example.com".to_string()]);
+
+        // IP addresses should NOT match domain names
+        assert!(!allowlist.is_allowed("93.184.216.34").is_allowed());
+        assert!(!allowlist.is_allowed("127.0.0.1").is_allowed());
+    }
+
+    #[test]
+    fn test_extract_host_ipv6() {
+        // IPv6 addresses with brackets stripped
+        assert_eq!(
+            extract_host("https://[::1]:8080/api"),
+            Some("::1".to_string())
+        );
+        assert_eq!(
+            extract_host("https://[2001:db8::1]/path"),
+            Some("2001:db8::1".to_string())
+        );
     }
 }

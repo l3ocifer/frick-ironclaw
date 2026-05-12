@@ -13,6 +13,9 @@ use crate::agent::session::Session;
 use crate::agent::undo::UndoManager;
 use crate::hooks::HookRegistry;
 
+/// Warn when session count exceeds this threshold.
+const SESSION_COUNT_WARNING_THRESHOLD: usize = 1000;
+
 /// Key for mapping external thread IDs to internal ones.
 #[derive(Clone, Hash, Eq, PartialEq)]
 struct ThreadKey {
@@ -68,6 +71,14 @@ impl SessionManager {
         let session = Arc::new(Mutex::new(new_session));
         sessions.insert(user_id.to_string(), Arc::clone(&session));
 
+        if sessions.len() >= SESSION_COUNT_WARNING_THRESHOLD && sessions.len() % 100 == 0 {
+            tracing::warn!(
+                "High session count: {} active sessions. \
+                 Pruning runs every 10 minutes; consider reducing session_idle_timeout.",
+                sessions.len()
+            );
+        }
+
         // Fire OnSessionStart hook (fire-and-forget)
         if let Some(ref hooks) = self.hooks {
             let hooks = hooks.clone();
@@ -91,11 +102,30 @@ impl SessionManager {
     /// Resolve an external thread ID to an internal thread.
     ///
     /// Returns the session and thread ID. Creates both if they don't exist.
+    /// Delegates to [`resolve_thread_with_parsed_uuid`](Self::resolve_thread_with_parsed_uuid)
+    /// with `parsed_uuid: None`.
     pub async fn resolve_thread(
         &self,
         user_id: &str,
         channel: &str,
         external_thread_id: Option<&str>,
+    ) -> (Arc<Mutex<Session>>, Uuid) {
+        self.resolve_thread_with_parsed_uuid(user_id, channel, external_thread_id, None)
+            .await
+    }
+
+    /// Like [`resolve_thread`](Self::resolve_thread), but accepts a pre-parsed
+    /// UUID to skip redundant parsing when the caller has already validated
+    /// the external thread ID as a UUID (e.g. the approval routing path).
+    ///
+    /// Uses a single read-lock acquisition for both the key lookup and the UUID
+    /// adoption check to reduce contention under concurrent approval load.
+    pub async fn resolve_thread_with_parsed_uuid(
+        &self,
+        user_id: &str,
+        channel: &str,
+        external_thread_id: Option<&str>,
+        parsed_uuid: Option<Uuid>,
     ) -> (Arc<Mutex<Session>>, Uuid) {
         let session = self.get_or_create_session(user_id).await;
 
@@ -105,22 +135,93 @@ impl SessionManager {
             external_thread_id: external_thread_id.map(String::from),
         };
 
-        // Check if we have a mapping
-        {
+        // Use pre-parsed UUID if available, otherwise parse from string.
+        let ext_uuid = parsed_uuid
+            .or_else(|| external_thread_id.and_then(|ext_tid| Uuid::parse_str(ext_tid).ok()));
+
+        // Validate that parsed_uuid (if provided) is consistent with external_thread_id.
+        #[cfg(debug_assertions)]
+        if let (Some(parsed), Some(ext_tid)) = (&parsed_uuid, external_thread_id) {
+            debug_assert_eq!(
+                Uuid::parse_str(ext_tid).ok().as_ref(),
+                Some(parsed),
+                "parsed_uuid must be the parsed form of external_thread_id"
+            );
+        }
+
+        // Single read lock for both the key lookup and UUID adoption check
+        let adoptable_uuid = {
             let thread_map = self.thread_map.read().await;
+
+            // Fast path: exact key match
             if let Some(&thread_id) = thread_map.get(&key) {
-                // Verify thread still exists in session
                 let sess = session.lock().await;
                 if sess.threads.contains_key(&thread_id) {
                     return (Arc::clone(&session), thread_id);
                 }
             }
+
+            // UUID adoption check (still under the same read lock).
+            // If external_thread_id is a valid UUID not mapped elsewhere,
+            // it may be a thread created by chat_new_thread_handler or
+            // hydrated from DB that we can adopt.
+            // Only attempt adoption when external_thread_id is Some, preserving
+            // the invariant that None external_thread_id never triggers adoption.
+            if external_thread_id.is_some() {
+                ext_uuid.filter(|&uuid| !thread_map.values().any(|&v| v == uuid))
+            } else {
+                None
+            }
+        }; // Single read lock dropped here
+
+        // If we found an adoptable UUID, verify it exists in session and acquire write lock
+        if let Some(ext_uuid) = adoptable_uuid {
+            let sess = session.lock().await;
+            if sess.threads.contains_key(&ext_uuid) {
+                drop(sess);
+
+                let mut thread_map = self.thread_map.write().await;
+                // Re-check after acquiring write lock to prevent race condition
+                // where another task mapped this UUID between our read and write.
+                if !thread_map.values().any(|&v| v == ext_uuid) {
+                    thread_map.insert(key, ext_uuid);
+                    drop(thread_map);
+                    // Ensure undo manager exists
+                    let mut undo_managers = self.undo_managers.write().await;
+                    undo_managers
+                        .entry(ext_uuid)
+                        .or_insert_with(|| Arc::new(Mutex::new(UndoManager::new())));
+                    return (session, ext_uuid);
+                }
+                // If mapped elsewhere while unlocked, fall through to create new thread
+            }
         }
 
-        // Create new thread (always create a new one for a new key)
+        // Create new thread (always create a new one for a new key).
+        // If the external_thread_id is a valid UUID AND it isn't already
+        // mapped to a different ThreadKey, adopt it as the internal thread ID
+        // so callers (e.g. the Responses API) can look up conversations by
+        // the same UUID they encoded in the response ID.
         let thread_id = {
+            // Check under read lock: only adopt ext_uuid if no other key
+            // maps to it (prevents aliasing two keys to the same thread).
+            let safe_ext_uuid = if let Some(uuid) = ext_uuid {
+                let thread_map = self.thread_map.read().await;
+                if thread_map.values().any(|&v| v == uuid) {
+                    None // Already mapped elsewhere — generate a new UUID
+                } else {
+                    Some(uuid)
+                }
+            } else {
+                None
+            };
+
             let mut sess = session.lock().await;
-            let thread = sess.create_thread();
+            let thread = if let Some(uuid) = safe_ext_uuid {
+                sess.create_thread_with_id(uuid, Some(channel))
+            } else {
+                sess.create_thread(Some(channel))
+            };
             thread.id
         };
 
@@ -228,15 +329,20 @@ impl SessionManager {
             return 0;
         }
 
-        // Collect thread IDs from stale sessions for cleanup
+        // Collect thread IDs from stale sessions for cleanup and hook dispatch.
         let mut stale_thread_ids: Vec<Uuid> = Vec::new();
+        // Per-session thread IDs so SessionEnd hooks can target the right conversations.
+        let mut per_session_thread_ids: std::collections::HashMap<String, Vec<Uuid>> =
+            std::collections::HashMap::new();
         {
             let sessions = self.sessions.read().await;
             for user_id in &stale_users {
                 if let Some(session) = sessions.get(user_id)
                     && let Ok(sess) = session.try_lock()
                 {
-                    stale_thread_ids.extend(sess.threads.keys());
+                    let tids: Vec<Uuid> = sess.threads.keys().copied().collect();
+                    stale_thread_ids.extend(&tids);
+                    per_session_thread_ids.insert(sess.id.to_string(), tids);
                 }
             }
         }
@@ -247,11 +353,15 @@ impl SessionManager {
                 let hooks = hooks.clone();
                 let uid = user_id.clone();
                 let sid = session_id.clone();
+                let tids = per_session_thread_ids
+                    .remove(session_id)
+                    .unwrap_or_default();
                 tokio::spawn(async move {
                     use crate::hooks::HookEvent;
                     let event = HookEvent::SessionEnd {
                         user_id: uid,
                         session_id: sid,
+                        thread_ids: tids,
                     };
                     if let Err(e) = hooks.run(&event).await {
                         tracing::warn!("OnSessionEnd hook error: {}", e);
@@ -396,7 +506,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-hydrate")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(thread_id, sess.id);
+            let thread = Thread::with_id(thread_id, sess.id, None);
             sess.threads.insert(thread_id, thread);
             sess.active_thread = Some(thread_id);
         }
@@ -520,7 +630,7 @@ mod tests {
         // Simulate hydration: create thread with a known UUID
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(known_uuid, session_id);
+            let thread = Thread::with_id(known_uuid, session_id, None);
             sess.threads.insert(known_uuid, thread);
         }
 
@@ -547,7 +657,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-idem")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
 
@@ -576,7 +686,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-undo")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
 
@@ -600,7 +710,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-new")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
 
@@ -708,7 +818,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new("user-cross")));
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(tid, sess.id);
+            let thread = Thread::with_id(tid, sess.id, None);
             sess.threads.insert(tid, thread);
         }
 
@@ -723,5 +833,318 @@ mod tests {
             .resolve_thread("user-cross", "telegram", Some(&tid.to_string()))
             .await;
         assert_ne!(resolved, tid);
+    }
+
+    #[tokio::test]
+    async fn test_register_then_resolve_same_uuid_on_second_channel_reuses_thread() {
+        use crate::agent::session::{Session, Thread};
+
+        let manager = SessionManager::new();
+        let tid = Uuid::new_v4();
+
+        let session = Arc::new(Mutex::new(Session::new("user-cross")));
+        {
+            let mut sess = session.lock().await;
+            let thread = Thread::with_id(tid, sess.id, None);
+            sess.threads.insert(tid, thread);
+        }
+
+        manager
+            .register_thread("user-cross", "http", tid, Arc::clone(&session))
+            .await;
+        manager
+            .register_thread("user-cross", "gateway", tid, Arc::clone(&session))
+            .await;
+
+        let (_, resolved) = manager
+            .resolve_thread("user-cross", "gateway", Some(&tid.to_string()))
+            .await;
+        assert_eq!(resolved, tid);
+    }
+
+    // === QA Plan P3 - 4.2: Concurrent session stress tests ===
+
+    #[tokio::test]
+    async fn concurrent_get_or_create_same_user_returns_same_session() {
+        let manager = Arc::new(SessionManager::new());
+
+        let handles: Vec<_> = (0..30)
+            .map(|_| {
+                let mgr = Arc::clone(&manager);
+                tokio::spawn(async move { mgr.get_or_create_session("shared-user").await })
+            })
+            .collect();
+
+        let mut sessions = Vec::new();
+        for handle in handles {
+            sessions.push(handle.await.expect("task should not panic"));
+        }
+
+        // All 30 must return the *same* Arc (double-checked locking guarantee).
+        for s in &sessions {
+            assert!(Arc::ptr_eq(&sessions[0], s));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolve_thread_distinct_users_no_cross_talk() {
+        let manager = Arc::new(SessionManager::new());
+
+        let handles: Vec<_> = (0..20)
+            .map(|i| {
+                let mgr = Arc::clone(&manager);
+                tokio::spawn(async move {
+                    let user = format!("user-{i}");
+                    let (session, tid) = mgr.resolve_thread(&user, "gateway", None).await;
+                    (user, session, tid)
+                })
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.expect("task should not panic"));
+        }
+
+        // All thread IDs must be unique.
+        let tids: std::collections::HashSet<_> = results.iter().map(|(_, _, t)| *t).collect();
+        assert_eq!(tids.len(), 20);
+
+        // Each session should contain exactly 1 thread (its own).
+        for (_, session, tid) in &results {
+            let sess = session.lock().await;
+            assert!(sess.threads.contains_key(tid));
+            assert_eq!(sess.threads.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolve_thread_same_user_different_channels() {
+        let manager = Arc::new(SessionManager::new());
+        let channels = ["gateway", "telegram", "slack", "cli", "repl"];
+
+        let handles: Vec<_> = channels
+            .iter()
+            .map(|ch| {
+                let mgr = Arc::clone(&manager);
+                let channel = ch.to_string();
+                tokio::spawn(async move {
+                    let (session, tid) = mgr.resolve_thread("multi-ch", &channel, None).await;
+                    (channel, session, tid)
+                })
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.expect("task should not panic"));
+        }
+
+        // All 5 threads must be unique (different channels = different keys).
+        let tids: std::collections::HashSet<_> = results.iter().map(|(_, _, t)| *t).collect();
+        assert_eq!(tids.len(), 5);
+
+        // All threads should live in the same session.
+        let sess = results[0].1.lock().await;
+        assert_eq!(sess.threads.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn concurrent_get_undo_manager_same_thread_returns_same_arc() {
+        let manager = Arc::new(SessionManager::new());
+        let (_, tid) = manager.resolve_thread("undo-user", "gateway", None).await;
+
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let mgr = Arc::clone(&manager);
+                tokio::spawn(async move { mgr.get_undo_manager(tid).await })
+            })
+            .collect();
+
+        let mut managers = Vec::new();
+        for handle in handles {
+            managers.push(handle.await.expect("task should not panic"));
+        }
+
+        // All 20 must point to the same UndoManager.
+        for m in &managers {
+            assert!(Arc::ptr_eq(&managers[0], m));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_thread_consolidates_read_path() {
+        // Verify that resolve_thread still correctly handles:
+        // 1. Fast path: key exists in thread_map
+        // 2. UUID adoption: external_thread_id is a UUID in session but not in map
+        // 3. New thread: neither path matches
+        use crate::agent::session::Thread;
+
+        let manager = SessionManager::new();
+
+        // Case 1: Normal resolution creates thread and maps it
+        let (session1, tid1) = manager
+            .resolve_thread("user1", "chan1", Some("ext-1"))
+            .await;
+        // Resolving again with same key should return same thread (fast path)
+        let (_, tid1_again) = manager
+            .resolve_thread("user1", "chan1", Some("ext-1"))
+            .await;
+        assert_eq!(tid1, tid1_again);
+
+        // Case 2: UUID adoption - insert a thread directly into session
+        let adopted_id = Uuid::new_v4();
+        {
+            let mut sess = session1.lock().await;
+            let thread = Thread::with_id(adopted_id, sess.id, None);
+            sess.threads.insert(adopted_id, thread);
+        }
+        // Resolve with the UUID as external_thread_id -- should adopt it
+        let (_, resolved) = manager
+            .resolve_thread("user1", "chan1", Some(&adopted_id.to_string()))
+            .await;
+        assert_eq!(resolved, adopted_id);
+
+        // Case 3: Different channel gets different thread
+        let (_, tid2) = manager.resolve_thread("user1", "chan2", None).await;
+        assert_ne!(tid1, tid2);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_thread_finds_existing_session_thread_by_uuid() {
+        use crate::agent::session::{Session, Thread};
+
+        let manager = SessionManager::new();
+        let tid = Uuid::new_v4();
+
+        // Simulate chat_new_thread_handler: create thread directly in session
+        // without registering it in thread_map
+        let session = Arc::new(Mutex::new(Session::new("user-direct")));
+        {
+            let mut sess = session.lock().await;
+            let thread = Thread::with_id(tid, sess.id, None);
+            sess.threads.insert(tid, thread);
+        }
+        {
+            let mut sessions = manager.sessions.write().await;
+            sessions.insert("user-direct".to_string(), Arc::clone(&session));
+        }
+
+        // resolve_thread should find the existing thread by UUID
+        // instead of creating a duplicate
+        let (_, resolved) = manager
+            .resolve_thread("user-direct", "gateway", Some(&tid.to_string()))
+            .await;
+        assert_eq!(
+            resolved, tid,
+            "should reuse existing thread, not create a new one"
+        );
+
+        // Verify no duplicate threads were created
+        let sess = session.lock().await;
+        assert_eq!(
+            sess.threads.len(),
+            1,
+            "should have exactly 1 thread, not a duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_thread_with_pre_parsed_uuid_adopts_thread() {
+        use crate::agent::session::Thread;
+
+        let manager = SessionManager::new();
+        let (session, _) = manager.resolve_thread("user1", "chan1", None).await;
+
+        // Manually insert a thread with a known UUID
+        let known_id = Uuid::new_v4();
+        {
+            let mut sess = session.lock().await;
+            let thread = Thread::with_id(known_id, sess.id, None);
+            sess.threads.insert(known_id, thread);
+        }
+
+        // Resolve with pre-parsed UUID -- should adopt it without re-parsing
+        let (_, resolved) = manager
+            .resolve_thread_with_parsed_uuid(
+                "user1",
+                "chan1",
+                Some(&known_id.to_string()),
+                Some(known_id),
+            )
+            .await;
+        assert_eq!(resolved, known_id);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_thread_with_parsed_uuid_none_delegates_to_parse() {
+        use crate::agent::session::Thread;
+
+        let manager = SessionManager::new();
+        let (session, _) = manager.resolve_thread("user2", "chan2", None).await;
+
+        // Insert a thread with a known UUID
+        let known_id = Uuid::new_v4();
+        {
+            let mut sess = session.lock().await;
+            let thread = Thread::with_id(known_id, sess.id, None);
+            sess.threads.insert(known_id, thread);
+        }
+
+        // Resolve with parsed_uuid=None but a valid UUID string -- should
+        // fall back to parsing the string and still adopt the thread
+        let (_, resolved) = manager
+            .resolve_thread_with_parsed_uuid("user2", "chan2", Some(&known_id.to_string()), None)
+            .await;
+        assert_eq!(resolved, known_id);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_thread_with_none_external_thread_id_does_not_adopt() {
+        use crate::agent::session::Thread;
+
+        let manager = SessionManager::new();
+        let (session, default_tid) = manager.resolve_thread("user3", "chan3", None).await;
+
+        // Manually insert a thread with a known UUID (simulating a thread
+        // created by chat_new_thread_handler)
+        let known_id = Uuid::new_v4();
+        {
+            let mut sess = session.lock().await;
+            let thread = Thread::with_id(known_id, sess.id, None);
+            sess.threads.insert(known_id, thread);
+        }
+
+        // Resolve with external_thread_id=None but parsed_uuid=Some.
+        // This should NOT adopt the UUID — the old code prevented adoption
+        // when external_thread_id was None, and we preserve that invariant.
+        let (_, resolved) = manager
+            .resolve_thread_with_parsed_uuid("user3", "chan3", None, Some(known_id))
+            .await;
+
+        // Should return the existing default thread, not the injected UUID
+        assert_eq!(
+            resolved, default_tid,
+            "should return existing default thread when external_thread_id is None"
+        );
+        assert_ne!(
+            resolved, known_id,
+            "should NOT adopt UUID when external_thread_id is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_thread_stores_source_channel() {
+        let manager = SessionManager::new();
+
+        let (session, thread_id) = manager.resolve_thread("user-1", "telegram", None).await;
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).unwrap();
+        assert_eq!(
+            thread.source_channel.as_deref(),
+            Some("telegram"),
+            "resolve_thread should store source_channel from the channel parameter"
+        );
     }
 }

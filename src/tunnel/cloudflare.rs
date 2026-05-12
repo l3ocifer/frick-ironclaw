@@ -49,6 +49,8 @@ impl Tunnel for CloudflareTunnel {
             .kill_on_drop(true)
             .spawn()?;
 
+        let stdout = child.stdout.take();
+
         // cloudflared prints the public URL on stderr
         let stderr = child
             .stderr
@@ -82,16 +84,62 @@ impl Tunnel for CloudflareTunnel {
         }
 
         if public_url.is_empty() {
+            let error_detail = if let Some(stdout) = stdout {
+                let mut out_reader = tokio::io::BufReader::new(stdout).lines();
+                let mut lines = Vec::new();
+                while lines.len() < 10 {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(1),
+                        out_reader.next_line(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(line))) => lines.push(line),
+                        _ => break,
+                    }
+                }
+                lines.join("\n")
+            } else {
+                String::new()
+            };
+
             child.kill().await.ok();
-            bail!("cloudflared did not produce a public URL within 30s. Is the token valid?");
+            if error_detail.is_empty() {
+                bail!("cloudflared did not produce a public URL within 30s");
+            } else {
+                bail!("cloudflared failed to start: {error_detail}");
+            }
         }
 
         if let Ok(mut guard) = self.url.write() {
             *guard = Some(public_url.clone());
         }
 
+        // We took ownership of cloudflared's stderr pipe above to parse the URL.
+        // cloudflared continues writing logs for its entire lifetime. If we drop
+        // the reader, the pipe closes and cloudflared gets SIGPIPE on its next
+        // write. We can't just store the reader without reading — the OS pipe
+        // buffer fills up and cloudflared blocks. So we drain it in a background
+        // task. The task exits naturally when cloudflared is killed (EOF).
+        let drain_handle = tokio::spawn(async move {
+            while let Ok(Some(line)) = reader.next_line().await {
+                tracing::trace!("cloudflared: {line}");
+            }
+        });
+
+        // Drain stdout silently to prevent SIGPIPE/buffer stalls.
+        if let Some(stdout) = stdout {
+            tokio::spawn(async move {
+                let mut out_reader = tokio::io::BufReader::new(stdout).lines();
+                while let Ok(Some(_)) = out_reader.next_line().await {}
+            });
+        }
+
         let mut guard = self.proc.lock().await;
-        *guard = Some(TunnelProcess { child });
+        *guard = Some(TunnelProcess {
+            child,
+            _pipe_drain: Some(drain_handle),
+        });
 
         Ok(public_url)
     }
