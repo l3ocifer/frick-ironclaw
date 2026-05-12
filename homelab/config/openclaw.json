@@ -1,27 +1,35 @@
 {
-  // OpenClaw config for Frick (Alef server)
-  // Intel i7-3820, 54GB RAM, RTX 3090 @ 115W power limit
-  
+  // OpenClaw config for Frick — homelab/cluster ops engineer.
+  //
+  // Inference: routes through the in-cluster LiteLLM proxy (no local Ollama).
+  // The `chat` alias is the fleet default — vllm-chat on thebeast (RTX 4090):
+  // QuantTrio Qwen3.5-27B-AWQ-INT4, ~80 tok/s, 20 K input ctx. `long` and
+  // `frontier` are opt-in for tasks that need either big context or
+  // reasoning quality.
+  //
+  // Keep contextWindow values in lock-step with
+  // homelab/argocd/apps/_inference/40-litellm-config.yaml `model_info`.
+
   models: {
     mode: "merge",
     providers: {
-      ollama: {
-        baseUrl: "http://127.0.0.1:11434/v1",
-        apiKey: "ollama-local",
+      litellm: {
+        baseUrl: "http://litellm.litellm.svc:4000/v1",
+        apiKeyEnv: "LITELLM_API_KEY",
         api: "openai-completions",
         models: [
           {
-            id: "qwen2.5-coder:32b",
-            name: "Qwen 2.5 Coder 32B",
+            id: "chat",
+            name: "Frick default chat (vllm-chat / Qwen3.5 27B AWQ)",
             reasoning: false,
             input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 32768,
-            maxTokens: 8192,
+            contextWindow: 20480,
+            maxTokens: 4096,
           },
           {
-            id: "qwen3-coder:30b",
-            name: "Qwen3 Coder 30B (MoE)",
+            id: "long",
+            name: "Long context (vllm-long / Qwen3.5 9B AWQ + DeltaNet, 262K)",
             reasoning: false,
             input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -29,49 +37,13 @@
             maxTokens: 8192,
           },
           {
-            id: "gemma3:27b",
-            name: "Gemma 3 27B",
-            reasoning: false,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 131072,
-            maxTokens: 8192,
-          },
-          {
-            id: "mistral-small3.2:24b",
-            name: "Mistral Small 3.2 24B",
-            reasoning: false,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 32768,
-            maxTokens: 8192,
-          },
-          {
-            id: "codestral:22b",
-            name: "Codestral 22B",
-            reasoning: false,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 32768,
-            maxTokens: 8192,
-          },
-          {
-            id: "deepseek-coder-v2:16b",
-            name: "DeepSeek Coder V2 16B",
+            id: "frontier",
+            name: "Frontier (llamacpp-blade / Qwen3-Coder 480B MoE, slow)",
             reasoning: true,
             input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 131072,
+            contextWindow: 65536,
             maxTokens: 8192,
-          },
-          {
-            id: "phi3.5:latest",
-            name: "Phi 3.5 (fast)",
-            reasoning: false,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 131072,
-            maxTokens: 4096,
           }
         ]
       }
@@ -81,13 +53,18 @@
   agents: {
     defaults: {
       model: {
-        primary: "ollama/qwen2.5-coder:32b",
-        fallbacks: ["ollama/qwen3-coder:30b", "ollama/gemma3:27b", "ollama/mistral-small3.2:24b"],
+        // Fleet default: chat (vllm-chat / Qwen). Long/frontier are opt-in
+        // per-task only; do not auto-fallback to long because a wedged long
+        // backend can hang normal agent work.
+        primary: "litellm/chat",
+        fallbacks: [],
       },
       workspace: "~/.openclaw/workspace",
       compaction: { mode: "safeguard" },
       contextPruning: { mode: "cache-ttl", ttl: "1h" },
-      maxConcurrent: 4,  // Conservative due to thermal limits
+      // Inference is centralized at LiteLLM now; concurrency is bounded by
+      // the inference tier, not by Frick's local thermals.
+      maxConcurrent: 4,
       thinkingDefault: "low",
       heartbeat: {
         every: "30m",

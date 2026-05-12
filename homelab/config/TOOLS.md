@@ -41,28 +41,24 @@ nvidia-smi
 
 **Do not remove the power limit** without understanding the thermal implications.
 
-## Ollama Models (Server)
+## LLM Aliases (LiteLLM)
 
-Models installed on alef:
+All inference now routes through the in-cluster LiteLLM proxy at
+`http://litellm.inference.svc.cluster.local:4000/v1`. There is no
+per-host Ollama in the fleet — that was retired in favor of vLLM on
+the GPUs.
 
-| Model | Size | Best For |
-|-------|------|----------|
-| `qwen2.5-coder:32b` | 19GB | Code generation (primary) |
-| `qwen3-coder:30b` | 18GB | Code completion |
-| `gemma3:27b` | 17GB | General reasoning |
-| `mistral-small3.2:24b` | 15GB | Fast general use |
-| `codestral:22b` | 12GB | Code-focused Mistral |
-| `deepcoder:14b` | 9GB | Lightweight code |
-| `deepseek-coder-v2:16b` | 8.9GB | Code with reasoning |
-| `phi3.5:latest` | 2.2GB | Fast, small tasks |
+| Alias | When | Backend |
+|-------|------|---------|
+| `chat` | Fleet default — every interactive + agentic request | vllm-chat on thebeast (RTX 4090): QuantTrio Qwen3.5-27B-AWQ-INT4, ~80 tok/s, 20 K input ctx |
+| `long` | Auto-fallback when context > 20 K (multi-file diffs, long sessions, sibling-graph reads) | vllm-long on alef (RTX 3090): Qwen3.5 9B AWQ + DeltaNet, 262 K native ctx |
+| `frontier` | Opt-in only — high-stakes deep-dives where quality >> latency. Prefer Vetinari rather than Frick for these (Ironclaw routines have no per-routine model override). | llamacpp-blade-frontier: unsloth Qwen3-Coder 480B-A35B GGUF Q4_K_M on dual Xeon E5-2667 v2 (CPU-only, ~3-5 tok/s, 65 K ctx) |
+| `embed` | Memory embeddings | tei-embed |
+| `rerank` | Hybrid search rerank | tei-rerank |
 
-```bash
-ollama list                    # See all models
-ollama ps                      # Currently loaded
-ollama run qwen2.5-coder:32b   # Run primary model
-```
-
-Note: Server models differ from MacBook due to VRAM vs unified memory constraints. The RTX 3090's 24GB VRAM can load larger Q8 quantizations.
+Ops note: if `ollama` is still installed on `thebeast` or `alef`,
+that's leftover from the pre-vLLM era and is a candidate for cleanup.
+The fleet does not depend on it.
 
 ## Kubernetes (k3s) - Complete Service List
 
@@ -305,9 +301,8 @@ All accessible via Cloudflare Tunnel:
 | Service | URL | Purpose |
 |---------|-----|---------|
 | Open WebUI | `openwebui.leopaska.xyz` | Primary chat interface |
-| Ollama | `ollama.leopaska.xyz` | Direct Ollama access |
 | LiteLLM Admin | `llm-admin.leopaska.xyz` | LiteLLM proxy admin |
-| LiteLLM API | `llm.leopaska.xyz` | Multi-model API gateway |
+| LiteLLM API | `llm.leopaska.xyz` | Multi-model API gateway (canonical fleet entry point) |
 | LibreChat | `librechat.leopaska.xyz` | Alternative chat UI |
 | ComfyUI | `comfyui.leopaska.xyz` | AI image generation |
 | Exo | `exo.leopaska.xyz` | Distributed inference |

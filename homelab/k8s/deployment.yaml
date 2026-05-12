@@ -59,7 +59,7 @@ spec:
             - { name: CLI_ENABLED, value: "false" }
             - { name: LLM_BACKEND, value: "openai_compatible" }
             - { name: LLM_BASE_URL, value: "http://litellm.inference.svc.cluster.local:4000/v1" }
-            - { name: LLM_MODEL, value: "long" }
+            - { name: LLM_MODEL, value: "chat" }
             - name: LLM_API_KEY
               valueFrom:
                 secretKeyRef:
