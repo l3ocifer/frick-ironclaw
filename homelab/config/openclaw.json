@@ -44,6 +44,36 @@
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             contextWindow: 65536,
             maxTokens: 8192,
+          },
+
+          // ─── Claude Max (via household claude-bridge) ──────────────
+          // Tier-5 budget share: 10% of weekly Claude pool. Reserve
+          // for the genuinely hard cases where the local frontier model
+          // hits a wall — typically:
+          //   - novel cluster failure modes that need cross-domain
+          //     synthesis (storage + networking + workload)
+          //   - postmortems that span multiple incidents and hours of
+          //     log/metric history (uses the full 200K context)
+          // Day-to-day ops keeps using `chat` / `long`. Bridge policy
+          // enforces the 7-day quota plus Frick's 10% share. On 429
+          // LiteLLM cascades sonnet→chat→frontier, opus→frontier→long.
+          {
+            id: "claude-sonnet-max",
+            name: "Claude Sonnet 4.6 via household Max subscription",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 200000,
+            maxTokens: 8192,
+          },
+          {
+            id: "claude-opus-max",
+            name: "Claude Opus 4.7 via household Max subscription",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 200000,
+            maxTokens: 8192,
           }
         ]
       }
