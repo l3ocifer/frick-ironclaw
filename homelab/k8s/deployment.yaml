@@ -120,6 +120,8 @@ spec:
               valueFrom: { secretKeyRef: { name: frick-secrets, key: LITELLM_API_KEY } }
             - name: LEO_IMESSAGE_HANDLE
               valueFrom: { secretKeyRef: { name: bluebubbles-proxy-secrets, key: LEO_IMESSAGE_HANDLE } }
+          ports:
+            - { name: a2a, containerPort: 8443, protocol: TCP }
           resources:
             requests: { cpu: "20m", memory: "96Mi" }
             limits:   { memory: "256Mi" }
