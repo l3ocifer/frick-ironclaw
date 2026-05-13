@@ -1,0 +1,19 @@
+name: labeler
+
+# Forgejo Actions sibling of .github/workflows/labeler.yml.
+# Forgejo proxies actions/* from the GH Marketplace, so the same
+# labeler action works; the labels live in Forgejo, not GitHub.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          configuration-path: .github/labeler.yml
+          sync-labels: true
