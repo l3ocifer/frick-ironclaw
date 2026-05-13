@@ -97,6 +97,35 @@ spec:
             - { name: graph-puck,      mountPath: /data/graphs/puck,     readOnly: true }
             - { name: graph-leo,       mountPath: /data/graphs/leo }
               # Restricted writes per HANDOFF.md §4 — runtime-enforced
+        # ── imessage-responder sidecar ─────────────────────────────────
+        # Universal iMessage facade — see apps/imessage-responder/ in the
+        # homelab repo. Polls Frick's PVC inbox, calls LiteLLM with the
+        # SOUL persona, replies through agent-bus (auto [Frick] prefix
+        # then bb-proxy → Leo). Stateless and independent of ironclaw's
+        # main runtime so user chat is unaffected by ops-loop load.
+        - name: imessage-responder
+          image: ghcr.io/l3ocifer/imessage-responder:latest
+          imagePullPolicy: Always
+          env:
+            - { name: AGENT_NAME, value: "frick" }
+            - { name: AGENT_PERSONA_FILE, value: "/etc/responder/persona/SOUL.md" }
+            - { name: GRAPH_ROOT, value: "/graphs/frick" }
+            - { name: AGENT_BUS_URL, value: "http://agent-bus.agents-shared.svc.cluster.local:8080" }
+            - { name: LITELLM_URL, value: "http://litellm.inference.svc.cluster.local:4000/v1" }
+            - { name: LLM_MODEL, value: "chat" }
+            - { name: LLM_MAX_TOKENS, value: "600" }
+            - { name: POLL_INTERVAL_S, value: "15" }
+            - { name: TZ, value: "America/New_York" }
+            - name: LITELLM_API_KEY
+              valueFrom: { secretKeyRef: { name: frick-secrets, key: LITELLM_API_KEY } }
+            - name: LEO_IMESSAGE_HANDLE
+              valueFrom: { secretKeyRef: { name: bluebubbles-proxy-secrets, key: LEO_IMESSAGE_HANDLE } }
+          resources:
+            requests: { cpu: "20m", memory: "96Mi" }
+            limits:   { memory: "256Mi" }
+          volumeMounts:
+            - { name: persona, mountPath: /etc/responder/persona, readOnly: true }
+            - { name: graph-frick, mountPath: /graphs/frick }
       volumes:
         - { name: state,            persistentVolumeClaim: { claimName: frick-state } }
         - { name: persona,          configMap: { name: frick-persona } }
