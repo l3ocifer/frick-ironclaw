@@ -13,4 +13,5 @@ spec:
     app.kubernetes.io/name: frick
   ports:
     - { name: gateway, port: 3000, targetPort: gateway, protocol: TCP }
+    - { name: a2a, port: 8443, targetPort: gateway, protocol: TCP }
     - { name: metrics, port: 9100, targetPort: metrics, protocol: TCP }
