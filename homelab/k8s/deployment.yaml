@@ -60,6 +60,12 @@ spec:
             - { name: GATEWAY_ENABLED, value: "true" }
             - { name: GATEWAY_HOST, value: "0.0.0.0" }
             - { name: GATEWAY_PORT, value: "3000" }
+            # Stable M2M token for agent-bus + A2A callers (matches A2A_BEARER_TOKEN).
+            - name: GATEWAY_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: frick-secrets
+                  key: A2A_BEARER_TOKEN
             - { name: CLI_ENABLED, value: "false" }
             - { name: LLM_BACKEND, value: "openai_compatible" }
             - { name: LLM_BASE_URL, value: "http://litellm.inference.svc.cluster.local:4000/v1" }
