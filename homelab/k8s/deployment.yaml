@@ -45,7 +45,7 @@ spec:
         fsGroup: 0
       containers:
         - name: ironclaw
-          image: ghcr.io/l3ocifer/frick-ironclaw:homelab
+          image: git.leopaska.xyz/leo/frick-ironclaw:homelab
           imagePullPolicy: Always
           command: ["ironclaw"]
           args: ["--no-onboard", "run"]
@@ -116,4 +116,4 @@ spec:
         - { name: graph-puck,       persistentVolumeClaim: { claimName: puck-graph } }
         - { name: graph-leo,        persistentVolumeClaim: { claimName: leo-graph } }
       imagePullSecrets:
-        - { name: ghcr-credentials }
+        - { name: forgejo-registry-credentials }
