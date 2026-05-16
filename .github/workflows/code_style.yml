@@ -123,7 +123,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Run cargo deny
-        uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2
+        uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2
 
   clippy:
     name: Clippy (${{ matrix.name }})
