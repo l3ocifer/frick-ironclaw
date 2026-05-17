@@ -93,7 +93,7 @@ jobs:
           key: coverage-${{ matrix.name }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # cargo-llvm-cov
+        uses: taiki-e/install-action@df1377c1bf6952c745002d2cbd7112360e58a40f # cargo-llvm-cov
 
       - name: Install cargo-component
         uses: ./.github/actions/install-cargo-component
@@ -161,7 +161,7 @@ jobs:
           key: e2e-coverage
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # cargo-llvm-cov
+        uses: taiki-e/install-action@df1377c1bf6952c745002d2cbd7112360e58a40f # cargo-llvm-cov
 
       - name: Install cargo-component
         uses: ./.github/actions/install-cargo-component
