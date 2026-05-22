@@ -21,7 +21,8 @@ frick-ironclaw/                      ← repo root (this fork)
     ├── k8s/                          ← deployment, pvc, svc, ingress, rbac
     ├── config/                       ← SOUL.md, TOOLS.md, openclaw.json
     ├── shared/                       ← submodule → l3ocifer/homelab
-    ├── .github/workflows/
+    ├── ../.forgejo/workflows/        ← primary homelab image build
+    ├── ../.github/workflows/         ← backup CI + manual GHCR fallback
     └── PATCHES.md, CHANGELOG.md, README.md
 ```
 
