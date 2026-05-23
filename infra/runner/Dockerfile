@@ -7,7 +7,7 @@
 # cached onto the persistent volume via RUSTUP_HOME / CARGO_HOME.
 
 # syntax=docker/dockerfile:1.7
-FROM ubuntu:22.04
+FROM ubuntu:26.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUNNER_VERSION=2.321.0
