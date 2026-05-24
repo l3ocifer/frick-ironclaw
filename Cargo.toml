@@ -189,7 +189,7 @@ monty = { git = "https://github.com/pydantic/monty", rev = "dcdf702" }
 
 # ERC-8004 agent identity (on-chain registry, agent cards)
 erc8004 = "0.2"
-alloy = { version = "1.6", default-features = false, features = ["signer-local", "network", "provider-http"] }
+alloy = { version = "2.0.5", default-features = false, features = ["signer-local", "network", "provider-http"] }
 
 # Docker sandbox
 bollard = "0.18"
