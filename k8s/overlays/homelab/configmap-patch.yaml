@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ironclaw-config
+data:
+  LLM_BACKEND: "ollama"
+  OLLAMA_BASE_URL: "http://external-ollama.ironclaw.svc.cluster.local:11434"
+  OLLAMA_MODEL: "qwen3-coder:30b"
+  MCP_SERVER_URL: "http://external-mcp.ironclaw.svc.cluster.local:8890"

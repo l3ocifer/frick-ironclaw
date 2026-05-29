@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ironclaw
+  labels:
+    app: ironclaw
+    agent: frick
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ironclaw
+  template:
+    metadata:
+      labels:
+        app: ironclaw
+        agent: frick
+    spec:
+      containers:
+        - name: ironclaw
+          image: ghcr.io/l3ocifer/ironclaw:latest
+          imagePullPolicy: Always
+          args: ["--no-onboard"]
+          ports:
+            - containerPort: 3000
+              name: gateway
+          envFrom:
+            - secretRef:
+                name: ironclaw-secrets
+            - configMapRef:
+                name: ironclaw-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: gateway
+            initialDelaySeconds: 30
+            periodSeconds: 60
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: gateway
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: ironclaw-data
+              mountPath: /home/ironclaw/.ironclaw
+      volumes:
+        - name: ironclaw-data
+          persistentVolumeClaim:
+            claimName: ironclaw-data
+      imagePullSecrets:
+        - name: ghcr-credentials

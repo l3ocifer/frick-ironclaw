@@ -1,0 +1,17 @@
+---
+# IronClaw runtime state: SQLite sessions, skills cache, local model
+# manifest, hardstop file. RWO Longhorn.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: frick-state
+  namespace: agents-shared
+  labels:
+    app.kubernetes.io/name: frick
+    app.kubernetes.io/component: state
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn-single
+  resources:
+    requests:
+      storage: 10Gi

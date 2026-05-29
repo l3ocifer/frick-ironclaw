@@ -1,0 +1,23 @@
+{
+  "agent_name": "Frick",
+  "agent_id": "frick",
+  "memory": {
+    "compaction_memory_flush": {
+      "enabled": true,
+      "soft_threshold_tokens": 4000,
+      "system_prompt": "Session nearing compaction. Store durable memories now.",
+      "prompt": "Write any lasting notes to memory (e.g. daily log or MEMORY.md); reply with NO_REPLY if nothing to store."
+    },
+    "logseq": {
+      "graph_path": "/home/ironclaw/.ironclaw/logseq",
+      "ai_namespace": "ai-memory",
+      "max_tokens": 2000,
+      "include_user_profile": true,
+      "include_preferences": true,
+      "include_decisions": true,
+      "include_voice": true
+    }
+  },
+  "routing_profile": "auto",
+  "routing_session_pinning": true
+}

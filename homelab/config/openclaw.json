@@ -1,0 +1,201 @@
+{
+  // OpenClaw config for Frick — homelab/cluster ops engineer.
+  //
+  // Inference: routes through the in-cluster LiteLLM proxy (no local Ollama).
+  // The `chat` alias is the fleet default — vllm-chat on thebeast (RTX 4090):
+  // QuantTrio Qwen3.5-27B-AWQ-INT4, ~80 tok/s, 20 K input ctx. `long` and
+  // `frontier` are opt-in for tasks that need either big context or
+  // reasoning quality.
+  //
+  // Keep contextWindow values in lock-step with
+  // homelab/argocd/apps/_inference/40-litellm-config.yaml `model_info`.
+
+  models: {
+    mode: "merge",
+    providers: {
+      litellm: {
+        baseUrl: "http://litellm.litellm.svc:4000/v1",
+        apiKeyEnv: "LITELLM_API_KEY",
+        api: "openai-completions",
+        models: [
+          {
+            id: "chat",
+            name: "Frick default chat (vllm-chat / Qwen3.5 27B AWQ)",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 20480,
+            maxTokens: 4096,
+          },
+          {
+            id: "long",
+            name: "Long context (vllm-long / Qwen3.5 9B AWQ + DeltaNet, 262K)",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 262144,
+            maxTokens: 8192,
+          },
+          {
+            id: "frontier",
+            name: "Frontier (llamacpp-blade / Qwen3-Coder 480B MoE, slow)",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 65536,
+            maxTokens: 8192,
+          },
+
+          // ─── Claude Max (via household claude-bridge) ──────────────
+          // Tier-5 budget share: 10% of weekly Claude pool. Reserve
+          // for the genuinely hard cases where the local frontier model
+          // hits a wall — typically:
+          //   - novel cluster failure modes that need cross-domain
+          //     synthesis (storage + networking + workload)
+          //   - postmortems that span multiple incidents and hours of
+          //     log/metric history (uses the full 200K context)
+          // Day-to-day ops keeps using `chat` / `long`. Bridge policy
+          // enforces the 7-day quota plus Frick's 10% share. The agent
+          // may choose any Claude Code model at call time via
+          // claude-code/<cli-model>; on 429 LiteLLM falls back locally.
+          {
+            id: "claude-sonnet-max",
+            name: "Claude Sonnet 4.6 via household Max subscription",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 200000,
+            maxTokens: 8192,
+          },
+          {
+            id: "claude-opus-max",
+            name: "Claude Opus 4.7 via household Max subscription",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 200000,
+            maxTokens: 8192,
+          },
+          {
+            id: "claude-code/*",
+            name: "Claude Code model selected at call time",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 200000,
+            maxTokens: 8192,
+          }
+        ]
+      }
+    }
+  },
+
+  agents: {
+    defaults: {
+      model: {
+        // Fleet default: chat (vllm-chat / Qwen). Long/frontier are opt-in
+        // per-task only; do not auto-fallback to long because a wedged long
+        // backend can hang normal agent work.
+        primary: "litellm/chat",
+        fallbacks: [],
+      },
+      workspace: "~/.openclaw/workspace",
+      compaction: { mode: "safeguard" },
+      contextPruning: { mode: "cache-ttl", ttl: "1h" },
+      // Inference is centralized at LiteLLM now; concurrency is bounded by
+      // the inference tier, not by Frick's local thermals.
+      maxConcurrent: 4,
+      thinkingDefault: "low",
+      heartbeat: {
+        every: "30m",
+        target: "last",
+      },
+      // Memory search with Logseq integration via extraPaths
+      memorySearch: {
+        enabled: true,
+        sources: ["memory", "sessions"],
+        // Logseq paths - synced via SyncThing from MacBook
+        // Note: Update path after setting up Logseq sync on Alef
+        extraPaths: [
+          "/home/l3o/Logseq/notes-sync/pages/ai-memory",
+          "/home/l3o/Logseq/notes-sync/journals",
+          "/home/l3o/Logseq/notes-sync/pages",
+        ],
+        // Use local embeddings (no cloud API)
+        provider: "local",
+        local: {
+          modelPath: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf",
+        },
+        fallback: "none",
+        // Sync settings
+        sync: {
+          watch: true,
+          watchDebounceMs: 2000,
+          onSessionStart: true,
+          onSearch: true,
+        },
+        // Hybrid search (BM25 + vector)
+        query: {
+          hybrid: {
+            enabled: true,
+            vectorWeight: 0.7,
+            textWeight: 0.3,
+          },
+        },
+      },
+    },
+    list: [
+      {
+        id: "main",
+        default: true,
+        identity: {
+          name: "Frick",
+          theme: "infrastructure ops engineer for homelab and cloud",
+          emoji: "🏠",
+        },
+      }
+    ],
+  },
+
+  tools: {
+    profile: "full",
+    allow: ["read", "exec", "write", "edit", "web_search", "browser"],
+    exec: { host: "gateway", ask: "off", security: "full" },
+    elevated: {
+      enabled: true,
+      allowFrom: {
+        agents: ["main"],
+      },
+    },
+  },
+
+  skills: {
+    load: {
+      extraDirs: ["~/.claude/skills"],
+    },
+  },
+
+  gateway: {
+    mode: "local",
+    port: 18789,
+    bind: "loopback",
+  },
+
+  // Fleet event bus — durable async A2A backbone shared by all
+  // seven agents. Backed by Postgres LISTEN/NOTIFY on the `fleet`
+  // database (schema in scripts/agents/sql/fleet-schema.sql, applied
+  // declaratively by argocd/apps/_postgres/fleet-schema-job.yaml).
+  // Connection string sealed in frick-secrets as FLEET_DATABASE_URL.
+  fleet: {
+    enabled: true,
+    agentId: "frick",
+    databaseUrlEnv: "FLEET_DATABASE_URL",
+    notifyChannel: "fleet_events_new",
+    inbound: {
+      // Frick is the cluster ops agent — wakes for every infrastructure
+      // event, every P0, and anything explicitly targeting `frick` or
+      // broadcast (target IS NULL).
+      predicate: "severity IN ('warn','critical','p0') OR target IS NULL OR target = 'frick' OR kind LIKE 'k8s.%' OR kind LIKE 'cluster.%' OR kind LIKE 'storage.%'",
+    },
+  },
+}

@@ -1,0 +1,17 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frick
+  namespace: agents-shared
+  labels:
+    app.kubernetes.io/name: frick
+    app.kubernetes.io/component: agent
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: frick
+  ports:
+    - { name: gateway, port: 3000, targetPort: gateway, protocol: TCP }
+    - { name: a2a, port: 8443, targetPort: gateway, protocol: TCP }
+    - { name: metrics, port: 9100, targetPort: metrics, protocol: TCP }
