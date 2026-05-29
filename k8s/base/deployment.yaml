@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: ironclaw
-          image: ghcr.io/l3ocifer/ironclaw:latest
+          image: git.leopaska.xyz/leo/ironclaw:homelab
           imagePullPolicy: Always
           args: ["--no-onboard"]
           ports:
@@ -58,4 +58,4 @@ spec:
           persistentVolumeClaim:
             claimName: ironclaw-data
       imagePullSecrets:
-        - name: ghcr-credentials
+        - name: forgejo-registry-credentials

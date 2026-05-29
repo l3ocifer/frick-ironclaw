@@ -1,0 +1,54 @@
+name: Forgejo - Build & push homelab image
+
+# Self-hosted CI: builds the app image on the Forgejo Actions runner (DinD)
+# and pushes it to the Forgejo container registry (git.leopaska.xyz/leo/*).
+# ArgoCD Image Updater watches the registry. GitHub Actions is fallback only.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+env:
+  REGISTRY_PUBLIC: git.leopaska.xyz
+  REGISTRY_INTERNAL: forgejo-http.forgejo.svc.cluster.local:3000
+
+jobs:
+  build-and-push:
+    runs-on: docker
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include:
+          - image: ironclaw
+            context: .
+            dockerfile: Dockerfile
+    steps:
+      - name: Build ${{ matrix.image }} and push via skopeo
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_TOKEN: ${{ secrets.FORGEJOPACKAGES }}
+          DOCKER_HOST: tcp://172.17.0.1:2375
+        run: |
+          set -eu
+          apk add --no-cache git skopeo
+          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
+            "http://${GITHUB_ACTOR}:${REPO_TOKEN}@${REGISTRY_INTERNAL}/${GITHUB_REPOSITORY}.git" repo
+          short_sha="$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+          img="${REGISTRY_PUBLIC}/leo/${{ matrix.image }}"
+          docker build \
+            --tag "${img}:sha-${short_sha}" \
+            --tag "${img}:homelab" \
+            --tag "${img}:latest" \
+            --file "repo/${{ matrix.dockerfile }}" \
+            "repo/${{ matrix.context }}"
+          for tag in "sha-${short_sha}" homelab latest; do
+            archive="/tmp/${{ matrix.image }}-${tag}.tar"
+            docker save "${img}:${tag}" -o "${archive}"
+            skopeo copy --dest-tls-verify=false \
+              --dest-creds "leo:${PACKAGE_TOKEN}" \
+              "docker-archive:${archive}:${img}:${tag}" \
+              "docker://${REGISTRY_INTERNAL}/leo/${{ matrix.image }}:${tag}"
+            rm -f "${archive}"
+          done
