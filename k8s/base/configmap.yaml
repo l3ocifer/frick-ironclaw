@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ironclaw-config
+data:
+  RUST_LOG: "ironclaw=info"
+  DATABASE_BACKEND: "postgres"
+  AGENT_NAME: "Frick"
+  AGENT_ID: "frick"
+  # Gateway (web UI + API)
+  GATEWAY_ENABLED: "true"
+  GATEWAY_HOST: "0.0.0.0"
+  GATEWAY_PORT: "3000"
+  # Ollama on host (bare metal) — exposed as K8s service
+  OLLAMA_BASE_URL: "http://host-ollama.ai.svc.cluster.local:11434"
+  OLLAMA_MODEL: "qwen3-coder:30b"
+  LLM_BACKEND: "ollama"
+  # MCP server (existing deployment in ai namespace)
+  MCP_SERVER_URL: "http://mcp-server.ai.svc.cluster.local:8890"
+  # Logseq graph (mounted from host or synced)
+  LOGSEQ_GRAPH_PATH: "/home/ironclaw/.ironclaw/logseq"
+  LOGSEQ_AI_NAMESPACE: "ai-memory"
+  # Heartbeat
+  HEARTBEAT_ENABLED: "true"
+  HEARTBEAT_INTERVAL_SECS: "300"
+  # Memory
+  MEMORY_FLUSH_ENABLED: "true"

@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ironclaw
+spec:
+  template:
+    spec:
+      containers:
+        - name: ironclaw
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ironclaw-secrets
+                  key: DATABASE_URL
+          volumeMounts:
+            - name: ironclaw-data
+              mountPath: /home/ironclaw/.ironclaw
+            - name: logseq-graph
+              mountPath: /home/ironclaw/.ironclaw/logseq
+              readOnly: true
+      volumes:
+        - name: ironclaw-data
+          persistentVolumeClaim:
+            claimName: ironclaw-data
+        - name: logseq-graph
+          hostPath:
+            path: /media/l3o/prod/k3s/storage/pvc-a94bcb9d-f188-479e-933a-69d3207635a3_storage_syncthing-data/logseq-graph
+            type: Directory

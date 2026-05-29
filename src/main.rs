@@ -641,7 +641,12 @@ async fn async_main() -> anyhow::Result<()> {
             config.owner_id.clone(),
             msg.clone(),
         ))
-    } else if use_repl && config.channels.cli.enabled {
+    } else if use_repl
+        && config.channels.cli.enabled
+        && std::io::IsTerminal::is_terminal(&std::io::stdin())
+    {
+        // homelab hosting: skip the REPL when stdin is not a TTY (headless
+        // container) — otherwise stdin EOF triggers an immediate shutdown.
         let repl = ReplChannel::with_user_id(config.owner_id.clone());
         repl.suppress_banner();
         Some(repl)

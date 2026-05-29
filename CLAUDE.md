@@ -157,7 +157,18 @@ src/
 │
 ├── safety/             # Re-export shim for crates/ironclaw_safety (see Extracted Crates)
 │
-├── (llm/  was extracted to crates/ironclaw_llm/ — see Extracted Crates)
+├── llm/                # LLM integration (6 backends + intelligent router)
+│   ├── provider.rs     # LlmProvider trait, message types
+│   ├── mod.rs          # Provider factory (create_llm_provider)
+│   ├── nearai.rs       # NEAR AI chat-api (Responses API)
+│   ├── nearai_chat.rs  # NEAR AI Chat Completions API
+│   ├── rig_adapter.rs  # rig-core adapter for OpenAI/Anthropic/Gemini/Ollama
+│   ├── failover.rs     # Multi-provider failover with retryable error classification
+│   ├── router.rs       # Intelligent LLM router (15-dim classifier, 4 profiles, 24 models)
+│   ├── costs.rs        # Per-model cost lookup table
+│   ├── reasoning.rs    # Planning, tool selection, evaluation
+│   ├── retry.rs        # Retry logic with backoff
+│   └── session.rs      # Session token management with auto-renewal
 │
 ├── tools/              # Extensible tool system
 │   ├── tool.rs         # Tool trait, ToolOutput, ToolError
@@ -232,7 +243,6 @@ When modifying a module with a spec, read the spec first. Code follows spec; spe
 | `src/channels/web/` | `src/channels/web/CLAUDE.md` |
 | `src/db/` | `src/db/CLAUDE.md` |
 | `crates/ironclaw_llm/` | `crates/ironclaw_llm/CLAUDE.md` |
-| `crates/ironclaw_embeddings/` | `crates/ironclaw_embeddings/AGENTS.md` |
 | `src/setup/` | `src/setup/README.md` |
 | `src/tools/` | `src/tools/README.md` |
 | `src/workspace/` | `src/workspace/README.md` |
@@ -324,10 +334,380 @@ RUST_LOG=ironclaw=debug,tower_http=debug cargo run  # + HTTP request logging
 
 ## Current Limitations
 
-1. Domain-specific tools (`marketplace.rs`, `restaurant.rs`, etc.) are stubs
-2. Integration tests need testcontainers for PostgreSQL
-3. MCP: no streaming support; stdio/HTTP/Unix transports all use request-response
-4. WIT bindgen: auto-extract tool schema from WASM is stubbed
-5. Built tools get empty capabilities; need UX for granting access
-6. No tool versioning or rollback
-7. Observability: only `log` and `noop` backends (no OpenTelemetry)
+Some modules have a `README.md` that serves as the authoritative specification
+for that module's behavior. When modifying code in a module that has a spec:
+
+1. **Read the spec first** before making changes
+2. **Code follows spec**: if the spec says X, the code must do X
+3. **Update both sides**: if you change behavior, update the spec to match;
+   if you're implementing a spec change, update the code to match
+4. **Spec is the tiebreaker**: when code and spec disagree, the spec is correct
+   (unless the spec is clearly outdated, in which case fix the spec first)
+
+| Module | Spec File |
+|--------|-----------|
+| `src/setup/` | `src/setup/README.md` |
+
+## Code Style
+
+- Use `crate::` imports, not `super::`
+- No `pub use` re-exports unless exposing to downstream consumers
+- Prefer strong types over strings (enums, newtypes)
+- Keep functions focused, extract helpers when logic is reused
+- Comments for non-obvious logic only
+
+## Review & Fix Discipline
+
+Hard-won lessons from code review -- follow these when fixing bugs or addressing review feedback.
+
+### Fix the pattern, not just the instance
+When a reviewer flags a bug (e.g., TOCTOU race in INSERT + SELECT-back), search the entire codebase for all instances of that same pattern. A fix in `SecretsStore::create()` that doesn't also fix `WasmToolStore::store()` is half a fix.
+
+### Propagate architectural fixes to satellite types
+If a core type changes its concurrency model (e.g., `LibSqlBackend` switches to connection-per-operation), every type that was handed a resource from the old model (e.g., `LibSqlSecretsStore`, `LibSqlWasmToolStore` holding a single `Connection`) must also be updated. Grep for the old type across the codebase.
+
+### Schema translation is more than DDL
+When translating a database schema between backends (PostgreSQL to libSQL, etc.), check for:
+- **Indexes** -- diff `CREATE INDEX` statements between the two schemas
+- **Seed data** -- check for `INSERT INTO` in migrations (e.g., `leak_detection_patterns`)
+- **Semantic differences** -- document where SQL functions behave differently (e.g., `json_patch` vs `jsonb_set`)
+
+### Feature flag testing
+When adding feature-gated code, test compilation with each feature in isolation:
+```bash
+cargo check                                          # default features
+cargo check --no-default-features --features libsql  # libsql only
+cargo check --all-features                           # all features
+```
+Dead code behind the wrong `#[cfg]` gate will only show up when building with a single feature.
+
+### Mechanical verification before committing
+Run these checks on changed files before committing:
+- `grep -rnE '\.unwrap\(|\.expect\(' <files>` -- no panics in production
+- `grep -rn 'super::' <files>` -- use `crate::` imports
+- If you fixed a pattern bug, `grep` for other instances of that pattern across `src/`
+
+## Workspace & Memory System
+
+Inspired by [OpenClaw](https://github.com/openclaw/openclaw), the workspace provides persistent memory for agents with a flexible filesystem-like structure.
+
+### Key Principles
+
+1. **"Memory is database, not RAM"** - If you want to remember something, write it explicitly
+2. **Flexible structure** - Create any directory/file hierarchy you need
+3. **Self-documenting** - Use README.md files to describe directory structure
+4. **Hybrid search** - Combines FTS (keyword) + vector (semantic) via Reciprocal Rank Fusion
+
+### Filesystem Structure
+
+```
+workspace/
+├── README.md              <- Root runbook/index
+├── MEMORY.md              <- Long-term curated memory
+├── HEARTBEAT.md           <- Periodic checklist
+├── IDENTITY.md            <- Agent name, nature, vibe
+├── SOUL.md                <- Core values
+├── AGENTS.md              <- Behavior instructions
+├── USER.md                <- User context
+├── context/               <- Identity-related docs
+│   ├── vision.md
+│   └── priorities.md
+├── daily/                 <- Daily logs
+│   ├── 2024-01-15.md
+│   └── 2024-01-16.md
+├── projects/              <- Arbitrary structure
+│   └── alpha/
+│       ├── README.md
+│       └── notes.md
+└── ...
+```
+
+### Using the Workspace
+
+```rust
+use crate::workspace::{Workspace, OpenAiEmbeddings, paths};
+
+// Create workspace for a user
+let workspace = Workspace::new("user_123", pool)
+    .with_embeddings(Arc::new(OpenAiEmbeddings::new(api_key)));
+
+// Read/write any path
+let doc = workspace.read("projects/alpha/notes.md").await?;
+workspace.write("context/priorities.md", "# Priorities\n\n1. Feature X").await?;
+workspace.append("daily/2024-01-15.md", "Completed task X").await?;
+
+// Convenience methods for well-known files
+workspace.append_memory("User prefers dark mode").await?;
+workspace.append_daily_log("Session note").await?;
+
+// List directory contents
+let entries = workspace.list("projects/").await?;
+
+// Search (hybrid FTS + vector)
+let results = workspace.search("dark mode preference", 5).await?;
+
+// Get system prompt from identity files
+let prompt = workspace.system_prompt().await?;
+```
+
+### Memory Tools
+
+Four tools for LLM use:
+
+- **`memory_search`** - Hybrid search, MUST be called before answering questions about prior work
+- **`memory_write`** - Write to any path (memory, daily_log, or custom paths)
+- **`memory_read`** - Read any file by path
+- **`memory_tree`** - View workspace structure as a tree (depth parameter, default 1)
+
+### Hybrid Search (RRF)
+
+Combines full-text search and vector similarity using Reciprocal Rank Fusion:
+
+```
+score(d) = Σ 1/(k + rank(d)) for each method where d appears
+```
+
+Default k=60. Results from both methods are combined, with documents appearing in both getting boosted scores.
+
+**Backend differences:**
+- **PostgreSQL:** `ts_rank_cd` for FTS, pgvector cosine distance for vectors, full RRF
+- **libSQL:** FTS5 for keyword search only (vector search via `libsql_vector_idx` not yet wired)
+
+### Heartbeat System
+
+Proactive periodic execution (default: 30 minutes):
+
+1. Reads `HEARTBEAT.md` checklist
+2. Runs agent turn with checklist prompt
+3. If findings, notifies via channel
+4. If nothing, agent replies "HEARTBEAT_OK" (no notification)
+
+```rust
+use crate::agent::{HeartbeatConfig, spawn_heartbeat};
+
+let config = HeartbeatConfig::default()
+    .with_interval(Duration::from_secs(60 * 30))
+    .with_notify("user_123", "telegram");
+
+spawn_heartbeat(config, workspace, llm, response_tx);
+```
+
+### Chunking Strategy
+
+Documents are chunked for search indexing:
+- Default: 800 words per chunk (roughly 800 tokens for English)
+- 15% overlap between chunks for context preservation
+- Minimum chunk size: 50 words (tiny trailing chunks merge with previous)
+
+---
+
+## Custom Extensions (Fork-Specific)
+
+The following sections document features added in the `l3ocifer/ironclaw` fork on top of the upstream `nearai/ironclaw` codebase.
+
+### OpenClaw Memory Transfer
+
+Ported from [OpenClaw](https://github.com/openclaw/openclaw) (TypeScript) to Rust. Full plan: [`docs/MEMORY_TRANSFER_PLAN.md`](docs/MEMORY_TRANSFER_PLAN.md).
+
+| Feature | File | Description |
+|---------|------|-------------|
+| Session save on `/new` | `src/agent/agent_loop.rs` | Last 15 messages saved to `daily/YYYY-MM-DD-session-HHMMSS.md` |
+| Pre-compaction memory flush | `src/agent/agent_loop.rs` | Silent LLM turn before compaction to persist durable notes |
+| MEMORY.md main-session only | `src/agent/agent_loop.rs` | MEMORY.md excluded from group chats for privacy |
+| Logseq integration | `src/workspace/logseq.rs` | Reads user profile, preferences, decisions from Logseq graph |
+| BOOT.md on startup | `src/agent/agent_loop.rs` | Runs BOOT.md as first agent turn with full tool access on startup |
+| Memory flush with tools | `src/agent/agent_loop.rs` | Pre-compaction flush now executes memory tools (max 3 iterations) |
+| Daily session reset | `src/agent/agent_loop.rs` | Auto-resets sessions at configurable hour boundary |
+| Learnings system | `src/workspace/learnings.rs` | Evidence-backed rules with confidence scoring and lifecycle |
+| Learning tools | `src/tools/builtin/learning.rs` | learning_create, learning_search, learning_promote |
+| Salience scoring | `src/agent/compressor/salience.rs` | Turn/session importance scoring for intelligent compaction |
+| Content-hash dedup | `src/workspace/mod.rs`, `repository.rs` | Cross-machine session merge deduplication |
+| AGENTS.md template | `docs/reference/AGENTS.recommended.md` | Recommended workspace instructions template |
+
+### Multi-Agent Task Graph
+
+Inspired by [beads](https://github.com/steveyegge/beads). PostgreSQL DAG for task coordination across agents.
+
+| File | Purpose |
+|------|---------|
+| `migrations/V9__agent_tasks.sql` | Schema: `agent_tasks`, `agent_task_deps`, `agent_task_events` tables |
+| `src/workspace/tasks.rs` | `TaskRepository` with CRUD, cycle detection, auto-promotion, **memory decay** (`archive_completed_tasks`) |
+| `src/tools/builtin/task.rs` | 6 LLM tools: `task_create`, `task_list`, `task_update`, `task_ready`, `task_export`, **`task_archive`** |
+
+### Semantic Merge
+
+Uses vendored [weave-core](https://github.com/Ataraxy-Labs/weave) for entity-level 3-way merge.
+
+| File | Purpose |
+|------|---------|
+| `src/workspace/merge.rs` | `semantic_merge`, `merge_prefer_ours`, `merge_with_markers` |
+| `src/workspace/mod.rs` | **`write_with_merge()`** — auto-merge on concurrent workspace writes |
+| `vendor/weave-core/` | Vendored (upstream pins sem-core 0.2, we need 0.3) |
+
+### Sandboxed Python
+
+Uses [monty](https://github.com/pydantic/monty) (Rust-native Python interpreter) with resource limits.
+
+| File | Purpose |
+|------|---------|
+| `src/tools/builtin/python.rs` | `PythonTool` — time/memory limited, no I/O, **external function bridge** (json_parse, json_dump, base64_encode, base64_decode, hash_sha256) |
+
+### Security Hardening
+
+| File | Purpose |
+|------|---------|
+| `src/safety/command_guard.rs` | Destructive command blocking — **20 security packs** (git, filesystem, database, containers, cloud, system, piped exec, inline scripts, sensitive paths, storage, secrets, remote, CI/CD, networking, DNS, backup, messaging, search, package managers, env vars) |
+| `src/safety/integrity.rs` | Workspace identity file SHA-256 drift detection, **wired into heartbeat** |
+| `src/tools/wasm/verification.rs` | WASM tool checksum verification on load |
+
+### Token Compression
+
+Ported from [claw-compactor](https://github.com/aeromomo/claw-compactor) — 5-stage deterministic compression pipeline.
+
+| File | Purpose |
+|------|---------|
+| `src/agent/compressor/mod.rs` | `CompressorPipeline` with config, token estimation |
+| `src/agent/compressor/observations.rs` | **Observation extraction** — highest-savings layer (~97%) |
+| `src/agent/compressor/dedup.rs` | Shingle hashing + Jaccard similarity dedup |
+| `src/agent/compressor/dictionary.rs` | Auto-learned codebook with `$XX` codes |
+| `src/agent/compressor/patterns.rs` | Path shorthand, IP compression, enum compaction |
+| `src/agent/compressor/text_optimizer.rs` | CJK normalization, whitespace, table compaction |
+| `src/agent/compaction.rs` | **Wired**: compressor runs before LLM summarization |
+
+### Agent Skills
+
+97 bundled skills in `skills/` at repo root. Auto-discovered from exe dir, ancestor dirs, or CWD. Sourced from 24 reference repos.
+
+| File | Purpose |
+|------|---------|
+| `src/skills/mod.rs` | Module root, public exports |
+| `src/skills/loader.rs` | Multi-source discovery (`resolve_bundled_skills_dir`) |
+| `src/skills/frontmatter.rs` | YAML frontmatter parser for SKILL.md |
+| `src/skills/eligibility.rs` | OS, bins, env var checks |
+| `src/skills/prompt.rs` | XML prompt formatting per Agent Skills standard |
+
+### Additional Dependencies
+
+| Crate | Source | Notes |
+|-------|--------|-------|
+| `weave-core` | `vendor/weave-core/` (path) | Vendored from Ataraxy-Labs/weave rev `8c461b4`. sem-core bumped 0.2→0.3. |
+| `monty` | `git` rev `dcdf702` | Sandboxed Python interpreter. |
+
+### Environment Variables (Fork-Specific)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENT_ID` | lowercase `AGENT_NAME` | Unique ID for multi-agent scoping (e.g., `frack`, `frick`) |
+| `IRONCLAW_SKILLS_DIR` | (auto-detected) | Override bundled skills directory |
+
+### LLM Provider Configuration
+
+IronClaw supports 6 LLM backends. Set `LLM_BACKEND` env var or `llm_backend` in settings.
+
+| Backend | `LLM_BACKEND` value | Required env vars | Default model |
+|---------|---------------------|-------------------|---------------|
+| NEAR AI (default) | `nearai` | `NEARAI_SESSION_TOKEN` or `NEARAI_API_KEY` | `llama4-maverick-instruct-basic` |
+| Ollama (local) | `ollama` | None | `qwen3-coder:30b` |
+| OpenAI | `openai` | `OPENAI_API_KEY` | `gpt-5.3-codex` |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` |
+| Gemini | `gemini` | `GEMINI_API_KEY` | `gemini-2.5-pro` |
+| OpenAI-compatible | `openai_compatible` | `LLM_BASE_URL` | `default` |
+
+**Ollama-specific vars:**
+- `OLLAMA_BASE_URL` — default `http://localhost:11434` (Frack: local, Frick: `http://alef:11434`)
+- `OLLAMA_MODEL` — default `qwen3-coder:30b`
+
+**Recommended setup for self-hosted:**
+```bash
+# Frack (MacBook) — use local Ollama
+export LLM_BACKEND=ollama
+export OLLAMA_MODEL=qwen3-coder:30b
+
+# Frick (homelab) — use Ollama on alef
+export LLM_BACKEND=ollama
+export OLLAMA_BASE_URL=http://localhost:11434
+export OLLAMA_MODEL=qwen3-coder:30b
+
+# Cloud fallback (any agent)
+export ANTHROPIC_API_KEY=sk-ant-...   # Claude Opus 4.6
+export OPENAI_API_KEY=sk-...          # ChatGPT 5.3
+export GEMINI_API_KEY=...             # Gemini 2.5 Pro
+```
+
+API keys from the encrypted secrets store are auto-injected via `inject_llm_keys_from_secrets()`.
+
+### Intelligent LLM Router
+
+IronClaw includes a native intelligent routing engine (`src/llm/router.rs`) ported from ClawRouter. It classifies requests by complexity and routes to the optimal model for cost/quality balance — all in <1ms with no external API calls.
+
+**15-dimension weighted scoring:**
+Token count, code presence, reasoning markers, technical terms, creative markers, simple indicators, multi-step patterns, question complexity, imperative verbs, constraints, output format, references, negation, domain specificity, agentic task detection.
+
+**4 complexity tiers:** SIMPLE → MEDIUM → COMPLEX → REASONING
+
+**4 routing profiles:**
+| Profile | `ROUTING_PROFILE` | Behavior |
+|---------|-------------------|----------|
+| Auto (default) | `auto` | Standard routing with automatic agentic detection |
+| Eco | `eco` | Ultra cost-optimized: cheapest viable models |
+| Premium | `premium` | Best quality: Claude Opus 4.6, GPT-5.2 Codex |
+| Free | `free` | Zero-cost models only (NVIDIA GPT-OSS 120B) |
+
+**Configuration:**
+```bash
+export ROUTING_PROFILE=auto          # auto, eco, premium, free
+export ROUTING_FORCE_AGENTIC=false   # force agentic tier selection
+export ROUTING_SESSION_PINNING=true  # reuse model within a session
+```
+
+Or in `settings.json`:
+```json
+{
+  "routing_profile": "auto",
+  "routing_force_agentic": false,
+  "routing_session_pinning": true
+}
+```
+
+**Key features:**
+- Session pinning: first request in a session determines the model; subsequent requests reuse it
+- Rate-limit cooldown: models that return 429 are deprioritized for 60 seconds
+- Agentic detection: tool-heavy requests (file ops, deploy, iterate) auto-upgrade to agentic tiers
+- Cost estimation: every routing decision includes estimated cost and savings vs Claude Opus 4.5 baseline
+- **Local-first**: Simple/Medium requests route to local Ollama models (qwen3-coder:30b, deepseek-r1:70b); Complex/Reasoning fall back to Claude Opus 4.6
+- 22-model catalog across 8 providers (OpenAI, Anthropic, Google, DeepSeek, Moonshot, xAI, NVIDIA, Ollama)
+- **Note**: GPT-4o, GPT-4.1, o4-mini were retired by OpenAI on 2026-02-13; GPT-5.3-Codex is the current SOTA coding model
+
+### Deployment Topology
+
+| Agent | Host | Role |
+|-------|------|------|
+| Frack | MacBook | Primary interactive agent (CLI/TUI, web gateway) |
+| Frick | Homelab server (`alef`) | Production/infrastructure agent (shared PostgreSQL, K3s, Ollama) |
+
+Both share PostgreSQL on `alef` and Logseq (synced natively). Both run Ollama bare metal for local inference.
+
+### Roadmap
+
+Full plan: [`docs/INTEGRATION_PLAN.md`](docs/INTEGRATION_PLAN.md). Remaining gaps: [`docs/REMAINING_INTEGRATION_WORK.md`](docs/REMAINING_INTEGRATION_WORK.md).
+
+- **Phase 1 (Security)**: ✅ Done — command guard (20 packs), integrity (heartbeat-wired), WASM verification
+- **Phase 2 (Compaction)**: ✅ Done — 5-stage pipeline (observations, dedup, dictionary, patterns, text opt) + salience scoring, wired into compaction
+- **Phase 3 (OpenClaw gaps)**: ✅ Done — BOOT.md on startup, memory flush with tool execution loop (max 3 iterations), daily session reset
+- **Phase 4 (Skills)**: ✅ Done — 97 bundled skills from 25 reference repos, multi-source discovery
+- **Phase 4b (Router)**: ✅ Done — Intelligent LLM router (15-dimension classifier, 4 profiles, 22-model catalog, local-first routing, Opus 4.6 cloud fallback)
+- **Phase 5 (Advanced)**: ✅ Done — weave-core + auto-merge, monty + external functions, task graph + memory decay
+- **Phase 5.5 (LLM Providers)**: ✅ Done — Gemini backend added, Ollama default updated to qwen3-coder:30b, 6 total backends
+- **Phase 6 (Database MCP)**: [genai-toolbox](https://github.com/googleapis/genai-toolbox) MCP Toolbox for Databases — structured DB tools via MCP for PostgreSQL + future data sources
+- **Phase 6b (Session Intelligence)**: ✅ Done — learnings system (PostgreSQL + 3 LLM tools + prompt injection), salience scoring (turn/session importance), cross-machine session merge (content-hash dedup)
+- **Phase 7+**: Frick deployment, multi-agent shared workspace, enhanced Logseq sync
+
+### Reference Repo Integration Process
+
+To add a new reference repository:
+
+1. `git clone --depth 1 <url> examples/reference-repos/<short-name>`
+2. Assess: read skills, source, README — what's novel vs already covered?
+3. Adopt: copy skills to `skills/`, port algorithms to Rust, or document patterns
+4. Document: update `docs/INTEGRATION_PLAN.md`, `FEATURE_PARITY.md`, `CLAUDE.md`, `README.md`
+5. Do not add as Cargo dependency — vendor or port instead

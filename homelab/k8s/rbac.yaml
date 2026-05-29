@@ -1,0 +1,53 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: frick-ops
+  namespace: agents-shared
+  labels:
+    app.kubernetes.io/name: frick
+
+---
+# Frick is the cluster-ops agent. Cluster-wide read + targeted writes
+# for pod restarts, deployment rollouts, ArgoCD app syncs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: frick-cluster-ops
+rules:
+  - apiGroups: [""]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      ["apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io",
+       "argoproj.io", "traefik.io", "monitoring.coreos.com",
+       "cert-manager.io", "postgresql.cnpg.io", "bitnami.com",
+       "metrics.k8s.io", "longhorn.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # Targeted writes — pod restarts (rolling), HPA tweaks, Application
+  # syncs/refreshes. NO destructive deletes on stateful resources, NO
+  # secrets writes (separation of duties; sealed-secrets in git only).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["patch", "update"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: frick-cluster-ops
+subjects:
+  - kind: ServiceAccount
+    name: frick-ops
+    namespace: agents-shared
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: frick-cluster-ops
