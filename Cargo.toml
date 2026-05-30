@@ -99,7 +99,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Terminal
 crossterm = "0.29"
-rustyline = { version = "17", features = ["custom-bindings", "derive", "with-file-history"] }
+rustyline = { version = "18.0.0", features = ["custom-bindings", "derive", "with-file-history"] }
 termimad = "0.34"
 
 # Channel integrations
