@@ -48,7 +48,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
 
       - name: Install cargo-insta and cargo-nextest
-        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # v2
+        uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
         with:
           tool: cargo-insta,cargo-nextest
 
