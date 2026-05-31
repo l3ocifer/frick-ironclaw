@@ -66,7 +66,7 @@ refinery = { version = "0.8", features = ["tokio-postgres"], optional = true }
 tokio-postgres-rustls = { version = "0.13", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false }
 rustls-native-certs = { version = "0.8", optional = true }
-webpki-roots = { version = "0.26", optional = true }
+webpki-roots = { version = "1.0.7", optional = true }
 
 # Database - libSQL/Turso (optional embedded database)
 libsql = { version = "0.6", optional = true, default-features = false, features = ["core", "replication", "remote", "tls"] }
