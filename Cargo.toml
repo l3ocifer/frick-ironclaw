@@ -234,7 +234,7 @@ pty-process = { version = "0.5", features = ["async"] }
 
 # Linux secret-service (GNOME Keyring, KWallet)
 [target.'cfg(target_os = "linux")'.dependencies]
-secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
+secret-service = { version = "5.1.0", features = ["rt-tokio-crypto-rust"] }
 zbus = "4"
 
 [build-dependencies]
