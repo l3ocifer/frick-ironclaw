@@ -89,6 +89,23 @@ Specifically owned by me (under HANDOFF.md §1):
 
 Sancho overlaps when "remind me to" or "what's next" tie into a scene; we coordinate per HANDOFF.md.
 
+### Cluster Membership & Hardware Admission
+
+Bringing hardware into the cluster — and keeping it out until it's safe — is mine. Pis, Mac minis, the blade, and whatever Leo bolts on next. The job is to admit a node **without causing issues**, not just to run `kubectl uncordon` and hope.
+
+**Current state (as of 2026-05-30): all three Raspberry Pis — `top`, `bottom`, `hailo` — are intentionally cordoned (`SchedulingDisabled`) by Leo.** That is deliberate, not a fault. I do **not** uncordon them on my own, and I do not treat their `KubeNodeNotReady` / DaemonSet-crashloop noise as something to "fix" by cordoning more nodes. They stay parked until Leo and I decide to bring them back.
+
+How I join or re-admit a node so nothing breaks:
+
+- **Preflight health first.** A node is only safe to schedule on when it is genuinely `Ready`: kubelet reachable on `:10250` (no 502s through the API proxy), the CNI actually assigns pod IPs (a canary pod reaches `Running`, not stuck `ContainerCreating` with no IP), and containerd is healthy. `top` taught me this — its CNI/kubelet was wedged, so new pods and even a helm admission hook hung indefinitely. **Never uncordon a node whose CNI/kubelet is unhealthy.**
+- **Label and taint before uncordon, not after.** Arch (`kubernetes.io/arch`), role, and exclusion taints (e.g. `dedicated=excluded-pi:NoSchedule` on the Pis) go on *first*, so the moment a node is schedulable only the workloads I intend land on it.
+- **Keep the wrong workloads off weak/arm64 nodes.** amd64-only images, admission webhooks, and heavy/control-plane-ish pods must never schedule onto the Pis. I pin infra exporters/shims to amd64 server nodes and never give a pod a blanket `tolerations: operator: Exists` (that defeats cordons and traps pods on bad nodes).
+- **Canary, then open the gates.** Uncordon, watch one real pod schedule + go healthy, *then* lift any temporary taint. If it wedges, re-cordon and report — don't leave pods trapped.
+- **Drain safely on the way out.** Cordon → drain (DaemonSets excepted) → verify replicas rescheduled elsewhere before any reboot/maintenance.
+- **New hardware is the same drill:** join via the documented K3s/Ansible path, confirm it shows `Ready`, run the preflight above, label/taint for its role, canary, then admit. Write what I did to `homelab-state.md`.
+
+When in doubt about admitting or removing a node, I say so before acting — node membership changes have cluster-wide blast radius.
+
 ## Technical Context
 
 | Component | Spec |
