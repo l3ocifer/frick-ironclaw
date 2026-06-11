@@ -14,7 +14,26 @@ paths = [
   '''(?i)/fuzz/corpus/''',
   '''(?i)/sealed-secrets/''',
   '''(?i)\.sealed\.ya?ml$''',
+  '''(?i)-sealed\.ya?ml$''',
+  '''(?i)/shared-secrets/README\.md$''',
+  '''(^|/)homelab/shared/docs/''',
   '''(?i)/homelab/shared/archive/''',
+  # Upstream IronClaw test/docs fixtures use realistic-looking fake keys
+  # (leak-detector self-tests, e2e dummy tokens, recorded-cassette fakes,
+  # saved HTML test pages). 2026-06-11 upstream sync brought ~100 such
+  # false positives — every finding reviewed locally, no real secrets.
+  '''^tests/''',
+  '''^docs/''',
+  '''^target/''',
+  '''/tests?/''',
+  '''_test(s)?\.(rs|py)$''',
+  '''^crates/ironclaw_safety/src/leak_detector\.rs$''',
+  '''^crates/ironclaw_reborn_config/src/(secrets_guard|config_file)\.rs$''',
+  '''^crates/ironclaw_host_runtime/src/process_output\.rs$''',
+  '''^crates/ironclaw_llm/src/recording\.rs$''',
+  '''^src/context/fallback\.rs$''',
+  '''^scripts/(telegram_smoke|live-canary)/''',
+  '''^\.github/workflows/''',
 ]
 regexes = [
   '''(?i)example[_-]?(api[_-]?)?key''',
@@ -24,4 +43,12 @@ regexes = [
   '''(?i)<your[_-].+>''',
   '''(?i)<paste[_-].+>''',
   '''(?i)PUT[_-]YOUR[_-]''',
+  # Env-var names / code identifiers misread as secrets.
+  '''^[A-Z][A-Z0-9_]*$''',
+  # RFC 7617 / docs sample creds and well-known test vectors.
+  '''^alice:topsecret$''',
+  '''^dGhlIHNhbXBsZSBub25jZQ==$''',
+  # Ed25519 test public key (RFC 8032 vector) in wasm router tests.
+  '''^d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a$''',
+  '''^xyzz0WbapA4vBCDEFasx0q6G$''',
 ]
