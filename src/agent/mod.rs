@@ -11,10 +11,13 @@
 //! - Context compaction for long conversations
 
 mod agent_loop;
+pub mod agentic_loop;
+mod attachments;
+mod commands;
 pub mod compaction;
-pub mod compressor;
 pub mod context_monitor;
 pub mod cost_guard;
+mod dispatcher;
 mod heartbeat;
 pub mod job_monitor;
 mod router;
@@ -26,6 +29,7 @@ pub mod session;
 mod session_manager;
 pub mod submission;
 pub mod task;
+mod thread_ops;
 pub mod undo;
 
 #[cfg(all(test, feature = "libsql"))]

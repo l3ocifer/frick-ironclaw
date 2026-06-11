@@ -12,60 +12,85 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use futures::StreamExt;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::heartbeat::{spawn_heartbeat, spawn_multi_user_heartbeat};
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
-use crate::agent::session::{PendingApproval, Session, ThreadState};
+use crate::agent::session::ThreadState;
 use crate::agent::session_manager::SessionManager;
 use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
-use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, MessageIntent, Router, Scheduler};
-use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse, StatusUpdate};
-use crate::config::{AgentConfig, HeartbeatConfig, MemoryFlushConfig, RoutineConfig};
-use crate::context::{ContextManager, JobContext};
+use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler, SchedulerDeps};
+use crate::channels::{
+    ChannelManager, IncomingMessage, OutgoingAttachment, OutgoingResponse, StatusUpdate,
+};
+use crate::config::{AgentConfig, HeartbeatConfig, RoutineConfig, SkillsConfig};
+use crate::context::ContextManager;
 use crate::db::Database;
 use crate::error::{ChannelError, Error};
 use crate::extensions::ExtensionManager;
 use crate::generated_images::GeneratedImageSentinel;
 use crate::hooks::HookRegistry;
-use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult};
-use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 use ironclaw_llm::LlmProvider;
 use ironclaw_safety::SafetyLayer;
 use ironclaw_skills::SkillRegistry;
 
-/// Result of the agentic loop execution.
-pub(super) enum AgenticLoopResult {
-    /// Completed with a response.
-    Response(String),
-    /// A tool requires approval before continuing.
-    NeedApproval {
-        /// The pending approval request to store.
-        pending: PendingApproval,
-    },
+const TRACE_QUEUE_WORKER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+const TRACE_QUEUE_WORKER_FLUSH_LIMIT: usize = 25;
+
+/// Outcome of [`Agent::handle_message`] — drives the run-loop's response/Done dispatch.
+///
+/// Distinguishes "no response, turn is over" from "no response, turn is paused"
+/// so the run loop can decide whether to emit the terminal `Done` status. Sending
+/// `Done` after a pause (e.g. while awaiting tool approval) is incorrect because
+/// the thread is not in a terminal state, and would also trip the web UI's
+/// missing-response safety net (see #2079).
+pub(crate) const BRIDGE_PENDING_SENTINEL: &str = "\u{0}__bridge_pending__";
+
+#[derive(Debug)]
+pub(crate) enum HandleOutcome {
+    /// Shutdown signal (e.g. `/quit`). Run loop should break.
+    Shutdown,
+    /// Send this content via the channel, then emit terminal `Done`.
+    Respond(OutgoingResponse),
+    /// No response to send, but the turn is complete — emit `Done` only.
+    NoResponse,
+    /// Turn is paused (awaiting approval/auth/etc). Do not emit `Done`.
+    Pending,
 }
 
-/// Channels that represent main/direct sessions (not group chats).
-/// Only in these do we include MEMORY.md in the system prompt for privacy.
-const MAIN_SESSION_CHANNELS: &[&str] = &["cli", "repl", "web", "gateway", "tui"];
-
-fn is_main_session(channel: &str) -> bool {
-    MAIN_SESSION_CHANNELS.contains(&channel)
-}
-
-/// Ensure thread.metadata is a JSON object so we can insert keys.
-fn ensure_metadata_object(thread: &mut crate::agent::session::Thread) {
-    if !thread.metadata.is_object() {
-        thread.metadata = serde_json::Value::Object(serde_json::Map::new());
+impl HandleOutcome {
+    /// Convert a legacy `Option<String>` return into a [`HandleOutcome`].
+    ///
+    /// `None` → `Shutdown`, empty string → `NoResponse`, otherwise `Respond`.
+    /// Used to wrap v1 handlers that return `Option<String>`.
+    fn from_legacy(opt: Option<String>) -> Self {
+        match opt {
+            None => HandleOutcome::Shutdown,
+            Some(s) if s == BRIDGE_PENDING_SENTINEL => HandleOutcome::Pending,
+            Some(s) if s.is_empty() => HandleOutcome::NoResponse,
+            Some(s) => HandleOutcome::Respond(OutgoingResponse::text(s)),
+        }
     }
 }
 
+impl From<crate::bridge::BridgeOutcome> for HandleOutcome {
+    fn from(outcome: crate::bridge::BridgeOutcome) -> Self {
+        match outcome {
+            crate::bridge::BridgeOutcome::Respond(s) => {
+                HandleOutcome::Respond(OutgoingResponse::text(s))
+            }
+            crate::bridge::BridgeOutcome::NoResponse => HandleOutcome::NoResponse,
+            crate::bridge::BridgeOutcome::Pending => HandleOutcome::Pending,
+        }
+    }
+}
+
+/// Static greeting persisted to DB and broadcast on first launch.
+///
 /// Collapse a tool output string into a single-line preview for display.
 pub(crate) fn truncate_for_preview(output: &str, max_chars: usize) -> String {
     let collapsed: String = output
@@ -115,6 +140,134 @@ fn trimmed_option(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+async fn trace_queue_worker_scopes(
+    owner_id: &str,
+    store: Option<Arc<dyn Database>>,
+) -> Vec<String> {
+    let mut scopes = vec![owner_id.to_string()];
+    if let Some(store) = store {
+        match store.list_users(Some("active")).await {
+            Ok(users) => scopes.extend(users.into_iter().map(|user| user.id)),
+            Err(error) => {
+                tracing::debug!(%error, "Trace Commons queue worker failed to list active users");
+            }
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
+fn spawn_trace_queue_flush_worker(
+    owner_id: String,
+    store: Option<Arc<dyn Database>>,
+    channels: Arc<ChannelManager>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(TRACE_QUEUE_WORKER_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+            let scopes = trace_queue_worker_scopes(&owner_id, store.clone()).await;
+            let delivery_scopes = scopes.clone();
+            let trace_host = crate::trace_client::TraceClientHost;
+            let _report = match trace_host
+                .flush_queue_worker_tick(scopes, TRACE_QUEUE_WORKER_FLUSH_LIMIT)
+                .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    tracing::debug!(%error, "Trace Commons queue worker tick failed");
+                    for scope in delivery_scopes {
+                        deliver_trace_credit_notice_outbox_for_scope(&scope, &channels).await;
+                    }
+                    continue;
+                }
+            };
+
+            for scope in delivery_scopes {
+                deliver_trace_credit_notice_outbox_for_scope(&scope, &channels).await;
+            }
+        }
+    })
+}
+
+async fn deliver_trace_credit_notice_outbox_for_scope(scope: &str, channels: &Arc<ChannelManager>) {
+    let trace_host = crate::trace_client::TraceClientHost;
+    let trace_scope = crate::trace_client::TraceClientScope::raw(scope);
+    let pending = match trace_host.pending_credit_notice_outbox_items(&trace_scope) {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                scope_ref = %crate::trace_contribution::local_pseudonymous_contributor_id(scope),
+                "Trace Commons queue worker failed to read credit notice outbox"
+            );
+            return;
+        }
+    };
+    for item in pending {
+        let response = OutgoingResponse::text(item.message.clone());
+        let results = channels.broadcast_all(scope, response).await;
+        let success_channel = results
+            .iter()
+            .find_map(|(channel, result)| result.is_ok().then(|| channel.clone()));
+        if let Some(channel) = success_channel {
+            if let Err(error) = trace_host.record_credit_notice_delivery_success(
+                &trace_scope,
+                &item.fingerprint,
+                &channel,
+            ) {
+                tracing::debug!(
+                    %channel,
+                    %error,
+                    "Trace Commons queue worker failed to record credit notice delivery"
+                );
+            }
+            continue;
+        }
+
+        if results.is_empty() {
+            if let Err(error) = trace_host.record_credit_notice_delivery_failure(
+                &trace_scope,
+                &item.fingerprint,
+                "none",
+                "no channels registered for credit notice delivery",
+            ) {
+                tracing::debug!(
+                    %error,
+                    "Trace Commons queue worker failed to record empty credit notice delivery"
+                );
+            }
+            continue;
+        }
+
+        for (channel, result) in results {
+            if let Err(error) = result {
+                tracing::debug!(
+                    %channel,
+                    %error,
+                    "Trace Commons queue worker failed to deliver credit notice"
+                );
+                if let Err(record_error) = trace_host.record_credit_notice_delivery_failure(
+                    &trace_scope,
+                    &item.fingerprint,
+                    &channel,
+                    &error.to_string(),
+                ) {
+                    tracing::debug!(
+                        %channel,
+                        %record_error,
+                        "Trace Commons queue worker failed to record credit notice delivery failure"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn resolve_owner_scope_notification_user(
@@ -223,8 +376,9 @@ async fn build_outgoing_response_for_thread(
     session: &Arc<tokio::sync::Mutex<crate::agent::session::Session>>,
     thread_id: Uuid,
     content: impl Into<String>,
+    attachment_paths: Vec<String>,
 ) -> OutgoingResponse {
-    let mut response = OutgoingResponse::text(content);
+    let mut response = OutgoingResponse::text(content).with_attachments(attachment_paths);
     let attachments = {
         let sess = session.lock().await;
         sess.threads
@@ -234,11 +388,41 @@ async fn build_outgoing_response_for_thread(
             .unwrap_or_default()
     };
 
-    if !attachments.is_empty() {
+    if response.attachments.is_empty() && !attachments.is_empty() {
         response = response.with_inline_attachments(attachments);
     }
 
     response
+}
+
+async fn submission_response_to_handle_outcome(
+    session: &Arc<tokio::sync::Mutex<crate::agent::session::Session>>,
+    thread_id: Uuid,
+    content: String,
+    attachments: Vec<String>,
+) -> HandleOutcome {
+    let has_attachments = !attachments.is_empty();
+
+    // Suppress silent replies only when there is truly nothing else to deliver.
+    // Image-only generated responses intentionally have empty text plus staged
+    // attachments, and must still reach the originating channel.
+    if ironclaw_llm::is_silent_reply(&content) {
+        if !has_attachments {
+            tracing::debug!("Suppressing silent reply token");
+            return HandleOutcome::Shutdown;
+        }
+        return HandleOutcome::Respond(
+            build_outgoing_response_for_thread(session, thread_id, "", attachments).await,
+        );
+    }
+
+    if content.is_empty() && !has_attachments {
+        HandleOutcome::NoResponse
+    } else {
+        HandleOutcome::Respond(
+            build_outgoing_response_for_thread(session, thread_id, content, attachments).await,
+        )
+    }
 }
 
 async fn resolve_channel_notification_user(
@@ -293,6 +477,18 @@ fn should_fallback_routine_notification(error: &ChannelError) -> bool {
     !matches!(error, ChannelError::MissingRoutingTarget { .. })
 }
 
+fn setup_markers_for_skills(
+    skills: &[ironclaw_skills::LoadedSkill],
+) -> std::collections::HashSet<String> {
+    let mut markers = std::collections::HashSet::new();
+    for skill in skills {
+        if let Some(marker) = &skill.manifest.activation.setup_marker {
+            markers.insert(marker.clone());
+        }
+    }
+    markers
+}
+
 /// Core dependencies for the agent.
 ///
 /// Bundles the shared components to reduce argument count.
@@ -311,8 +507,9 @@ pub struct AgentDeps {
     pub tools: Arc<ToolRegistry>,
     pub workspace: Option<Arc<Workspace>>,
     pub extension_manager: Option<Arc<ExtensionManager>>,
-    /// Learning repository for evidence-backed learnings (Phase 6b).
-    pub learning_repo: Option<Arc<crate::workspace::learnings::LearningRepository>>,
+    pub skill_registry: Option<Arc<std::sync::RwLock<SkillRegistry>>>,
+    pub skill_catalog: Option<Arc<ironclaw_skills::catalog::SkillCatalog>>,
+    pub skills_config: SkillsConfig,
     pub hooks: Arc<HookRegistry>,
     pub auth_manager: Option<Arc<crate::auth::extension::AuthManager>>,
     /// Cost enforcement guardrails (daily budget, hourly rate limits).
@@ -334,6 +531,15 @@ pub struct AgentDeps {
     pub llm_backend: String,
     /// Per-tenant rate limiting registry (lazily creates rate state per user).
     pub tenant_rates: Arc<crate::tenant::TenantRateRegistry>,
+    /// Resolved runtime policy used to filter the model-facing tool list
+    /// (#3045 PR 4 + PR 5). When `None`, the legacy unfiltered tool list
+    /// is used — appropriate for tests and the bootstrap path before
+    /// `Config::with_runtime_overrides` has run. When `Some`, every
+    /// `tool_definitions` build for the LLM goes through
+    /// `ToolRegistry::tool_definitions_visible_under(policy)` so
+    /// hosted-multi-tenant deployments cannot expose provider-host shell
+    /// affordances to the model.
+    pub runtime_policy: Option<ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy>,
 }
 
 /// The main agent that coordinates all components.
@@ -412,6 +618,12 @@ impl Agent {
         if let Some(ref interceptor) = deps.http_interceptor {
             scheduler.set_http_interceptor(Arc::clone(interceptor));
         }
+        if let Some(ref policy) = deps.runtime_policy {
+            // Propagate the resolved runtime policy so background-job
+            // workers see the same model-facing tool surface as the
+            // dispatcher (#3243 HIGH iteration-2 gap).
+            scheduler.set_runtime_policy(policy.clone());
+        }
         let scheduler = Arc::new(scheduler);
 
         Self {
@@ -476,7 +688,11 @@ impl Agent {
         message: &IncomingMessage,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
+        let staged_generated_attachments = response.attachments.clone();
         let respond_result = self.channels.respond(message, response).await;
+        crate::generated_images::remove_staged_generated_image_attachments(
+            &staged_generated_attachments,
+        );
         // Always emit Done regardless of whether respond succeeded, so the
         // client knows the turn is over even when the response delivery fails.
         if let Err(e) = self
@@ -680,27 +896,16 @@ impl Agent {
         let Some(registry) = self.skill_registry() else {
             return (vec![], message_content.to_string(), vec![]);
         };
-        // Snapshot the skill list + distinct setup markers under the read
-        // lock, then drop the guard before any await. The marker checks
-        // and the prefilter call don't need the registry lock and we
-        // shouldn't hold a poisonable RwLock across an await point.
-        let (available, distinct_markers) = match registry.read() {
-            Ok(guard) => {
-                let skills_clone: Vec<ironclaw_skills::LoadedSkill> = guard.skills().to_vec();
-                let mut markers: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for s in &skills_clone {
-                    if let Some(m) = &s.manifest.activation.setup_marker {
-                        markers.insert(m.clone());
-                    }
-                }
-                (skills_clone, markers)
-            }
-            Err(e) => {
-                tracing::error!("Skill registry lock poisoned: {}", e);
-                return (vec![], message_content.to_string(), vec![]);
-            }
+        // Snapshot the skill list + distinct setup markers, then drop any
+        // registry state before marker checks and prefiltering. In hosted
+        // multi-tenant mode, non-owner turns resolve the same private skill
+        // mount used by the Settings UI so self-installed skills can actually
+        // activate at runtime.
+        let available = match self.available_skills_for_user(registry, user_id).await {
+            Some(skills) => skills,
+            None => return (vec![], message_content.to_string(), vec![]),
         };
+        let distinct_markers = setup_markers_for_skills(&available);
 
         // Resolve which setup markers are satisfied by the current
         // workspace. A marker is "satisfied" iff its path exists.
@@ -731,12 +936,15 @@ impl Agent {
 
         // Phase 2: Score-based selection on the rewritten message
         let skills_cfg = &self.deps.skills_config;
-        let outcome = ironclaw_skills::prefilter_skills(
+        let outcome = ironclaw_skills::prefilter_skills_with_options(
             &rewritten,
             &available,
             skills_cfg.max_active_skills,
             skills_cfg.max_context_tokens,
             &satisfied,
+            ironclaw_skills::SkillSelectionOptions {
+                regex_activation_enabled: skills_cfg.regex_activation_enabled,
+            },
         );
 
         // Feedback notes: start with the selector's own notes (chain-load,
@@ -774,6 +982,32 @@ impl Agent {
         }
 
         (selected, rewritten, feedback)
+    }
+
+    async fn available_skills_for_user(
+        &self,
+        registry: &Arc<std::sync::RwLock<SkillRegistry>>,
+        user_id: &str,
+    ) -> Option<Vec<ironclaw_skills::LoadedSkill>> {
+        if self.config.multi_tenant {
+            let mut scoped = match registry.read() {
+                Ok(guard) => guard.clone_config_for_tenant_user_scope(self.owner_id(), user_id),
+                Err(e) => {
+                    tracing::error!("Skill registry lock poisoned: {}", e);
+                    return None;
+                }
+            };
+            scoped.discover_all().await;
+            return Some(scoped.skills().to_vec());
+        }
+
+        match registry.read() {
+            Ok(guard) => Some(guard.skills().to_vec()),
+            Err(e) => {
+                tracing::error!("Skill registry lock poisoned: {}", e);
+                None
+            }
+        }
     }
 
     /// Send initial engine thread list and routines to the TUI channel so
@@ -968,6 +1202,12 @@ impl Agent {
             }
         });
 
+        let trace_queue_worker_handle = spawn_trace_queue_flush_worker(
+            self.owner_id().to_string(),
+            self.deps.store.clone(),
+            self.channels.clone(),
+        );
+
         // Spawn heartbeat if enabled
         let heartbeat_handle = if let Some(ref hb_config) = self.heartbeat_config {
             if hb_config.enabled {
@@ -1058,17 +1298,35 @@ impl Agent {
                         }
                     });
 
-                    tracing::info!(
-                        "Heartbeat enabled with {}s interval",
-                        hb_config.interval_secs
-                    );
-                    Some(spawn_heartbeat(
-                        config,
-                        workspace.clone(),
-                        self.cheap_llm().clone(),
-                        Some(notify_tx),
-                        None, // Integrity monitor set separately at startup
-                    ))
+                    let hygiene = self
+                        .hygiene_config
+                        .as_ref()
+                        .map(|h| h.to_workspace_config())
+                        .unwrap_or_default();
+
+                    if config.multi_tenant {
+                        if let Some(system) = self.system_store() {
+                            Some(spawn_multi_user_heartbeat(
+                                config,
+                                hygiene,
+                                self.cheap_llm().clone(),
+                                Some(notify_tx),
+                                system,
+                            ))
+                        } else {
+                            tracing::warn!("Multi-tenant heartbeat requires a database store");
+                            None
+                        }
+                    } else {
+                        Some(spawn_heartbeat(
+                            config,
+                            hygiene,
+                            workspace.clone(),
+                            self.cheap_llm().clone(),
+                            Some(notify_tx),
+                            self.system_store(),
+                        ))
+                    }
                 } else {
                     tracing::warn!("Heartbeat enabled but no workspace available");
                     None
@@ -1088,7 +1346,7 @@ impl Agent {
                     let (notify_tx, mut notify_rx) =
                         tokio::sync::mpsc::channel::<OutgoingResponse>(32);
 
-                    let engine = Arc::new(RoutineEngine::new(
+                    let mut engine = RoutineEngine::new(
                         rt_config.clone(),
                         crate::tenant::SystemScope::new(Arc::clone(store)),
                         self.llm().clone(),
@@ -1100,7 +1358,13 @@ impl Agent {
                         self.safety().clone(),
                         self.deps.sandbox_readiness,
                         self.deps.http_interceptor.clone(),
-                    ));
+                    );
+                    if let Some(ref policy) = self.deps.runtime_policy {
+                        // Apply the model-facing tool list filter to
+                        // routine-driven LLM iterations too (#3243 HIGH).
+                        engine.set_runtime_policy(policy.clone());
+                    }
+                    let engine = Arc::new(engine);
 
                     // Register routine tools
                     self.deps
@@ -1216,14 +1480,6 @@ impl Agent {
         // activity panel is populated before the first user message.
         self.hydrate_tui_sidebar().await;
 
-        // Run BOOT.md instructions on startup (Phase 3: OpenClaw gap)
-        if self.workspace().is_some() {
-            let boot_user_id = "system";
-            if let Err(e) = self.run_boot_if_present(boot_user_id).await {
-                tracing::warn!("BOOT.md startup failed: {}", e);
-            }
-        }
-
         // Main message loop
         tracing::debug!("Agent {} ready and listening", self.config.name);
 
@@ -1273,6 +1529,9 @@ impl Agent {
                     match self.hooks().run(&event).await {
                         Err(err) => {
                             tracing::warn!("BeforeOutbound hook blocked response: {}", err);
+                            crate::generated_images::remove_staged_generated_image_attachments(
+                                &response.attachments,
+                            );
                             // Still send Done so the client knows the turn is complete
                             // even though the response was suppressed by the hook.
                             self.send_done(&message).await;
@@ -1302,8 +1561,6 @@ impl Agent {
                     }
                 }
                 Ok(HandleOutcome::NoResponse) => {
-                    // Empty response (e.g. routine consumed the message, silent reply).
-                    // Send Done so the client knows the turn is complete.
                     tracing::debug!(
                         channel = %message.channel,
                         user = %message.user_id,
@@ -1312,10 +1569,6 @@ impl Agent {
                     self.send_done(&message).await;
                 }
                 Ok(HandleOutcome::Pending) => {
-                    // Turn paused awaiting user action (approval, auth, etc).
-                    // Do NOT emit Done — the thread is not in a terminal state.
-                    // The relevant ApprovalNeeded/AuthRequired status was already
-                    // sent by the inner handler before returning.
                     tracing::debug!(
                         channel = %message.channel,
                         user = %message.user_id,
@@ -1323,7 +1576,6 @@ impl Agent {
                     );
                 }
                 Ok(HandleOutcome::Shutdown) => {
-                    // Shutdown signal received (/quit, /exit, /shutdown)
                     tracing::debug!("Shutdown command received, exiting...");
                     break;
                 }
@@ -1378,6 +1630,7 @@ impl Agent {
         tracing::debug!("Agent shutting down...");
         repair_handle.abort();
         pruning_handle.abort();
+        trace_queue_worker_handle.abort();
         if let Some(handle) = heartbeat_handle {
             handle.abort();
         }
@@ -1598,10 +1851,18 @@ impl Agent {
                     .await
                     .map(HandleOutcome::from);
                 }
-                Submission::ExternalCallback { request_id } => {
-                    return crate::bridge::handle_external_callback(self, message, *request_id)
-                        .await
-                        .map(HandleOutcome::from);
+                Submission::ExternalCallback {
+                    request_id,
+                    payload,
+                } => {
+                    return crate::bridge::handle_external_callback(
+                        self,
+                        message,
+                        *request_id,
+                        payload.clone(),
+                    )
+                    .await
+                    .map(HandleOutcome::from);
                 }
                 Submission::GateAuthResolution {
                     request_id,
@@ -1847,98 +2108,37 @@ impl Agent {
             message.content.len()
         );
 
-        // Audit log for command submissions (Phase 3.4: Command audit logging)
-        match &submission {
-            Submission::UserInput { .. } => {} // Don't log user text
-            sub => {
-                let cmd_name = match sub {
-                    Submission::Undo => "undo",
-                    Submission::Redo => "redo",
-                    Submission::Interrupt => "interrupt",
-                    Submission::Compact => "compact",
-                    Submission::Clear => "clear",
-                    Submission::NewThread => "new",
-                    Submission::Heartbeat => "heartbeat",
-                    Submission::Summarize => "summarize",
-                    Submission::Suggest => "suggest",
-                    Submission::Quit => "quit",
-                    Submission::SwitchThread { .. } => "switch_thread",
-                    Submission::Resume { .. } => "resume",
-                    Submission::ExecApproval { .. } => "exec_approval",
-                    Submission::ApprovalResponse { .. } => "approval_response",
-                    Submission::SystemCommand { command, .. } => command.as_str(),
-                    Submission::UserInput { .. } => unreachable!(),
-                };
-                tracing::info!(
-                    target: "audit",
-                    command = cmd_name,
-                    channel = message.channel.as_str(),
-                    user = message.user_id.as_str(),
-                    thread = %thread_id,
-                );
-            }
-        }
-
-        // Daily session reset check (Phase 3.3)
-        if let Some(reset_hour) = self.config.daily_reset_hour {
-            let should_reset = {
-                let sess = session.lock().await;
-                if let Some(thread) = sess.threads.get(&thread_id) {
-                    let last_active = thread.updated_at;
-                    let now = chrono::Utc::now();
-                    // Check if last activity was before today's reset hour
-                    let today_reset = now
-                        .date_naive()
-                        .and_hms_opt(reset_hour as u32, 0, 0)
-                        .map(|dt| dt.and_utc());
-                    if let Some(reset_time) = today_reset {
-                        last_active < reset_time && now >= reset_time
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
+        if !message.is_internal
+            && let Submission::UserInput { ref content } = submission
+            && let Some(engine) = self.routine_engine().await
+        {
+            let single_message_repl = is_single_message_repl(message);
+            // Use post-hook content so that BeforeInbound hooks that rewrite
+            // input are respected by event trigger matching.
+            let fired = if single_message_repl {
+                engine.check_event_triggers_and_wait(message, content).await
+            } else {
+                engine.check_event_triggers(message, content).await
             };
-
-            if should_reset && matches!(submission, Submission::UserInput { .. }) {
-                tracing::info!(
-                    "Daily session reset triggered (reset_hour={})",
-                    reset_hour
+            if fired > 0 {
+                tracing::debug!(
+                    channel = %message.channel,
+                    user = %message.user_id,
+                    fired,
+                    "Consumed inbound user message with matching event-triggered routine(s)"
                 );
-                if let Some(ws) = self.workspace() {
-                    let _ = self
-                        .save_thread_to_workspace_before_new(session.clone(), thread_id, ws.as_ref())
-                        .await;
-                }
-                // Create new thread for this user/channel
-                let _ = self.process_new_thread(message).await;
-                // Re-resolve the thread after reset
-                let (new_session, new_thread_id) = self
-                    .session_manager
-                    .resolve_thread(
-                        &message.user_id,
-                        &message.channel,
-                        message.thread_id.as_deref(),
-                    )
-                    .await;
-                // Continue processing with the new thread
-                return self
-                    .process_user_input(
-                        message,
-                        new_session,
-                        new_thread_id,
-                        &message.content,
-                    )
-                    .await
-                    .map(|r| match r {
-                        SubmissionResult::Response { content } => Some(content),
-                        SubmissionResult::Ok { message } => message,
-                        SubmissionResult::Error { message } => Some(format!("Error: {}", message)),
-                        _ => Some(String::new()),
-                    });
+                return if single_message_repl {
+                    Ok(HandleOutcome::Shutdown)
+                } else {
+                    Ok(HandleOutcome::NoResponse)
+                };
             }
         }
+
+        // Build per-tenant execution context once; threaded through all handlers.
+        let tenant = self.tenant_ctx(&message.user_id).await;
+
+        let session_for_empty_exit = Arc::clone(&session);
 
         // Process based on submission type
         let result = match submission {
@@ -1969,7 +2169,11 @@ impl Agent {
                 // - `Error`: soft error — draining more messages after an error
                 //    would produce confusing interleaved output
                 // - `Err(_)`: hard error
-                while let Ok(SubmissionResult::Response { content: outgoing }) = &result {
+                while let Ok(SubmissionResult::Response {
+                    content: outgoing,
+                    attachments,
+                }) = &result
+                {
                     let merged = {
                         let mut sess = session.lock().await;
                         sess.threads
@@ -1999,9 +2203,13 @@ impl Agent {
                     //   identity will attribute every response to the first
                     //   message. This is acceptable for the current
                     //   single-user-per-thread model.
-                    let response =
-                        build_outgoing_response_for_thread(&session, thread_id, outgoing.clone())
-                            .await;
+                    let response = build_outgoing_response_for_thread(
+                        &session,
+                        thread_id,
+                        outgoing.clone(),
+                        attachments.clone(),
+                    )
+                    .await;
                     if let Err(e) = self.respond_then_done(message, response).await {
                         tracing::warn!(
                             thread_id = %thread_id,
@@ -2055,9 +2263,18 @@ impl Agent {
                         .handle_reasoning_command(&args, &session, thread_id)
                         .await;
                     return match result {
-                        SubmissionResult::Response { content } => {
-                            Ok(HandleOutcome::Respond(OutgoingResponse::text(content)))
-                        }
+                        SubmissionResult::Response {
+                            content,
+                            attachments,
+                        } => Ok(HandleOutcome::Respond(
+                            build_outgoing_response_for_thread(
+                                &session,
+                                thread_id,
+                                content,
+                                attachments,
+                            )
+                            .await,
+                        )),
                         SubmissionResult::Ok { message } => Ok(HandleOutcome::from_legacy(message)),
                         SubmissionResult::Error { message } => Ok(HandleOutcome::Respond(
                             OutgoingResponse::text(format!("Error: {}", message)),
@@ -2075,26 +2292,24 @@ impl Agent {
                 self.handle_system_command(&command, &args, &message.channel, &tenant)
                     .await
             }
-            Submission::Undo => self.process_undo(session, thread_id).await,
-            Submission::Redo => self.process_redo(session, thread_id).await,
-            Submission::Interrupt => self.process_interrupt(session, thread_id).await,
-            Submission::Compact => self.process_compact(session, thread_id).await,
-            Submission::Clear => self.process_clear(session, thread_id).await,
-            Submission::NewThread => {
-                if let Some(ws) = self.workspace() {
-                    if let Err(e) = self
-                        .save_thread_to_workspace_before_new(session.clone(), thread_id, ws.as_ref())
-                        .await
-                    {
-                        tracing::warn!("Failed to save thread to workspace on /new: {}", e);
-                    }
-                }
-                self.process_new_thread(message).await
+            Submission::Undo => self.process_undo(session.clone(), thread_id).await,
+            Submission::Redo => self.process_redo(session.clone(), thread_id).await,
+            Submission::Interrupt => self.process_interrupt(session.clone(), thread_id).await,
+            Submission::Compact => self.process_compact(session.clone(), thread_id).await,
+            Submission::Clear => self.process_clear(session.clone(), thread_id).await,
+            Submission::NewThread => self.process_new_thread(message).await,
+            Submission::Heartbeat => self.process_heartbeat(&message.user_id).await,
+            Submission::Summarize => self.process_summarize(session.clone(), thread_id).await,
+            Submission::Suggest => self.process_suggest(session.clone(), thread_id).await,
+            Submission::Expected { description } => {
+                self.process_expected(session.clone(), thread_id, &description, &message.user_id)
+                    .await
             }
-            Submission::Heartbeat => self.process_heartbeat().await,
-            Submission::Summarize => self.process_summarize(session, thread_id).await,
-            Submission::Suggest => self.process_suggest(session, thread_id).await,
-            Submission::Quit => return Ok(None),
+            Submission::JobStatus { job_id } => {
+                self.process_job_status(&tenant, job_id.as_deref()).await
+            }
+            Submission::JobCancel { job_id } => self.process_job_cancel(&tenant, &job_id).await,
+            Submission::Quit => return Ok(HandleOutcome::Shutdown),
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await
             }
@@ -2187,7 +2402,11 @@ impl Agent {
                         )
                         .await;
 
-                    while let Ok(SubmissionResult::Response { content: outgoing }) = &result {
+                    while let Ok(SubmissionResult::Response {
+                        content: outgoing,
+                        attachments,
+                    }) = &result
+                    {
                         let merged = {
                             let mut sess = session.lock().await;
                             sess.threads
@@ -2202,6 +2421,7 @@ impl Agent {
                             &session,
                             thread_id,
                             outgoing.clone(),
+                            attachments.clone(),
                         )
                         .await;
                         if let Err(e) = self.respond_then_done(message, response).await {
@@ -2241,7 +2461,10 @@ impl Agent {
                 // identically (#3317).
                 match crate::bridge::handle_pairing_claim(self, message, &channel, &code).await {
                     Ok(crate::bridge::BridgeOutcome::Respond(text)) => {
-                        Ok(SubmissionResult::Response { content: text })
+                        Ok(SubmissionResult::Response {
+                            content: text,
+                            attachments: Vec::new(),
+                        })
                     }
                     Ok(crate::bridge::BridgeOutcome::NoResponse)
                     | Ok(crate::bridge::BridgeOutcome::Pending) => {
@@ -2291,20 +2514,16 @@ impl Agent {
 
         // Convert SubmissionResult to a HandleOutcome.
         match result? {
-            SubmissionResult::Response { content } => {
-                // Suppress silent replies (e.g. from group chat "nothing to say" responses).
-                // Silent replies exit single-message REPL invocations.
-                if ironclaw_llm::is_silent_reply(&content) {
-                    tracing::debug!("Suppressing silent reply token");
-                    Ok(HandleOutcome::Shutdown)
-                } else if content.is_empty() {
-                    Ok(HandleOutcome::NoResponse)
-                } else {
-                    Ok(HandleOutcome::Respond(
-                        build_outgoing_response_for_thread(&session, thread_id, content).await,
-                    ))
-                }
-            }
+            SubmissionResult::Response {
+                content,
+                attachments,
+            } => Ok(submission_response_to_handle_outcome(
+                &session,
+                thread_id,
+                content,
+                attachments,
+            )
+            .await),
             SubmissionResult::Ok {
                 message: output_message,
             } => {
@@ -2346,2290 +2565,6 @@ impl Agent {
             }
         }
     }
-
-    /// Hydrate a historical thread from DB into memory if not already present.
-    ///
-    /// Called before `resolve_thread` so that the session manager finds the
-    /// thread on lookup instead of creating a new one.
-    ///
-    /// Creates an in-memory thread with the exact UUID the frontend sent,
-    /// even when the conversation has zero messages (e.g. a brand-new
-    /// assistant thread). Without this, `resolve_thread` would mint a
-    /// fresh UUID and all messages would land in the wrong conversation.
-    async fn maybe_hydrate_thread(&self, message: &IncomingMessage, external_thread_id: &str) {
-        // Only hydrate UUID-shaped thread IDs (web gateway uses UUIDs)
-        let thread_uuid = match Uuid::parse_str(external_thread_id) {
-            Ok(id) => id,
-            Err(_) => return,
-        };
-
-        // Check if already in memory
-        let session = self
-            .session_manager
-            .get_or_create_session(&message.user_id)
-            .await;
-        {
-            let sess = session.lock().await;
-            if sess.threads.contains_key(&thread_uuid) {
-                return;
-            }
-        }
-
-        // Load history from DB (may be empty for a newly created thread).
-        let mut chat_messages: Vec<ChatMessage> = Vec::new();
-        let msg_count;
-
-        if let Some(store) = self.store() {
-            let db_messages = store
-                .list_conversation_messages(thread_uuid)
-                .await
-                .unwrap_or_default();
-            msg_count = db_messages.len();
-            chat_messages = db_messages
-                .iter()
-                .filter_map(|m| match m.role.as_str() {
-                    "user" => Some(ChatMessage::user(&m.content)),
-                    "assistant" => Some(ChatMessage::assistant(&m.content)),
-                    _ => None,
-                })
-                .collect();
-        } else {
-            msg_count = 0;
-        }
-
-        // Create thread with the historical ID and restore messages
-        let session_id = {
-            let sess = session.lock().await;
-            sess.id
-        };
-
-        let mut thread = crate::agent::session::Thread::with_id(thread_uuid, session_id);
-        if !chat_messages.is_empty() {
-            thread.restore_from_messages(chat_messages);
-        }
-
-        // Restore response chain from conversation metadata
-        if let Some(store) = self.store()
-            && let Ok(Some(metadata)) = store.get_conversation_metadata(thread_uuid).await
-            && let Some(rid) = metadata
-                .get("last_response_id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        {
-            thread.last_response_id = Some(rid.clone());
-            self.llm()
-                .seed_response_chain(&thread_uuid.to_string(), rid);
-            tracing::debug!("Restored response chain for thread {}", thread_uuid);
-        }
-
-        // Insert into session and register with session manager
-        {
-            let mut sess = session.lock().await;
-            sess.threads.insert(thread_uuid, thread);
-            sess.active_thread = Some(thread_uuid);
-            sess.last_active_at = chrono::Utc::now();
-        }
-
-        self.session_manager
-            .register_thread(
-                &message.user_id,
-                &message.channel,
-                thread_uuid,
-                Arc::clone(&session),
-            )
-            .await;
-
-        tracing::debug!(
-            "Hydrated thread {} from DB ({} messages)",
-            thread_uuid,
-            msg_count
-        );
-    }
-
-    async fn process_user_input(
-        &self,
-        message: &IncomingMessage,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-        content: &str,
-    ) -> Result<SubmissionResult, Error> {
-        // First check thread state without holding lock during I/O
-        let thread_state = {
-            let sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.state
-        };
-
-        // Check thread state
-        match thread_state {
-            ThreadState::Processing => {
-                return Ok(SubmissionResult::error(
-                    "Turn in progress. Use /interrupt to cancel.",
-                ));
-            }
-            ThreadState::AwaitingApproval => {
-                return Ok(SubmissionResult::error(
-                    "Waiting for approval. Use /interrupt to cancel.",
-                ));
-            }
-            ThreadState::Completed => {
-                return Ok(SubmissionResult::error(
-                    "Thread completed. Use /thread new.",
-                ));
-            }
-            ThreadState::Idle | ThreadState::Interrupted => {
-                // Can proceed
-            }
-        }
-
-        // Safety validation for user input
-        let validation = self.safety().validate_input(content);
-        if !validation.is_valid {
-            let details = validation
-                .errors
-                .iter()
-                .map(|e| format!("{}: {}", e.field, e.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Ok(SubmissionResult::error(format!(
-                "Input rejected by safety validation: {}",
-                details
-            )));
-        }
-
-        let violations = self.safety().check_policy(content);
-        if violations
-            .iter()
-            .any(|rule| rule.action == crate::safety::PolicyAction::Block)
-        {
-            return Ok(SubmissionResult::error("Input rejected by safety policy."));
-        }
-
-        // Handle explicit commands (starting with /) directly
-        // Everything else goes through the normal agentic loop with tools
-        let temp_message = IncomingMessage {
-            content: content.to_string(),
-            ..message.clone()
-        };
-
-        if let Some(intent) = self.router.route_command(&temp_message) {
-            // Explicit command like /status, /job, /list - handle directly
-            return self.handle_job_or_command(intent, message).await;
-        }
-
-        // Natural language goes through the agentic loop
-        // Job tools (create_job, list_jobs, etc.) are in the tool registry
-
-        // Auto-compact if needed BEFORE adding new turn
-        {
-            let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-            let messages = thread.messages();
-            if let Some(strategy) = self.context_monitor.suggest_compaction(&messages) {
-                let pct = self.context_monitor.usage_percent(&messages);
-                tracing::info!("Context at {:.1}% capacity, auto-compacting", pct);
-
-                // Pre-compaction memory flush: one silent turn to remind model to write durable memory
-                let compaction_count = thread
-                    .metadata
-                    .get("compaction_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0)
-                    + 1;
-                let last_flush = thread
-                    .metadata
-                    .get("memory_flush_compaction_count")
-                    .and_then(|v| v.as_u64());
-                let run_flush = self
-                    .config
-                    .memory_flush
-                    .as_ref()
-                    .map(|m| m.enabled)
-                    .unwrap_or(false)
-                    && self.workspace().is_some()
-                    && last_flush != Some(compaction_count);
-
-                if run_flush {
-                    ensure_metadata_object(thread);
-                    thread
-                        .metadata
-                        .as_object_mut()
-                        .unwrap()
-                        .insert(
-                            "memory_flush_compaction_count".to_string(),
-                            serde_json::json!(compaction_count),
-                        );
-                    let flush_cfg = self.config.memory_flush.clone().unwrap();
-                    drop(sess);
-                    if let Err(e) = self
-                        .run_memory_flush_turn(&flush_cfg, message.user_id.as_str())
-                        .await
-                    {
-                        tracing::warn!("Pre-compaction memory flush failed: {}", e);
-                    }
-                    sess = session.lock().await;
-                }
-
-                let thread = sess
-                    .threads
-                    .get_mut(&thread_id)
-                    .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-                ensure_metadata_object(thread);
-                thread
-                    .metadata
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("compaction_count".to_string(), serde_json::json!(compaction_count));
-
-                // Notify the user that compaction is happening
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::Status(format!(
-                            "Context at {:.0}% capacity, compacting...",
-                            pct
-                        )),
-                        &message.metadata,
-                    )
-                    .await;
-
-                let compactor = ContextCompactor::new(self.llm().clone());
-                if let Err(e) = compactor
-                    .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
-                    .await
-                {
-                    tracing::warn!("Auto-compaction failed: {}", e);
-                }
-            }
-        }
-
-        // Create checkpoint before turn
-        let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
-        {
-            let sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-            let mut mgr = undo_mgr.lock().await;
-            mgr.checkpoint(
-                thread.turn_number(),
-                thread.messages(),
-                format!("Before turn {}", thread.turn_number()),
-            );
-        }
-
-        // Start the turn and get messages
-        let turn_messages = {
-            let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.start_turn(content);
-            thread.messages()
-        };
-
-        // Send thinking status
-        let _ = self
-            .channels
-            .send_status(
-                &message.channel,
-                StatusUpdate::Thinking("Processing...".into()),
-                &message.metadata,
-            )
-            .await;
-
-        // Run the agentic tool execution loop
-        let result = self
-            .run_agentic_loop(message, session.clone(), thread_id, turn_messages, false)
-            .await;
-
-        // Re-acquire lock and check if interrupted
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-        if thread.state == ThreadState::Interrupted {
-            let _ = self
-                .channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::Status("Interrupted".into()),
-                    &message.metadata,
-                )
-                .await;
-            return Ok(SubmissionResult::Interrupted);
-        }
-
-        // Complete, fail, or request approval
-        match result {
-            Ok(AgenticLoopResult::Response(response)) => {
-                thread.complete_turn(&response);
-                self.persist_response_chain(thread);
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::Status("Done".into()),
-                        &message.metadata,
-                    )
-                    .await;
-
-                // Fire-and-forget: persist turn to DB
-                self.persist_turn(thread_id, &message.user_id, content, Some(&response));
-
-                Ok(SubmissionResult::response(response))
-            }
-            Ok(AgenticLoopResult::NeedApproval { pending }) => {
-                // Store pending approval in thread and update state
-                let request_id = pending.request_id;
-                let tool_name = pending.tool_name.clone();
-                let description = pending.description.clone();
-                let parameters = pending.parameters.clone();
-                thread.await_approval(pending);
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::Status("Awaiting approval".into()),
-                        &message.metadata,
-                    )
-                    .await;
-                Ok(SubmissionResult::NeedApproval {
-                    request_id,
-                    tool_name,
-                    description,
-                    parameters,
-                })
-            }
-            Err(e) => {
-                thread.fail_turn(e.to_string());
-
-                // Persist the user message even on failure
-                self.persist_turn(thread_id, &message.user_id, content, None);
-
-                Ok(SubmissionResult::error(e.to_string()))
-            }
-        }
-    }
-
-    /// Fire-and-forget: persist a turn (user message + optional assistant response) to the DB.
-    fn persist_turn(
-        &self,
-        thread_id: Uuid,
-        user_id: &str,
-        user_input: &str,
-        response: Option<&str>,
-    ) {
-        let store = match self.store() {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
-
-        let user_id = user_id.to_string();
-        let user_input = user_input.to_string();
-        let response = response.map(String::from);
-
-        tokio::spawn(async move {
-            if let Err(e) = store
-                .ensure_conversation(thread_id, "gateway", &user_id, None)
-                .await
-            {
-                tracing::warn!("Failed to ensure conversation {}: {}", thread_id, e);
-                return;
-            }
-
-            if let Err(e) = store
-                .add_conversation_message(thread_id, "user", &user_input)
-                .await
-            {
-                tracing::warn!("Failed to persist user message: {}", e);
-                return;
-            }
-
-            if let Some(ref resp) = response
-                && let Err(e) = store
-                    .add_conversation_message(thread_id, "assistant", resp)
-                    .await
-            {
-                tracing::warn!("Failed to persist assistant message: {}", e);
-            }
-        });
-    }
-
-    /// Sync the provider's response chain ID to the thread and DB metadata.
-    ///
-    /// Call after a successful agentic loop to persist the latest
-    /// `previous_response_id` so chaining survives restarts.
-    fn persist_response_chain(&self, thread: &mut crate::agent::session::Thread) {
-        let tid = thread.id.to_string();
-        let response_id = match self.llm().get_response_chain_id(&tid) {
-            Some(rid) => rid,
-            None => return,
-        };
-
-        // Update in-memory thread
-        thread.last_response_id = Some(response_id.clone());
-
-        // Fire-and-forget DB write
-        let store = match self.store() {
-            Some(s) => Arc::clone(s),
-            None => return,
-        };
-        let thread_id = thread.id;
-        tokio::spawn(async move {
-            let val = serde_json::json!(response_id);
-            if let Err(e) = store
-                .update_conversation_metadata_field(thread_id, "last_response_id", &val)
-                .await
-            {
-                tracing::warn!(
-                    "Failed to persist response chain for thread {}: {}",
-                    thread_id,
-                    e
-                );
-            }
-        });
-    }
-
-    /// Run the agentic loop: call LLM, execute tools, repeat until text response.
-    ///
-    /// Returns `AgenticLoopResult::Response` on completion, or
-    /// `AgenticLoopResult::NeedApproval` if a tool requires user approval.
-    ///
-    /// When `resume_after_tool` is true the loop already knows a tool was
-    /// executed earlier in this turn (e.g. an approved tool), so it won't
-    /// force the LLM to use tools if it responds with text.
-    async fn run_agentic_loop(
-        &self,
-        message: &IncomingMessage,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-        initial_messages: Vec<ChatMessage>,
-        resume_after_tool: bool,
-    ) -> Result<AgenticLoopResult, Error> {
-        // Load workspace system prompt (identity files + optional MEMORY.md in main session)
-        let system_prompt = if let Some(ws) = self.workspace() {
-            let include_memory = is_main_session(&message.channel);
-            let logseq_context = self
-                .config
-                .logseq
-                .as_ref()
-                .map(|c| crate::workspace::load_logseq_context(c, &self.config.name))
-                .unwrap_or_default();
-            let logseq_opt = if logseq_context.is_empty() {
-                None
-            } else {
-                Some(logseq_context.as_str())
-            };
-
-            // Load active learnings for main sessions
-            let learnings_context = if include_memory {
-                if let Some(ref repo) = self.deps.learning_repo {
-                    repo.format_for_prompt(&message.user_id, &self.config.agent_id, 15)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-            let learnings_opt = if learnings_context.is_empty() {
-                None
-            } else {
-                Some(learnings_context.as_str())
-            };
-
-            match ws
-                .system_prompt_with_learnings(include_memory, logseq_opt, learnings_opt)
-                .await
-            {
-                Ok(prompt) if !prompt.is_empty() => Some(prompt),
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::debug!("Could not load workspace system prompt: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Build skills prompt (progressive disclosure — only name + description in system prompt)
-        let skills_prompt = {
-            let load_opts = self.config.skills.to_load_options(None);
-            let snapshot = crate::skills::build_skill_snapshot(&load_opts);
-            if !snapshot.skills.is_empty() {
-                tracing::debug!(
-                    "Loaded {} skills: {}",
-                    snapshot.skills.len(),
-                    snapshot
-                        .skills
-                        .iter()
-                        .map(|s| s.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            if snapshot.prompt.is_empty() {
-                None
-            } else {
-                Some(snapshot.prompt)
-            }
-        };
-
-        // Combine workspace system prompt + skills prompt
-        let system_prompt = match (system_prompt, skills_prompt) {
-            (Some(ws), Some(sk)) => Some(format!("{}\n\n{}", ws, sk)),
-            (Some(ws), None) => Some(ws),
-            (None, Some(sk)) => Some(sk),
-            (None, None) => None,
-        };
-
-        let mut reasoning = Reasoning::new(self.llm().clone(), self.safety().clone());
-        if let Some(prompt) = system_prompt {
-            reasoning = reasoning.with_system_prompt(prompt);
-        }
-
-        // Build context with messages that we'll mutate during the loop
-        let mut context_messages = initial_messages;
-
-        // Create a JobContext for tool execution (chat doesn't have a real job)
-        let job_ctx = JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
-
-        const MAX_TOOL_ITERATIONS: usize = 10;
-        let mut iteration = 0;
-        let mut tools_executed = resume_after_tool;
-
-        loop {
-            iteration += 1;
-            if iteration > MAX_TOOL_ITERATIONS {
-                return Err(crate::error::LlmError::InvalidResponse {
-                    provider: "agent".to_string(),
-                    reason: format!("Exceeded maximum tool iterations ({})", MAX_TOOL_ITERATIONS),
-                }
-                .into());
-            }
-
-            // Check if interrupted
-            {
-                let sess = session.lock().await;
-                if let Some(thread) = sess.threads.get(&thread_id)
-                    && thread.state == ThreadState::Interrupted
-                {
-                    return Err(crate::error::JobError::ContextError {
-                        id: thread_id,
-                        reason: "Interrupted".to_string(),
-                    }
-                    .into());
-                }
-            }
-
-            // Refresh tool definitions each iteration so newly built tools become visible
-            let tool_defs = self.tools().tool_definitions().await;
-
-            // Call LLM with current context
-            let context = ReasoningContext::new()
-                .with_messages(context_messages.clone())
-                .with_tools(tool_defs)
-                .with_metadata({
-                    let mut m = std::collections::HashMap::new();
-                    m.insert("thread_id".to_string(), thread_id.to_string());
-                    m
-                });
-
-            let output = reasoning.respond_with_tools(&context).await?;
-
-            // Track token usage for budget enforcement
-            tracing::debug!(
-                "LLM call used {} input + {} output tokens",
-                output.usage.input_tokens,
-                output.usage.output_tokens
-            );
-
-            match output.result {
-                RespondResult::Text(text) => {
-                    // If no tools have been executed yet, prompt the LLM to use tools
-                    // This handles the case where the model explains what it will do
-                    // instead of actually calling tools
-                    if !tools_executed && iteration < 3 {
-                        tracing::debug!(
-                            "No tools executed yet (iteration {}), prompting for tool use",
-                            iteration
-                        );
-                        context_messages.push(ChatMessage::assistant(&text));
-                        context_messages.push(ChatMessage::user(
-                            "Please proceed and use the available tools to complete this task.",
-                        ));
-                        continue;
-                    }
-
-                    // Tools have been executed or we've tried multiple times, return response
-                    return Ok(AgenticLoopResult::Response(text));
-                }
-                RespondResult::ToolCalls {
-                    tool_calls,
-                    content,
-                } => {
-                    tools_executed = true;
-
-                    // Add the assistant message with tool_calls to context.
-                    // OpenAI protocol requires this before tool-result messages.
-                    context_messages.push(ChatMessage::assistant_with_tool_calls(
-                        content,
-                        tool_calls.clone(),
-                    ));
-
-                    // Execute tools and add results to context
-                    let _ = self
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::Thinking(format!(
-                                "Executing {} tool(s)...",
-                                tool_calls.len()
-                            )),
-                            &message.metadata,
-                        )
-                        .await;
-
-                    // Record tool calls in the thread
-                    {
-                        let mut sess = session.lock().await;
-                        if let Some(thread) = sess.threads.get_mut(&thread_id)
-                            && let Some(turn) = thread.last_turn_mut()
-                        {
-                            for tc in &tool_calls {
-                                turn.record_tool_call(&tc.name, tc.arguments.clone());
-                            }
-                        }
-                    }
-
-                    // Execute each tool (with approval checking)
-                    for tc in tool_calls {
-                        // Check if tool requires approval
-                        if let Some(tool) = self.tools().get(&tc.name).await
-                            && tool.requires_approval()
-                        {
-                            // Check if auto-approved for this session
-                            let mut is_auto_approved = {
-                                let sess = session.lock().await;
-                                sess.is_tool_auto_approved(&tc.name)
-                            };
-
-                            // For shell commands, override auto-approval for
-                            // destructive patterns that should always require
-                            // explicit per-invocation approval.
-                            if is_auto_approved
-                                && tc.name == "shell"
-                                && let Some(cmd) = tc
-                                    .arguments
-                                    .get("command")
-                                    .and_then(|c| c.as_str().map(String::from))
-                                    .or_else(|| {
-                                        tc.arguments
-                                            .as_str()
-                                            .and_then(|s| {
-                                                serde_json::from_str::<serde_json::Value>(s).ok()
-                                            })
-                                            .and_then(|v| {
-                                                v.get("command")
-                                                    .and_then(|c| c.as_str().map(String::from))
-                                            })
-                                    })
-                                && crate::tools::builtin::shell::requires_explicit_approval(&cmd)
-                            {
-                                tracing::info!(
-                                    "Shell command '{}' requires explicit approval despite auto-approve",
-                                    cmd.chars().take(80).collect::<String>()
-                                );
-                                is_auto_approved = false;
-                            }
-
-                            if !is_auto_approved {
-                                // Need approval - store pending request and return
-                                let pending = PendingApproval {
-                                    request_id: Uuid::new_v4(),
-                                    tool_name: tc.name.clone(),
-                                    parameters: tc.arguments.clone(),
-                                    description: tool.description().to_string(),
-                                    tool_call_id: tc.id.clone(),
-                                    context_messages: context_messages.clone(),
-                                };
-
-                                return Ok(AgenticLoopResult::NeedApproval { pending });
-                            }
-                        }
-
-                        let _ = self
-                            .channels
-                            .send_status(
-                                &message.channel,
-                                StatusUpdate::ToolStarted {
-                                    name: tc.name.clone(),
-                                },
-                                &message.metadata,
-                            )
-                            .await;
-
-                        let tool_result = self
-                            .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
-                            .await;
-
-                        let _ = self
-                            .channels
-                            .send_status(
-                                &message.channel,
-                                StatusUpdate::ToolCompleted {
-                                    name: tc.name.clone(),
-                                    success: tool_result.is_ok(),
-                                },
-                                &message.metadata,
-                            )
-                            .await;
-
-                        if let Ok(ref output) = tool_result
-                            && !output.is_empty()
-                        {
-                            let _ = self
-                                .channels
-                                .send_status(
-                                    &message.channel,
-                                    StatusUpdate::ToolResult {
-                                        name: tc.name.clone(),
-                                        preview: output.clone(),
-                                    },
-                                    &message.metadata,
-                                )
-                                .await;
-                        }
-
-                        // Record result in thread
-                        {
-                            let mut sess = session.lock().await;
-                            if let Some(thread) = sess.threads.get_mut(&thread_id)
-                                && let Some(turn) = thread.last_turn_mut()
-                            {
-                                match &tool_result {
-                                    Ok(output) => {
-                                        turn.record_tool_result(serde_json::json!(output));
-                                    }
-                                    Err(e) => {
-                                        turn.record_tool_error(e.to_string());
-                                    }
-                                }
-                            }
-                        }
-
-                        // If tool_auth returned awaiting_token, enter auth mode
-                        // and short-circuit: return the instructions directly so
-                        // the LLM doesn't get a chance to hallucinate tool calls.
-                        if let Some((ext_name, instructions)) =
-                            detect_auth_awaiting(&tc.name, &tool_result)
-                        {
-                            let auth_data = parse_auth_result(&tool_result);
-                            {
-                                let mut sess = session.lock().await;
-                                if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                                    thread.enter_auth_mode(ext_name.clone());
-                                }
-                            }
-                            let _ = self
-                                .channels
-                                .send_status(
-                                    &message.channel,
-                                    StatusUpdate::AuthRequired {
-                                        extension_name: ext_name,
-                                        instructions: Some(instructions.clone()),
-                                        auth_url: auth_data.auth_url,
-                                        setup_url: auth_data.setup_url,
-                                    },
-                                    &message.metadata,
-                                )
-                                .await;
-                            return Ok(AgenticLoopResult::Response(instructions));
-                        }
-
-                        // Add tool result to context for next LLM call
-                        let result_content = match tool_result {
-                            Ok(output) => {
-                                // Sanitize output before showing to LLM
-                                let sanitized =
-                                    self.safety().sanitize_tool_output(&tc.name, &output);
-                                self.safety().wrap_for_llm(
-                                    &tc.name,
-                                    &sanitized.content,
-                                    sanitized.was_modified,
-                                )
-                            }
-                            Err(e) => format!("Error: {}", e),
-                        };
-
-                        context_messages.push(ChatMessage::tool_result(
-                            &tc.id,
-                            &tc.name,
-                            result_content,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Execute a tool for chat (without full job context).
-    async fn execute_chat_tool(
-        &self,
-        tool_name: &str,
-        params: &serde_json::Value,
-        job_ctx: &JobContext,
-    ) -> Result<String, Error> {
-        let tool =
-            self.tools()
-                .get(tool_name)
-                .await
-                .ok_or_else(|| crate::error::ToolError::NotFound {
-                    name: tool_name.to_string(),
-                })?;
-
-        // Validate tool parameters
-        let validation = self.safety().validator().validate_tool_params(params);
-        if !validation.is_valid {
-            let details = validation
-                .errors
-                .iter()
-                .map(|e| format!("{}: {}", e.field, e.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(crate::error::ToolError::InvalidParameters {
-                name: tool_name.to_string(),
-                reason: format!("Invalid tool parameters: {}", details),
-            }
-            .into());
-        }
-
-        tracing::debug!(
-            tool = %tool_name,
-            params = %params,
-            "Tool call started"
-        );
-
-        // Execute with per-tool timeout
-        let timeout = tool.execution_timeout();
-        let start = std::time::Instant::now();
-        let result = tokio::time::timeout(timeout, async {
-            tool.execute(params.clone(), job_ctx).await
-        })
-        .await;
-        let elapsed = start.elapsed();
-
-        match &result {
-            Ok(Ok(output)) => {
-                let result_str = serde_json::to_string(&output.result)
-                    .unwrap_or_else(|_| "<serialize error>".to_string());
-                tracing::debug!(
-                    tool = %tool_name,
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    result = %result_str,
-                    "Tool call succeeded"
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::debug!(
-                    tool = %tool_name,
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    error = %e,
-                    "Tool call failed"
-                );
-            }
-            Err(_) => {
-                tracing::debug!(
-                    tool = %tool_name,
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    timeout_secs = timeout.as_secs(),
-                    "Tool call timed out"
-                );
-            }
-        }
-
-        let result = result
-            .map_err(|_| crate::error::ToolError::Timeout {
-                name: tool_name.to_string(),
-                timeout,
-            })?
-            .map_err(|e| crate::error::ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                reason: e.to_string(),
-            })?;
-
-        // Convert result to string
-        serde_json::to_string_pretty(&result.result).map_err(|e| {
-            crate::error::ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                reason: format!("Failed to serialize result: {}", e),
-            }
-            .into()
-        })
-    }
-
-    /// Handle job-related intents without turn tracking.
-    async fn handle_job_or_command(
-        &self,
-        intent: MessageIntent,
-        message: &IncomingMessage,
-    ) -> Result<SubmissionResult, Error> {
-        // Send thinking status for non-trivial operations
-        if let MessageIntent::CreateJob { .. } = &intent {
-            let _ = self
-                .channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::Thinking("Processing...".into()),
-                    &message.metadata,
-                )
-                .await;
-        }
-
-        let response = match intent {
-            MessageIntent::CreateJob {
-                title,
-                description,
-                category,
-            } => {
-                self.handle_create_job(&message.user_id, title, description, category)
-                    .await?
-            }
-            MessageIntent::CheckJobStatus { job_id } => {
-                self.handle_check_status(&message.user_id, job_id).await?
-            }
-            MessageIntent::CancelJob { job_id } => {
-                self.handle_cancel_job(&message.user_id, &job_id).await?
-            }
-            MessageIntent::ListJobs { filter } => {
-                self.handle_list_jobs(&message.user_id, filter).await?
-            }
-            MessageIntent::HelpJob { job_id } => {
-                self.handle_help_job(&message.user_id, &job_id).await?
-            }
-            MessageIntent::Command { command, args } => {
-                match self.handle_command(&command, &args).await? {
-                    Some(s) => s,
-                    None => return Ok(SubmissionResult::Ok { message: None }), // Shutdown signal
-                }
-            }
-            _ => "Unknown intent".to_string(),
-        };
-        Ok(SubmissionResult::response(response))
-    }
-
-    async fn process_undo(
-        &self,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-    ) -> Result<SubmissionResult, Error> {
-        let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
-        let mut mgr = undo_mgr.lock().await;
-
-        if !mgr.can_undo() {
-            return Ok(SubmissionResult::ok_with_message("Nothing to undo."));
-        }
-
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-        // Save current state to redo, get previous checkpoint
-        let current_messages = thread.messages();
-        let current_turn = thread.turn_number();
-
-        if let Some(checkpoint) = mgr.undo(current_turn, current_messages) {
-            // Extract values before consuming the reference
-            let turn_number = checkpoint.turn_number;
-            let messages = checkpoint.messages.clone();
-            let undo_count = mgr.undo_count();
-            // Restore thread from checkpoint
-            thread.restore_from_messages(messages);
-            Ok(SubmissionResult::ok_with_message(format!(
-                "Undone to turn {}. {} undo(s) remaining.",
-                turn_number, undo_count
-            )))
-        } else {
-            Ok(SubmissionResult::error("Undo failed."))
-        }
-    }
-
-    async fn process_redo(
-        &self,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-    ) -> Result<SubmissionResult, Error> {
-        let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
-        let mut mgr = undo_mgr.lock().await;
-
-        if !mgr.can_redo() {
-            return Ok(SubmissionResult::ok_with_message("Nothing to redo."));
-        }
-
-        // Capture current state before redo so redo() can save it to undo stack
-        let (current_turn, current_messages) = {
-            let sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            (thread.turn_number(), thread.messages().to_vec())
-        };
-
-        if let Some(checkpoint) = mgr.redo(current_turn, current_messages) {
-            let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.restore_from_messages(checkpoint.messages);
-            Ok(SubmissionResult::ok_with_message(format!(
-                "Redone to turn {}.",
-                checkpoint.turn_number
-            )))
-        } else {
-            Ok(SubmissionResult::error("Redo failed."))
-        }
-    }
-
-    async fn process_interrupt(
-        &self,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-    ) -> Result<SubmissionResult, Error> {
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-        match thread.state {
-            ThreadState::Processing | ThreadState::AwaitingApproval => {
-                thread.interrupt();
-                Ok(SubmissionResult::ok_with_message("Interrupted."))
-            }
-            _ => Ok(SubmissionResult::ok_with_message("Nothing to interrupt.")),
-        }
-    }
-
-    async fn process_compact(
-        &self,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-    ) -> Result<SubmissionResult, Error> {
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-        let messages = thread.messages();
-        let usage = self.context_monitor.usage_percent(&messages);
-        let strategy = self
-            .context_monitor
-            .suggest_compaction(&messages)
-            .unwrap_or(
-                crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
-            );
-
-        let compactor = ContextCompactor::new(self.llm().clone());
-        match compactor
-            .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
-            .await
-        {
-            Ok(result) => {
-                let mut msg = format!(
-                    "Compacted: {} turns removed, {} → {} tokens (was {:.1}% full)",
-                    result.turns_removed, result.tokens_before, result.tokens_after, usage
-                );
-                if result.summary_written {
-                    msg.push_str(", summary saved to workspace");
-                }
-                Ok(SubmissionResult::ok_with_message(msg))
-            }
-            Err(e) => Ok(SubmissionResult::error(format!("Compaction failed: {}", e))),
-        }
-    }
-
-    async fn process_clear(
-        &self,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-    ) -> Result<SubmissionResult, Error> {
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-        thread.turns.clear();
-        thread.state = ThreadState::Idle;
-
-        // Clear undo history too
-        let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
-        undo_mgr.lock().await.clear();
-
-        Ok(SubmissionResult::ok_with_message("Thread cleared."))
-    }
-
-    /// Process an approval or rejection of a pending tool execution.
-    async fn process_approval(
-        &self,
-        message: &IncomingMessage,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-        request_id: Option<Uuid>,
-        approved: bool,
-        always: bool,
-    ) -> Result<SubmissionResult, Error> {
-        // Get thread state and pending approval
-        let (_thread_state, pending) = {
-            let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-            if thread.state != ThreadState::AwaitingApproval {
-                return Ok(SubmissionResult::error("No pending approval request."));
-            }
-
-            let pending = thread.take_pending_approval();
-            (thread.state, pending)
-        };
-
-        let pending = match pending {
-            Some(p) => p,
-            None => return Ok(SubmissionResult::error("No pending approval request.")),
-        };
-
-        // Verify request ID if provided
-        if let Some(req_id) = request_id
-            && req_id != pending.request_id
-        {
-            // Put it back and return error
-            let mut sess = session.lock().await;
-            if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                thread.await_approval(pending);
-            }
-            return Ok(SubmissionResult::error(
-                "Request ID mismatch. Use the correct request ID.",
-            ));
-        }
-
-        if approved {
-            // If always, add to auto-approved set
-            if always {
-                let mut sess = session.lock().await;
-                sess.auto_approve_tool(&pending.tool_name);
-                tracing::info!(
-                    "Auto-approved tool '{}' for session {}",
-                    pending.tool_name,
-                    sess.id
-                );
-            }
-
-            // Reset thread state to processing
-            {
-                let mut sess = session.lock().await;
-                if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                    thread.state = ThreadState::Processing;
-                }
-            }
-
-            // Execute the approved tool and continue the loop
-            let job_ctx =
-                JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
-
-            let _ = self
-                .channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::ToolStarted {
-                        name: pending.tool_name.clone(),
-                    },
-                    &message.metadata,
-                )
-                .await;
-
-            let tool_result = self
-                .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
-                .await;
-
-            let _ = self
-                .channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::ToolCompleted {
-                        name: pending.tool_name.clone(),
-                        success: tool_result.is_ok(),
-                    },
-                    &message.metadata,
-                )
-                .await;
-
-            if let Ok(ref output) = tool_result
-                && !output.is_empty()
-            {
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::ToolResult {
-                            name: pending.tool_name.clone(),
-                            preview: output.clone(),
-                        },
-                        &message.metadata,
-                    )
-                    .await;
-            }
-
-            // Build context including the tool result
-            let mut context_messages = pending.context_messages;
-
-            // Record result in thread
-            {
-                let mut sess = session.lock().await;
-                if let Some(thread) = sess.threads.get_mut(&thread_id)
-                    && let Some(turn) = thread.last_turn_mut()
-                {
-                    match &tool_result {
-                        Ok(output) => {
-                            turn.record_tool_result(serde_json::json!(output));
-                        }
-                        Err(e) => {
-                            turn.record_tool_error(e.to_string());
-                        }
-                    }
-                }
-            }
-
-            // If tool_auth returned awaiting_token, enter auth mode and
-            // return instructions directly (skip agentic loop continuation).
-            if let Some((ext_name, instructions)) =
-                detect_auth_awaiting(&pending.tool_name, &tool_result)
-            {
-                let auth_data = parse_auth_result(&tool_result);
-                {
-                    let mut sess = session.lock().await;
-                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                        thread.enter_auth_mode(ext_name.clone());
-                        thread.complete_turn(&instructions);
-                    }
-                }
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::AuthRequired {
-                            extension_name: ext_name,
-                            instructions: Some(instructions.clone()),
-                            auth_url: auth_data.auth_url,
-                            setup_url: auth_data.setup_url,
-                        },
-                        &message.metadata,
-                    )
-                    .await;
-                return Ok(SubmissionResult::response(instructions));
-            }
-
-            // Add tool result to context
-            let result_content = match tool_result {
-                Ok(output) => {
-                    let sanitized = self
-                        .safety()
-                        .sanitize_tool_output(&pending.tool_name, &output);
-                    self.safety().wrap_for_llm(
-                        &pending.tool_name,
-                        &sanitized.content,
-                        sanitized.was_modified,
-                    )
-                }
-                Err(e) => format!("Error: {}", e),
-            };
-
-            context_messages.push(ChatMessage::tool_result(
-                &pending.tool_call_id,
-                &pending.tool_name,
-                result_content,
-            ));
-
-            // Continue the agentic loop (a tool was already executed this turn)
-            let result = self
-                .run_agentic_loop(message, session.clone(), thread_id, context_messages, true)
-                .await;
-
-            // Handle the result
-            let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-            match result {
-                Ok(AgenticLoopResult::Response(response)) => {
-                    thread.complete_turn(&response);
-                    self.persist_response_chain(thread);
-                    let _ = self
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::Status("Done".into()),
-                            &message.metadata,
-                        )
-                        .await;
-                    Ok(SubmissionResult::response(response))
-                }
-                Ok(AgenticLoopResult::NeedApproval {
-                    pending: new_pending,
-                }) => {
-                    let request_id = new_pending.request_id;
-                    let tool_name = new_pending.tool_name.clone();
-                    let description = new_pending.description.clone();
-                    let parameters = new_pending.parameters.clone();
-                    thread.await_approval(new_pending);
-                    let _ = self
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::Status("Awaiting approval".into()),
-                            &message.metadata,
-                        )
-                        .await;
-                    Ok(SubmissionResult::NeedApproval {
-                        request_id,
-                        tool_name,
-                        description,
-                        parameters,
-                    })
-                }
-                Err(e) => {
-                    thread.fail_turn(e.to_string());
-                    Ok(SubmissionResult::error(e.to_string()))
-                }
-            }
-        } else {
-            // Rejected - clear approval and return to idle
-            {
-                let mut sess = session.lock().await;
-                if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                    thread.clear_pending_approval();
-                }
-            }
-
-            let _ = self
-                .channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::Status("Rejected".into()),
-                    &message.metadata,
-                )
-                .await;
-
-            Ok(SubmissionResult::response(format!(
-                "Tool '{}' was rejected. The agent will not execute this tool.\n\n\
-                 You can continue the conversation or try a different approach.",
-                pending.tool_name
-            )))
-        }
-    }
-
-    /// Handle an auth token submitted while the thread is in auth mode.
-    ///
-    /// The token goes directly to the extension manager's credential store,
-    /// completely bypassing logging, turn creation, history, and compaction.
-    async fn process_auth_token(
-        &self,
-        message: &IncomingMessage,
-        pending: &crate::agent::session::PendingAuth,
-        token: &str,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-    ) -> Result<Option<String>, Error> {
-        let token = token.trim();
-
-        // Clear auth mode regardless of outcome
-        {
-            let mut sess = session.lock().await;
-            if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                thread.pending_auth = None;
-            }
-        }
-
-        let ext_mgr = match self.deps.extension_manager.as_ref() {
-            Some(mgr) => mgr,
-            None => return Ok(Some("Extension manager not available.".to_string())),
-        };
-
-        match ext_mgr.auth(&pending.extension_name, Some(token)).await {
-            Ok(result) if result.status == "authenticated" => {
-                tracing::info!(
-                    "Extension '{}' authenticated via auth mode",
-                    pending.extension_name
-                );
-
-                // Auto-activate so tools are available immediately after auth
-                match ext_mgr.activate(&pending.extension_name).await {
-                    Ok(activate_result) => {
-                        let tool_count = activate_result.tools_loaded.len();
-                        let tool_list = if activate_result.tools_loaded.is_empty() {
-                            String::new()
-                        } else {
-                            format!("\n\nTools: {}", activate_result.tools_loaded.join(", "))
-                        };
-                        let msg = format!(
-                            "{} authenticated and activated ({} tools loaded).{}",
-                            pending.extension_name, tool_count, tool_list
-                        );
-                        let _ = self
-                            .channels
-                            .send_status(
-                                &message.channel,
-                                StatusUpdate::AuthCompleted {
-                                    extension_name: pending.extension_name.clone(),
-                                    success: true,
-                                    message: msg.clone(),
-                                },
-                                &message.metadata,
-                            )
-                            .await;
-                        Ok(Some(msg))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Extension '{}' authenticated but activation failed: {}",
-                            pending.extension_name,
-                            e
-                        );
-                        let msg = format!(
-                            "{} authenticated successfully, but activation failed: {}. \
-                             Try activating manually.",
-                            pending.extension_name, e
-                        );
-                        let _ = self
-                            .channels
-                            .send_status(
-                                &message.channel,
-                                StatusUpdate::AuthCompleted {
-                                    extension_name: pending.extension_name.clone(),
-                                    success: true,
-                                    message: msg.clone(),
-                                },
-                                &message.metadata,
-                            )
-                            .await;
-                        Ok(Some(msg))
-                    }
-                }
-            }
-            Ok(result) => {
-                // Invalid token, re-enter auth mode
-                {
-                    let mut sess = session.lock().await;
-                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                        thread.enter_auth_mode(pending.extension_name.clone());
-                    }
-                }
-                let msg = result
-                    .instructions
-                    .clone()
-                    .unwrap_or_else(|| "Invalid token. Please try again.".to_string());
-                // Re-emit AuthRequired so web UI re-shows the card
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::AuthRequired {
-                            extension_name: pending.extension_name.clone(),
-                            instructions: Some(msg.clone()),
-                            auth_url: result.auth_url,
-                            setup_url: result.setup_url,
-                        },
-                        &message.metadata,
-                    )
-                    .await;
-                Ok(Some(msg))
-            }
-            Err(e) => {
-                let msg = format!(
-                    "Authentication failed for {}: {}",
-                    pending.extension_name, e
-                );
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::AuthCompleted {
-                            extension_name: pending.extension_name.clone(),
-                            success: false,
-                            message: msg.clone(),
-                        },
-                        &message.metadata,
-                    )
-                    .await;
-                Ok(Some(msg))
-            }
-        }
-    }
-
-    /// Run one silent LLM turn to remind the model to write durable memory (pre-compaction).
-    /// Maximum iterations for memory flush tool calls (prevents runaway).
-    const MEMORY_FLUSH_MAX_ITERATIONS: usize = 3;
-
-    async fn run_memory_flush_turn(
-        &self,
-        flush_cfg: &MemoryFlushConfig,
-        user_id: &str,
-    ) -> Result<(), Error> {
-        // Memory tools available during flush (no shell, no file, no HTTP).
-        let tool_defs = self
-            .tools()
-            .tool_definitions_for(&[
-                "memory_write",
-                "memory_read",
-                "memory_search",
-                "memory_append",
-            ])
-            .await;
-
-        let reasoning = Reasoning::new(self.llm().clone(), self.safety().clone())
-            .with_system_prompt(flush_cfg.system_prompt.clone());
-        let mut messages = vec![ChatMessage::user(&flush_cfg.prompt)];
-        let job_ctx = JobContext::with_user(user_id, "memory_flush", "Pre-compaction memory flush");
-
-        for iteration in 0..Self::MEMORY_FLUSH_MAX_ITERATIONS {
-            let context = ReasoningContext::new()
-                .with_messages(messages.clone())
-                .with_tools(tool_defs.clone());
-
-            let output = reasoning.respond_with_tools(&context).await?;
-
-            match &output.result {
-                RespondResult::Text(text) => {
-                    if text.trim() == "NO_REPLY" {
-                        tracing::debug!("Memory flush: model had nothing to store");
-                    } else if !text.is_empty() {
-                        tracing::debug!(
-                            "Memory flush response (iter {}): {}",
-                            iteration,
-                            truncate_for_preview(text, 200)
-                        );
-                    }
-                    return Ok(());
-                }
-                RespondResult::ToolCalls { tool_calls, content } => {
-                    if let Some(text) = content {
-                        tracing::debug!(
-                            "Memory flush text (iter {}): {}",
-                            iteration,
-                            truncate_for_preview(text, 200)
-                        );
-                    }
-
-                    // Execute each tool call and collect results
-                    for tc in tool_calls {
-                        let result = self
-                            .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
-                            .await;
-                        let result_content = match result {
-                            Ok(output) => output,
-                            Err(e) => format!("Error: {}", e),
-                        };
-                        tracing::debug!(
-                            "Memory flush tool {}(iter {}): {}",
-                            tc.name,
-                            iteration,
-                            truncate_for_preview(&result_content, 100)
-                        );
-                        messages.push(ChatMessage::tool_result(&tc.id, &tc.name, result_content));
-                    }
-                }
-            }
-        }
-
-        tracing::debug!("Memory flush reached max iterations ({})", Self::MEMORY_FLUSH_MAX_ITERATIONS);
-        Ok(())
-    }
-
-    /// Run BOOT.md instructions on startup (if present in workspace).
-    ///
-    /// Reads BOOT.md content and executes it as a single agent turn with
-    /// full tool access. Output is suppressed (NO_REPLY expected).
-    async fn run_boot_if_present(&self, user_id: &str) -> Result<(), Error> {
-        let workspace = match self.workspace() {
-            Some(ws) => ws,
-            None => return Ok(()),
-        };
-
-        let boot_content = match workspace.read("BOOT.md").await {
-            Ok(doc) if !doc.content.trim().is_empty() => doc.content,
-            _ => return Ok(()),
-        };
-
-        tracing::info!("Running BOOT.md startup instructions");
-
-        let system_prompt = workspace
-            .system_prompt(true, None)
-            .await
-            .unwrap_or_else(|_| "You are a helpful assistant.".to_string());
-
-        let reasoning = Reasoning::new(self.llm().clone(), self.safety().clone())
-            .with_system_prompt(system_prompt);
-
-        let boot_prompt = format!(
-            "Execute the following startup instructions. When done, reply with NO_REPLY.\n\n{}",
-            boot_content
-        );
-        let messages = vec![ChatMessage::user(&boot_prompt)];
-
-        // Full tool access for boot instructions (same trust as AGENTS.md)
-        let tools = self.tools().tool_definitions().await;
-
-        let context = ReasoningContext::new()
-            .with_messages(messages)
-            .with_tools(tools);
-
-        match reasoning.respond_with_tools(&context).await {
-            Ok(output) => {
-                let text = match &output.result {
-                    RespondResult::Text(s) => s.clone(),
-                    RespondResult::ToolCalls { content, .. } => {
-                        content.clone().unwrap_or_default()
-                    }
-                };
-                if text.trim() != "NO_REPLY" && !text.is_empty() {
-                    tracing::info!(
-                        "BOOT.md output: {}",
-                        truncate_for_preview(&text, 200)
-                    );
-                }
-                tracing::info!("BOOT.md startup instructions completed");
-            }
-            Err(e) => {
-                tracing::warn!("BOOT.md execution failed: {}", e);
-            }
-        }
-
-        // Audit log
-        tracing::info!(
-            target: "audit",
-            command = "boot",
-            user = user_id,
-            "Ran BOOT.md startup instructions"
-        );
-
-        Ok(())
-    }
-
-    /// Save the current thread's last N messages to workspace when user runs /new.
-    const SESSION_SAVE_MESSAGE_COUNT: usize = 15;
-
-    async fn save_thread_to_workspace_before_new(
-        &self,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-        workspace: &Workspace,
-    ) -> Result<(), Error> {
-        let messages = {
-            let sess = session.lock().await;
-            let thread = match sess.threads.get(&thread_id) {
-                Some(t) => t,
-                None => return Ok(()),
-            };
-            let msgs = thread.messages();
-            if msgs.is_empty() {
-                return Ok(());
-            }
-            let start = msgs.len().saturating_sub(Self::SESSION_SAVE_MESSAGE_COUNT);
-            msgs[start..].to_vec()
-        };
-
-        let now = chrono::Utc::now();
-        let date_str = now.format("%Y-%m-%d").to_string();
-        let time_str = now.format("%H%M%S").to_string();
-        let path = format!("daily/{}-session-{}.md", date_str, time_str);
-
-        let mut lines = vec![
-            format!("# Session: {} UTC", now.format("%Y-%m-%d %H:%M:%S")),
-            String::new(),
-            format!("- **Thread ID**: {}", thread_id),
-            format!("- **Source**: /new"),
-            String::new(),
-            "## Conversation".to_string(),
-            String::new(),
-        ];
-        for msg in &messages {
-            let role = match msg.role {
-                crate::llm::Role::User => "user",
-                crate::llm::Role::Assistant => "assistant",
-                crate::llm::Role::System => "system",
-                crate::llm::Role::Tool => "tool",
-            };
-            lines.push(format!("**{}**: {}", role, msg.content.trim()));
-            lines.push(String::new());
-        }
-        let content = lines.join("\n");
-
-        // Use content-hash dedup to prevent duplicates during cross-machine sync
-        match workspace.write_dedup(&path, &content).await {
-            Ok(true) => tracing::info!("Saved thread to workspace: {}", path),
-            Ok(false) => tracing::debug!("Session file deduplicated (already exists): {}", path),
-            Err(e) => {
-                // Fall back to regular write if dedup fails (e.g., no postgres)
-                tracing::debug!("Dedup write failed, falling back to regular write: {}", e);
-                workspace.write(&path, &content).await.map_err(Error::from)?;
-                tracing::info!("Saved thread to workspace (fallback): {}", path);
-            }
-        }
-        Ok(())
-    }
-
-    async fn process_new_thread(
-        &self,
-        message: &IncomingMessage,
-    ) -> Result<SubmissionResult, Error> {
-        let session = self
-            .session_manager
-            .get_or_create_session(&message.user_id)
-            .await;
-        let mut sess = session.lock().await;
-        let thread = sess.create_thread();
-        let thread_id = thread.id;
-        Ok(SubmissionResult::ok_with_message(format!(
-            "New thread: {}",
-            thread_id
-        )))
-    }
-
-    async fn process_switch_thread(
-        &self,
-        message: &IncomingMessage,
-        target_thread_id: Uuid,
-    ) -> Result<SubmissionResult, Error> {
-        let session = self
-            .session_manager
-            .get_or_create_session(&message.user_id)
-            .await;
-        let mut sess = session.lock().await;
-
-        if sess.switch_thread(target_thread_id) {
-            Ok(SubmissionResult::ok_with_message(format!(
-                "Switched to thread {}",
-                target_thread_id
-            )))
-        } else {
-            Ok(SubmissionResult::error("Thread not found."))
-        }
-    }
-
-    async fn process_resume(
-        &self,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-        checkpoint_id: Uuid,
-    ) -> Result<SubmissionResult, Error> {
-        let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
-        let mut mgr = undo_mgr.lock().await;
-
-        if let Some(checkpoint) = mgr.restore(checkpoint_id) {
-            let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.restore_from_messages(checkpoint.messages);
-            Ok(SubmissionResult::ok_with_message(format!(
-                "Resumed from checkpoint: {}",
-                checkpoint.description
-            )))
-        } else {
-            Ok(SubmissionResult::error("Checkpoint not found."))
-        }
-    }
-
-    async fn handle_create_job(
-        &self,
-        user_id: &str,
-        title: String,
-        description: String,
-        category: Option<String>,
-    ) -> Result<String, Error> {
-        // Create job context
-        let job_id = self
-            .context_manager
-            .create_job_for_user(user_id, &title, &description)
-            .await?;
-
-        // Update category if provided
-        if let Some(cat) = category {
-            self.context_manager
-                .update_context(job_id, |ctx| {
-                    ctx.category = Some(cat);
-                })
-                .await?;
-        }
-
-        // Persist new job to database (fire-and-forget)
-        if let Some(store) = self.store()
-            && let Ok(ctx) = self.context_manager.get_context(job_id).await
-        {
-            let store = store.clone();
-            tokio::spawn(async move {
-                if let Err(e) = store.save_job(&ctx).await {
-                    tracing::warn!("Failed to persist new job {}: {}", job_id, e);
-                }
-            });
-        }
-
-        // Schedule for execution
-        self.scheduler.schedule(job_id).await?;
-
-        Ok(format!(
-            "Created job: {}\nID: {}\n\nThe job has been scheduled and is now running.",
-            title, job_id
-        ))
-    }
-
-    async fn handle_check_status(
-        &self,
-        user_id: &str,
-        job_id: Option<String>,
-    ) -> Result<String, Error> {
-        match job_id {
-            Some(id) => {
-                let uuid = Uuid::parse_str(&id)
-                    .map_err(|_| crate::error::JobError::NotFound { id: Uuid::nil() })?;
-
-                let ctx = self.context_manager.get_context(uuid).await?;
-                if ctx.user_id != user_id {
-                    return Err(crate::error::JobError::NotFound { id: uuid }.into());
-                }
-
-                Ok(format!(
-                    "Job: {}\nStatus: {:?}\nCreated: {}\nStarted: {}\nActual cost: {}",
-                    ctx.title,
-                    ctx.state,
-                    ctx.created_at.format("%Y-%m-%d %H:%M:%S"),
-                    ctx.started_at
-                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                        .unwrap_or_else(|| "Not started".to_string()),
-                    ctx.actual_cost
-                ))
-            }
-            None => {
-                // Show summary of all jobs
-                let summary = self.context_manager.summary_for(user_id).await;
-                Ok(format!(
-                    "Jobs summary:\n  Total: {}\n  In Progress: {}\n  Completed: {}\n  Failed: {}\n  Stuck: {}",
-                    summary.total,
-                    summary.in_progress,
-                    summary.completed,
-                    summary.failed,
-                    summary.stuck
-                ))
-            }
-        }
-    }
-
-    async fn handle_cancel_job(&self, user_id: &str, job_id: &str) -> Result<String, Error> {
-        let uuid = Uuid::parse_str(job_id)
-            .map_err(|_| crate::error::JobError::NotFound { id: Uuid::nil() })?;
-
-        let ctx = self.context_manager.get_context(uuid).await?;
-        if ctx.user_id != user_id {
-            return Err(crate::error::JobError::NotFound { id: uuid }.into());
-        }
-
-        self.scheduler.stop(uuid).await?;
-
-        Ok(format!("Job {} has been cancelled.", job_id))
-    }
-
-    async fn handle_list_jobs(
-        &self,
-        user_id: &str,
-        _filter: Option<String>,
-    ) -> Result<String, Error> {
-        let jobs = self.context_manager.all_jobs_for(user_id).await;
-
-        if jobs.is_empty() {
-            return Ok("No jobs found.".to_string());
-        }
-
-        let mut output = String::from("Jobs:\n");
-        for job_id in jobs {
-            if let Ok(ctx) = self.context_manager.get_context(job_id).await
-                && ctx.user_id == user_id
-            {
-                output.push_str(&format!("  {} - {} ({:?})\n", job_id, ctx.title, ctx.state));
-            }
-        }
-
-        Ok(output)
-    }
-
-    async fn handle_help_job(&self, user_id: &str, job_id: &str) -> Result<String, Error> {
-        let uuid = Uuid::parse_str(job_id)
-            .map_err(|_| crate::error::JobError::NotFound { id: Uuid::nil() })?;
-
-        let ctx = self.context_manager.get_context(uuid).await?;
-        if ctx.user_id != user_id {
-            return Err(crate::error::JobError::NotFound { id: uuid }.into());
-        }
-
-        if ctx.state == crate::context::JobState::Stuck {
-            // Attempt recovery
-            self.context_manager
-                .update_context(uuid, |ctx| ctx.attempt_recovery())
-                .await?
-                .map_err(|s| crate::error::JobError::ContextError {
-                    id: uuid,
-                    reason: s,
-                })?;
-
-            // Reschedule
-            self.scheduler.schedule(uuid).await?;
-
-            Ok(format!(
-                "Job {} was stuck. Attempting recovery (attempt #{}).",
-                job_id,
-                ctx.repair_attempts + 1
-            ))
-        } else {
-            Ok(format!(
-                "Job {} is not stuck (current state: {:?}). No help needed.",
-                job_id, ctx.state
-            ))
-        }
-    }
-
-    /// Trigger a manual heartbeat check.
-    async fn process_heartbeat(&self) -> Result<SubmissionResult, Error> {
-        let Some(workspace) = self.workspace() else {
-            return Ok(SubmissionResult::error(
-                "Heartbeat requires a workspace (database must be connected).",
-            ));
-        };
-
-        let runner = crate::agent::HeartbeatRunner::new(
-            crate::agent::HeartbeatConfig::default(),
-            workspace.clone(),
-            self.llm().clone(),
-        );
-
-        match runner.check_heartbeat().await {
-            crate::agent::HeartbeatResult::Ok => Ok(SubmissionResult::ok_with_message(
-                "Heartbeat: all clear, nothing needs attention.",
-            )),
-            crate::agent::HeartbeatResult::NeedsAttention(msg) => Ok(SubmissionResult::response(
-                format!("Heartbeat findings:\n\n{}", msg),
-            )),
-            crate::agent::HeartbeatResult::Skipped => Ok(SubmissionResult::ok_with_message(
-                "Heartbeat skipped: no HEARTBEAT.md checklist found in workspace.",
-            )),
-            crate::agent::HeartbeatResult::Failed(err) => Ok(SubmissionResult::error(format!(
-                "Heartbeat failed: {}",
-                err
-            ))),
-        }
-    }
-
-    /// Summarize the current thread's conversation.
-    async fn process_summarize(
-        &self,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-    ) -> Result<SubmissionResult, Error> {
-        let messages = {
-            let sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.messages()
-        };
-
-        if messages.is_empty() {
-            return Ok(SubmissionResult::ok_with_message(
-                "Nothing to summarize (empty thread).",
-            ));
-        }
-
-        // Build a summary prompt with the conversation
-        let mut context = Vec::new();
-        context.push(ChatMessage::system(
-            "Summarize the conversation so far in 3-5 concise bullet points. \
-             Focus on decisions made, actions taken, and key outcomes. \
-             Be brief and factual.",
-        ));
-        // Include the conversation messages (truncate to last 20 to avoid context overflow)
-        let start = if messages.len() > 20 {
-            messages.len() - 20
-        } else {
-            0
-        };
-        context.extend_from_slice(&messages[start..]);
-        context.push(ChatMessage::user("Summarize this conversation."));
-
-        let request = crate::llm::CompletionRequest::new(context)
-            .with_max_tokens(512)
-            .with_temperature(0.3);
-
-        match self.llm().complete(request).await {
-            Ok(response) => Ok(SubmissionResult::response(format!(
-                "Thread Summary:\n\n{}",
-                response.content.trim()
-            ))),
-            Err(e) => Ok(SubmissionResult::error(format!("Summarize failed: {}", e))),
-        }
-    }
-
-    /// Suggest next steps based on the current thread.
-    async fn process_suggest(
-        &self,
-        session: Arc<Mutex<Session>>,
-        thread_id: Uuid,
-    ) -> Result<SubmissionResult, Error> {
-        let messages = {
-            let sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.messages()
-        };
-
-        if messages.is_empty() {
-            return Ok(SubmissionResult::ok_with_message(
-                "Nothing to suggest from (empty thread).",
-            ));
-        }
-
-        let mut context = Vec::new();
-        context.push(ChatMessage::system(
-            "Based on the conversation so far, suggest 2-4 concrete next steps the user could take. \
-             Be actionable and specific. Format as a numbered list.",
-        ));
-        let start = if messages.len() > 20 {
-            messages.len() - 20
-        } else {
-            0
-        };
-        context.extend_from_slice(&messages[start..]);
-        context.push(ChatMessage::user("What should I do next?"));
-
-        let request = crate::llm::CompletionRequest::new(context)
-            .with_max_tokens(512)
-            .with_temperature(0.5);
-
-        match self.llm().complete(request).await {
-            Ok(response) => Ok(SubmissionResult::response(format!(
-                "Suggested Next Steps:\n\n{}",
-                response.content.trim()
-            ))),
-            Err(e) => Ok(SubmissionResult::error(format!("Suggest failed: {}", e))),
-        }
-    }
-
-    /// Handle system commands that bypass thread-state checks entirely.
-    async fn handle_system_command(
-        &self,
-        command: &str,
-        args: &[String],
-    ) -> Result<SubmissionResult, Error> {
-        match command {
-            "help" => Ok(SubmissionResult::response(concat!(
-                "System:\n",
-                "  /help             Show this help\n",
-                "  /model [name]     Show or switch the active model\n",
-                "  /version          Show version info\n",
-                "  /tools            List available tools\n",
-                "  /debug            Toggle debug mode\n",
-                "  /ping             Connectivity check\n",
-                "\n",
-                "Jobs:\n",
-                "  /job <desc>       Create a new job\n",
-                "  /status [id]      Check job status\n",
-                "  /cancel <id>      Cancel a job\n",
-                "  /list             List all jobs\n",
-                "\n",
-                "Session:\n",
-                "  /undo             Undo last turn\n",
-                "  /redo             Redo undone turn\n",
-                "  /compact          Compress context window\n",
-                "  /clear            Clear current thread\n",
-                "  /interrupt        Stop current operation\n",
-                "  /new              New conversation thread\n",
-                "  /thread <id>      Switch to thread\n",
-                "  /resume <id>      Resume from checkpoint\n",
-                "\n",
-                "Agent:\n",
-                "  /heartbeat        Run heartbeat check\n",
-                "  /summarize        Summarize current thread\n",
-                "  /suggest          Suggest next steps\n",
-                "\n",
-                "  /quit             Exit",
-            ))),
-
-            "ping" => Ok(SubmissionResult::response("pong!")),
-
-            "version" => Ok(SubmissionResult::response(format!(
-                "{} v{}",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            ))),
-
-            "tools" => {
-                let tools = self.tools().list().await;
-                Ok(SubmissionResult::response(format!(
-                    "Available tools: {}",
-                    tools.join(", ")
-                )))
-            }
-
-            "debug" => {
-                // Debug toggle is handled client-side in the REPL.
-                // For non-REPL channels, just acknowledge.
-                Ok(SubmissionResult::ok_with_message(
-                    "Debug toggle is handled by your client.",
-                ))
-            }
-
-            "model" => {
-                if args.is_empty() {
-                    // Show current model
-                    let name = self.llm().active_model_name();
-                    Ok(SubmissionResult::response(format!(
-                        "Active model: {}",
-                        name
-                    )))
-                } else {
-                    let requested = &args[0];
-
-                    // Validate the model exists
-                    match self.llm().list_models().await {
-                        Ok(models) if !models.is_empty() => {
-                            if !models.iter().any(|m| m == requested) {
-                                return Ok(SubmissionResult::error(format!(
-                                    "Unknown model: {}. Available models:\n  {}",
-                                    requested,
-                                    models.join("\n  ")
-                                )));
-                            }
-                        }
-                        Ok(_) => {
-                            // Empty model list, can't validate but try anyway
-                        }
-                        Err(e) => {
-                            tracing::warn!("Could not fetch model list for validation: {}", e);
-                            // Proceed anyway, the provider will error on the next call if invalid
-                        }
-                    }
-
-                    match self.llm().set_model(requested) {
-                        Ok(()) => Ok(SubmissionResult::response(format!(
-                            "Switched model to: {}",
-                            requested
-                        ))),
-                        Err(e) => Ok(SubmissionResult::error(format!(
-                            "Failed to switch model: {}",
-                            e
-                        ))),
-                    }
-                }
-            }
-
-            _ => Ok(SubmissionResult::error(format!(
-                "Unknown command: {}. Try /help",
-                command
-            ))),
-        }
-    }
-
-    /// Handle legacy command routing from the Router (job commands that go through
-    /// process_user_input -> router -> handle_job_or_command -> here).
-    async fn handle_command(
-        &self,
-        command: &str,
-        args: &[String],
-    ) -> Result<Option<String>, Error> {
-        // System commands are now handled directly via Submission::SystemCommand,
-        // but the router may still send us unknown /commands.
-        match self.handle_system_command(command, args).await? {
-            SubmissionResult::Response { content } => Ok(Some(content)),
-            SubmissionResult::Ok { message } => Ok(message),
-            SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
-            _ => Ok(None),
-        }
-    }
-}
-
-/// Parsed auth result fields for emitting StatusUpdate::AuthRequired.
-struct ParsedAuthData {
-    auth_url: Option<String>,
-    setup_url: Option<String>,
-}
-
-/// Extract auth_url and setup_url from a tool_auth result JSON string.
-fn parse_auth_result(result: &Result<String, Error>) -> ParsedAuthData {
-    let parsed = result
-        .as_ref()
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-    ParsedAuthData {
-        auth_url: parsed
-            .as_ref()
-            .and_then(|v| v.get("auth_url"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        setup_url: parsed
-            .as_ref()
-            .and_then(|v| v.get("setup_url"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-    }
-}
-
-/// Check if a tool_auth result indicates the extension is awaiting a token.
-///
-/// Returns `Some((extension_name, instructions))` if the tool result contains
-/// `awaiting_token: true`, meaning the thread should enter auth mode.
-fn detect_auth_awaiting(
-    tool_name: &str,
-    result: &Result<String, Error>,
-) -> Option<(String, String)> {
-    if tool_name != "tool_auth" && tool_name != "tool_activate" {
-        return None;
-    }
-    let output = result.as_ref().ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(output).ok()?;
-    if parsed.get("awaiting_token") != Some(&serde_json::Value::Bool(true)) {
-        return None;
-    }
-    let name = parsed.get("name")?.as_str()?.to_string();
-    let instructions = parsed
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Please provide your API token/key.")
-        .to_string();
-    Some((name, instructions))
 }
 
 #[cfg(test)]
@@ -4677,6 +2612,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 finish_reason: FinishReason::Stop,
+                reasoning: None,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -4727,6 +2663,7 @@ mod tests {
             builder: None,
             llm_backend: "nearai".to_string(),
             tenant_rates: Arc::new(crate::tenant::TenantRateRegistry::new(4, 3)),
+            runtime_policy: None,
         };
 
         Agent::new(
@@ -4761,6 +2698,59 @@ mod tests {
             Some(Arc::new(crate::context::ContextManager::new(1))),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn select_active_skills_uses_scoped_user_registry_in_multi_tenant_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ironclaw_skills::SkillRegistry::new(temp.path().join("owner-skills"))
+            .with_installed_dir(temp.path().join("owner-installed"));
+        let scoped = registry.clone_config_for_tenant_user_scope("owner", "alice");
+        let skill_content = r#"---
+name: tenant-skill
+description: Tenant runtime skill
+---
+
+Only Alice should be able to activate this skill.
+"#;
+        ironclaw_skills::SkillRegistry::prepare_install_to_disk(
+            scoped.install_target_dir(),
+            "tenant-skill",
+            skill_content,
+        )
+        .await
+        .expect("install scoped skill");
+
+        let mut agent = make_legacy_handle_message_test_agent();
+        agent.config.multi_tenant = true;
+        agent.deps.owner_id = "owner".to_string();
+        agent.deps.skill_registry = Some(Arc::new(std::sync::RwLock::new(registry)));
+
+        let (selected, rewritten, feedback) = agent
+            .select_active_skills("please use /tenant-skill", "alice")
+            .await;
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|skill| skill.name())
+                .collect::<Vec<_>>(),
+            vec!["tenant-skill"]
+        );
+        assert!(rewritten.contains("Tenant runtime skill"));
+        assert!(
+            feedback
+                .iter()
+                .any(|note| note.contains("force-activated via /mention"))
+        );
+
+        let (owner_selected, _, _) = agent
+            .select_active_skills("please use /tenant-skill", "owner")
+            .await;
+        assert!(
+            owner_selected.is_empty(),
+            "owner/shared registry must not discover hidden scoped user skills"
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -5139,7 +3129,8 @@ mod tests {
             thread_id
         };
 
-        let response = build_outgoing_response_for_thread(&session, thread_id, "done").await;
+        let response =
+            build_outgoing_response_for_thread(&session, thread_id, "done", Vec::new()).await;
 
         assert_eq!(response.content, "done");
         assert!(response.attachments.is_empty());
@@ -5150,6 +3141,36 @@ mod tests {
         );
         assert_eq!(response.inline_attachments[0].mime_type, "image/png");
         assert_eq!(response.inline_attachments[0].data, b"png-bytes");
+    }
+
+    #[tokio::test]
+    async fn empty_submission_response_with_attachments_is_delivered() {
+        use super::submission_response_to_handle_outcome;
+        use crate::agent::session::Session;
+        use std::sync::Arc;
+
+        let session: Arc<tokio::sync::Mutex<Session>> =
+            Arc::new(tokio::sync::Mutex::new(Session::new("user-123")));
+        let thread_id = {
+            let mut sess = session.lock().await;
+            sess.create_thread(None).id
+        };
+
+        let outcome = submission_response_to_handle_outcome(
+            &session,
+            thread_id,
+            String::new(),
+            vec!["/tmp/generated-image.png".to_string()],
+        )
+        .await;
+
+        match outcome {
+            HandleOutcome::Respond(response) => {
+                assert!(response.content.is_empty());
+                assert_eq!(response.attachments, vec!["/tmp/generated-image.png"]);
+            }
+            other => panic!("expected attachment response, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -5198,6 +3219,7 @@ mod tests {
 
         let callback = serde_json::to_string(&Submission::ExternalCallback {
             request_id: Uuid::new_v4(),
+            payload: None,
         })
         .expect("serialize external callback");
         let callback_message =

@@ -2146,20 +2146,12 @@ impl SetupWizard {
                 print_success(&format!("Selected {}", model_id));
             }
             _ => {
-                // NEAR AI: use existing provider list_models()
-                let fetched = self.fetch_nearai_models().await;
-                let default_models: Vec<(String, String)> = vec![
-                    (
-                        "fireworks::accounts/fireworks/models/llama4-maverick-instruct-basic"
-                            .into(),
-                        "Llama 4 Maverick (default, fast)".into(),
-                    ),
-                    (
-                        "anthropic::claude-sonnet-4-20250514".into(),
-                        "Claude Sonnet 4 (best quality)".into(),
-                    ),
-                    ("openai::gpt-5.3-codex".into(), "GPT-5.3 Codex".into()),
-                ];
+                if let Some(def) = registry.find(backend) {
+                    let can_list = def
+                        .setup
+                        .as_ref()
+                        .map(|s| s.can_list_models())
+                        .unwrap_or(false);
 
                     if can_list {
                         // Try to fetch models from the provider's /v1/models endpoint
@@ -2294,34 +2286,7 @@ impl SetupWizard {
 
         let config = build_nearai_model_fetch_config();
 
-        let config = LlmConfig {
-            backend: crate::config::LlmBackend::NearAi,
-            nearai: crate::config::NearAiConfig {
-                model: "dummy".to_string(),
-                cheap_model: None,
-                base_url,
-                auth_base_url,
-                session_path: crate::llm::session::default_session_path(),
-                api_mode: crate::config::NearAiApiMode::Responses,
-                api_key: None,
-                fallback_model: None,
-                max_retries: 3,
-                circuit_breaker_threshold: None,
-                circuit_breaker_recovery_secs: 30,
-                response_cache_enabled: false,
-                response_cache_ttl_secs: 3600,
-                response_cache_max_entries: 1000,
-                failover_cooldown_secs: 300,
-                failover_cooldown_threshold: 3,
-            },
-            openai: None,
-            anthropic: None,
-            gemini: None,
-            ollama: None,
-            openai_compatible: None,
-        };
-
-        match create_llm_provider(&config, session) {
+        match create_llm_provider(&config, session).await {
             Ok(provider) => match provider.list_models().await {
                 Ok(models) => models,
                 Err(e) => {
@@ -2724,6 +2689,12 @@ impl SetupWizard {
 
         // Process selected WASM channels
         let mut enabled_wasm_channels = Vec::new();
+        let existing_runtime_overrides = self
+            .settings
+            .channels
+            .wasm_channel_runtime_overrides
+            .clone();
+        let mut enabled_runtime_overrides: HashMap<String, serde_json::Value> = HashMap::new();
         for channel_name in selected_wasm_channels {
             println!();
             if let Some(ref ctx) = secrets {
@@ -2738,6 +2709,7 @@ impl SetupWizard {
                         crate::setup::channels::WasmChannelSetupResult {
                             enabled: true,
                             channel_name: channel_name.clone(),
+                            config_overrides: HashMap::new(),
                         }
                     }
                 } else {
@@ -2749,7 +2721,19 @@ impl SetupWizard {
                 };
 
                 if result.enabled {
-                    enabled_wasm_channels.push(result.channel_name);
+                    let channel_name = result.channel_name;
+                    enabled_wasm_channels.push(channel_name.clone());
+                    let channel_overrides = merge_wasm_channel_runtime_overrides_for_channel(
+                        &existing_runtime_overrides,
+                        &channel_name,
+                        result.config_overrides,
+                    );
+                    for (config_key, value) in channel_overrides {
+                        enabled_runtime_overrides.insert(
+                            wasm_channel_runtime_override_key(&channel_name, &config_key),
+                            value,
+                        );
+                    }
                 }
             } else {
                 // No secrets context, just enable the channel
@@ -2758,10 +2742,21 @@ impl SetupWizard {
                     capitalize_first(&channel_name)
                 ));
                 enabled_wasm_channels.push(channel_name.clone());
+                let channel_overrides = collect_wasm_channel_runtime_overrides_for_channel(
+                    &existing_runtime_overrides,
+                    &channel_name,
+                );
+                for (config_key, value) in channel_overrides {
+                    enabled_runtime_overrides.insert(
+                        wasm_channel_runtime_override_key(&channel_name, &config_key),
+                        value,
+                    );
+                }
             }
         }
 
         self.settings.channels.wasm_channels = enabled_wasm_channels;
+        self.settings.channels.wasm_channel_runtime_overrides = enabled_runtime_overrides;
 
         Ok(())
     }
@@ -3658,196 +3653,6 @@ fn mask_password_in_url(url: &str) -> String {
     format!("{}{}:****{}", scheme, username, after_at)
 }
 
-/// Fetch models from the Anthropic API.
-///
-/// Returns `(model_id, display_label)` pairs. Falls back to static defaults on error.
-async fn fetch_anthropic_models(cached_key: Option<&str>) -> Vec<(String, String)> {
-    let static_defaults = vec![
-        ("claude-sonnet-4-20250514".into(), "Claude Sonnet 4".into()),
-        ("claude-opus-4-20250514".into(), "Claude Opus 4".into()),
-        (
-            "claude-3-5-haiku-20241022".into(),
-            "Claude 3.5 Haiku (fast)".into(),
-        ),
-    ];
-
-    let api_key = cached_key
-        .map(String::from)
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-        .filter(|k| !k.is_empty());
-
-    let api_key = match api_key {
-        Some(k) => k,
-        None => return static_defaults,
-    };
-
-    let client = reqwest::Client::new();
-    let resp = match client
-        .get("https://api.anthropic.com/v1/models")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return static_defaults,
-    };
-
-    #[derive(serde::Deserialize)]
-    struct ModelEntry {
-        id: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct ModelsResponse {
-        data: Vec<ModelEntry>,
-    }
-
-    match resp.json::<ModelsResponse>().await {
-        Ok(body) => {
-            let mut models: Vec<(String, String)> = body
-                .data
-                .into_iter()
-                .filter(|m| !m.id.contains("embedding") && !m.id.contains("audio"))
-                .map(|m| {
-                    let label = m.id.clone();
-                    (m.id, label)
-                })
-                .collect();
-            if models.is_empty() {
-                return static_defaults;
-            }
-            models.sort_by(|a, b| a.0.cmp(&b.0));
-            models
-        }
-        Err(_) => static_defaults,
-    }
-}
-
-/// Fetch models from the OpenAI API.
-///
-/// Returns `(model_id, display_label)` pairs. Falls back to static defaults on error.
-async fn fetch_openai_models(cached_key: Option<&str>) -> Vec<(String, String)> {
-    let static_defaults = vec![
-        ("gpt-5.3-codex".into(), "GPT-5.3 Codex (agentic coding)".into()),
-        ("gpt-5.2".into(), "GPT-5.2 (flagship)".into()),
-        ("gpt-5-mini".into(), "GPT-5 Mini (fast)".into()),
-    ];
-
-    let api_key = cached_key
-        .map(String::from)
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .filter(|k| !k.is_empty());
-
-    let api_key = match api_key {
-        Some(k) => k,
-        None => return static_defaults,
-    };
-
-    let client = reqwest::Client::new();
-    let resp = match client
-        .get("https://api.openai.com/v1/models")
-        .bearer_auth(&api_key)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return static_defaults,
-    };
-
-    #[derive(serde::Deserialize)]
-    struct ModelEntry {
-        id: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct ModelsResponse {
-        data: Vec<ModelEntry>,
-    }
-
-    // Prefixes that indicate chat-relevant models
-    let chat_prefixes = ["gpt-4", "gpt-3.5", "o1", "o3", "o4", "chatgpt"];
-
-    match resp.json::<ModelsResponse>().await {
-        Ok(body) => {
-            let mut models: Vec<(String, String)> = body
-                .data
-                .into_iter()
-                .filter(|m| {
-                    chat_prefixes.iter().any(|p| m.id.starts_with(p))
-                        && !m.id.contains("realtime")
-                        && !m.id.contains("audio")
-                })
-                .map(|m| {
-                    let label = m.id.clone();
-                    (m.id, label)
-                })
-                .collect();
-            if models.is_empty() {
-                return static_defaults;
-            }
-            models.sort_by(|a, b| a.0.cmp(&b.0));
-            models
-        }
-        Err(_) => static_defaults,
-    }
-}
-
-/// Fetch installed models from a local Ollama instance.
-///
-/// Returns `(model_name, display_label)` pairs. Falls back to static defaults on error.
-async fn fetch_ollama_models(base_url: &str) -> Vec<(String, String)> {
-    let static_defaults = vec![
-        ("llama3".into(), "llama3".into()),
-        ("mistral".into(), "mistral".into()),
-        ("codellama".into(), "codellama".into()),
-    ];
-
-    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-
-    let resp = match client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        Ok(_) => return static_defaults,
-        Err(_) => {
-            print_info("Could not connect to Ollama. Is it running?");
-            return static_defaults;
-        }
-    };
-
-    #[derive(serde::Deserialize)]
-    struct ModelEntry {
-        name: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct TagsResponse {
-        models: Vec<ModelEntry>,
-    }
-
-    match resp.json::<TagsResponse>().await {
-        Ok(body) => {
-            let models: Vec<(String, String)> = body
-                .models
-                .into_iter()
-                .map(|m| {
-                    let label = m.name.clone();
-                    (m.name, label)
-                })
-                .collect();
-            if models.is_empty() {
-                return static_defaults;
-            }
-            models
-        }
-        Err(_) => static_defaults,
-    }
-}
-
 /// Discover WASM channels in a directory.
 ///
 /// Returns a list of (channel_name, capabilities_file) pairs.
@@ -3935,6 +3740,36 @@ fn capitalize_first(s: &str) -> String {
         None => String::new(),
         Some(first) => first.to_uppercase().chain(chars).collect(),
     }
+}
+
+fn wasm_channel_runtime_override_key(channel_name: &str, config_key: &str) -> String {
+    format!("{}:{}", channel_name, config_key)
+}
+
+fn collect_wasm_channel_runtime_overrides_for_channel(
+    stored: &HashMap<String, serde_json::Value>,
+    channel_name: &str,
+) -> HashMap<String, serde_json::Value> {
+    let mut result = HashMap::new();
+    let prefix = format!("{channel_name}:");
+    for (key, value) in stored {
+        if let Some(config_key) = key.strip_prefix(&prefix)
+            && !config_key.trim().is_empty()
+        {
+            result.insert(config_key.to_string(), value.clone());
+        }
+    }
+    result
+}
+
+fn merge_wasm_channel_runtime_overrides_for_channel(
+    stored: &HashMap<String, serde_json::Value>,
+    channel_name: &str,
+    new_overrides: HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    let mut result = collect_wasm_channel_runtime_overrides_for_channel(stored, channel_name);
+    result.extend(new_overrides);
+    result
 }
 
 #[cfg(test)]
@@ -4120,7 +3955,7 @@ async fn install_selected_bundled_channels(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     #[cfg(unix)]
     use std::ffi::OsString;
 
@@ -4271,6 +4106,33 @@ mod tests {
     }
 
     #[test]
+    fn wasm_channel_runtime_overrides_merge_existing_with_new_values() {
+        let stored = HashMap::from([
+            (
+                "wecom:allow_from".to_string(),
+                serde_json::json!(["ZhangSan"]),
+            ),
+            ("wecom:dm_policy".to_string(), serde_json::json!("pairing")),
+            ("telegram:dm_policy".to_string(), serde_json::json!("open")),
+        ]);
+        let new_overrides =
+            HashMap::from([("dm_policy".to_string(), serde_json::json!("allowlist"))]);
+
+        let merged =
+            merge_wasm_channel_runtime_overrides_for_channel(&stored, "wecom", new_overrides);
+
+        assert_eq!(
+            merged.get("allow_from"),
+            Some(&serde_json::json!(["ZhangSan"]))
+        );
+        assert_eq!(
+            merged.get("dm_policy"),
+            Some(&serde_json::json!("allowlist"))
+        );
+        assert!(!merged.contains_key("telegram:dm_policy"));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn test_try_with_config_and_toml_propagates_invalid_owner_env() {
         use std::os::unix::ffi::OsStringExt;
@@ -4394,7 +4256,7 @@ mod tests {
         let _guard = EnvGuard::clear("OPENAI_API_KEY");
         let models = fetch_models_for("openai", &ModelFetchOptions::default()).await;
         assert!(!models.is_empty());
-        assert_eq!(models[0].0, "gpt-5.3-codex");
+        assert_eq!(models[0].0, "gpt-5.5");
         assert!(
             models.iter().any(|(id, _)| id.contains("gpt")),
             "static defaults should include a GPT model"

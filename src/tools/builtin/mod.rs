@@ -10,14 +10,16 @@ mod grep_tool;
 mod http;
 mod job;
 mod json;
-pub mod learning;
-mod memory;
-mod python;
+pub mod memory;
+mod message;
+pub mod path_utils;
+mod plan;
+mod restart;
 pub mod routine;
 pub mod secrets_tools;
 pub(crate) mod shell;
-pub mod task;
-pub mod tilth;
+pub mod skill_tools;
+pub mod system;
 mod time;
 mod tool_info;
 
@@ -37,19 +39,18 @@ pub use job::{
     PromptQueue, SchedulerSlot,
 };
 pub use json::JsonTool;
-pub use learning::{LearningCreateTool, LearningPromoteTool, LearningSearchTool};
 pub use memory::{MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool};
-pub use python::PythonTool;
+pub use message::MessageTool;
+pub use plan::PlanUpdateTool;
+pub use restart::RestartTool;
 pub use routine::{
     EventEmitTool, RoutineCreateTool, RoutineDeleteTool, RoutineFireTool, RoutineHistoryTool,
     RoutineListTool, RoutineUpdateTool,
 };
 pub use secrets_tools::{SecretDeleteTool, SecretListTool};
 pub use shell::ShellTool;
-pub use task::{
-    TaskArchiveTool, TaskCreateTool, TaskExportTool, TaskListTool, TaskReadyTool, TaskUpdateTool,
-};
-pub use tilth::{CodeFilesTool, CodeReadTool, CodeSearchTool, TilthState};
+pub use skill_tools::{SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool};
+pub use system::{SystemToolsListTool, SystemVersionTool};
 pub use time::TimeTool;
 pub use tool_info::ToolInfoTool;
 mod html_converter;

@@ -63,7 +63,8 @@ use crate::error::ChannelError;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::tools::ToolRegistry;
-use crate::workspace::{EmbeddingCacheConfig, EmbeddingProvider, Workspace};
+use crate::workspace::Workspace;
+use ironclaw_embeddings::{EmbeddingCacheConfig, EmbeddingProvider};
 use ironclaw_skills::catalog::SkillCatalog;
 use ironclaw_skills::registry::SkillRegistry;
 
@@ -167,8 +168,35 @@ impl GatewayChannel {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
             llm_provider: None,
-            chat_rate_limiter: server::RateLimiter::new(30, 60),
-            agent_card_json: None,
+            llm_reload: None,
+            llm_session_manager: None,
+            config_toml_path: None,
+            skill_registry: None,
+            skill_catalog: None,
+            auth_manager: None,
+            chat_rate_limiter: platform::state::PerUserRateLimiter::new(30, 60),
+            oauth_rate_limiter: platform::state::PerUserRateLimiter::new(20, 60),
+            webhook_rate_limiter: platform::state::RateLimiter::new(10, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
+            active_config: Arc::new(tokio::sync::RwLock::new(
+                platform::state::ActiveConfigSnapshot::default(),
+            )),
+            secrets_store: None,
+            db_auth: None,
+            pairing_store: None,
+            oauth_providers: None,
+            oauth_state_store: None,
+            oauth_base_url: None,
+            oauth_allowed_domains: Vec::new(),
+            near_nonce_store: None,
+            near_rpc_url: None,
+            near_network: None,
+            oauth_sweep_shutdown: None,
+            frontend_html_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            tool_dispatcher: None,
         });
 
         Self {
@@ -206,8 +234,35 @@ impl GatewayChannel {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
             llm_provider: self.state.llm_provider.clone(),
-            chat_rate_limiter: server::RateLimiter::new(30, 60),
-            agent_card_json: self.state.agent_card_json.clone(),
+            llm_reload: self.state.llm_reload.clone(),
+            llm_session_manager: self.state.llm_session_manager.clone(),
+            config_toml_path: self.state.config_toml_path.clone(),
+            skill_registry: self.state.skill_registry.clone(),
+            skill_catalog: self.state.skill_catalog.clone(),
+            auth_manager: self.state.auth_manager.clone(),
+            chat_rate_limiter: platform::state::PerUserRateLimiter::new(30, 60),
+            oauth_rate_limiter: platform::state::PerUserRateLimiter::new(20, 60),
+            webhook_rate_limiter: platform::state::RateLimiter::new(10, 60),
+            registry_entries: self.state.registry_entries.clone(),
+            cost_guard: self.state.cost_guard.clone(),
+            routine_engine: Arc::clone(&self.state.routine_engine),
+            startup_time: self.state.startup_time,
+            active_config: Arc::clone(&self.state.active_config),
+            secrets_store: self.state.secrets_store.clone(),
+            db_auth: self.state.db_auth.clone(),
+            pairing_store: self.state.pairing_store.clone(),
+            oauth_providers: self.state.oauth_providers.clone(),
+            oauth_state_store: self.state.oauth_state_store.clone(),
+            oauth_base_url: self.state.oauth_base_url.clone(),
+            oauth_allowed_domains: self.state.oauth_allowed_domains.clone(),
+            near_nonce_store: self.state.near_nonce_store.clone(),
+            near_rpc_url: self.state.near_rpc_url.clone(),
+            near_network: self.state.near_network.clone(),
+            oauth_sweep_shutdown: None, // sweep tasks are managed by with_oauth
+            // Preserve the existing cache — workspace state hasn't changed
+            // just because a `with_*` builder added a new subsystem.
+            frontend_html_cache: Arc::clone(&self.state.frontend_html_cache),
+            tool_dispatcher: self.state.tool_dispatcher.clone(),
         };
         mutate(&mut new_state);
         new_state.auth_manager = build_gateway_auth_manager(&new_state);

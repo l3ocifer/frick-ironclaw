@@ -80,7 +80,7 @@
 pub const WIT_TOOL_VERSION: &str = "0.3.0";
 
 /// Host WIT version for channel extensions.
-pub const WIT_CHANNEL_VERSION: &str = "0.3.0";
+pub const WIT_CHANNEL_VERSION: &str = "0.3.1";
 
 mod allowlist;
 mod capabilities;
@@ -93,8 +93,7 @@ mod limits;
 pub(crate) mod loader;
 mod rate_limiter;
 mod runtime;
-mod storage;
-pub mod verification;
+pub(crate) mod storage;
 mod wrapper;
 
 // Core types
@@ -149,6 +148,3 @@ pub use capabilities_schema::{
     AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema, RateLimitSchema,
     ToolFieldSetupSchema, ToolSetupFieldInputType, ToolSetupSchema, ValidationEndpointSchema,
 };
-
-// Checksum verification
-pub use verification::{ChecksumStore, ToolChecksum, VerifyResult};

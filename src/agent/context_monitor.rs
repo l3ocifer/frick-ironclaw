@@ -43,9 +43,6 @@ pub struct ContextMonitor {
     context_limit: usize,
     /// Threshold ratio for triggering compaction.
     threshold_ratio: f64,
-    /// Optional absolute floor (from reserveTokensFloor config).
-    /// When set, compaction triggers when remaining tokens < this floor.
-    reserve_tokens_floor: Option<usize>,
 }
 
 impl ContextMonitor {
@@ -54,7 +51,6 @@ impl ContextMonitor {
         Self {
             context_limit: DEFAULT_CONTEXT_LIMIT,
             threshold_ratio: COMPACTION_THRESHOLD,
-            reserve_tokens_floor: None,
         }
     }
 
@@ -70,12 +66,6 @@ impl ContextMonitor {
         self
     }
 
-    /// Set the reserve tokens floor (from config).
-    pub fn with_reserve_floor(mut self, floor: Option<usize>) -> Self {
-        self.reserve_tokens_floor = floor;
-        self
-    }
-
     /// Estimate the token count for a list of messages.
     pub fn estimate_tokens(&self, messages: &[ChatMessage]) -> usize {
         messages.iter().map(estimate_message_tokens).sum()
@@ -84,15 +74,6 @@ impl ContextMonitor {
     /// Check if compaction is needed.
     pub fn needs_compaction(&self, messages: &[ChatMessage]) -> bool {
         let tokens = self.estimate_tokens(messages);
-
-        // If reserve floor is set, use it as an alternative trigger
-        if let Some(floor) = self.reserve_tokens_floor {
-            let remaining = self.context_limit.saturating_sub(tokens);
-            if remaining < floor {
-                return true;
-            }
-        }
-
         let threshold = (self.context_limit as f64 * self.threshold_ratio) as usize;
         tokens >= threshold
     }

@@ -10,23 +10,31 @@ use crate::db::{Database, UserStore};
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::secrets::SecretsStore;
-use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
+use crate::tools::builder::{
+    BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder, SoftwareBuilder,
+};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CodeFilesTool, CodeReadTool, CodeSearchTool, CreateJobTool,
-    EchoTool, HttpTool, JobStatusTool, JsonTool, LearningCreateTool, LearningPromoteTool,
-    LearningSearchTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool,
-    MemoryTreeTool, MemoryWriteTool, PythonTool, ReadFileTool, ShellTool, TaskArchiveTool,
-    TaskCreateTool, TaskExportTool, TaskListTool, TaskReadyTool, TaskUpdateTool, TilthState,
-    TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool,
-    ToolSearchTool, WriteFileTool,
+    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool, FileUndoTool,
+    GlobTool, GrepTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool,
+    ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
+    PlanUpdateTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool, SkillListTool,
+    SkillRemoveTool, SkillSearchTool, TimeTool, ToolAuthTool, ToolInstallTool, ToolListTool,
+    ToolPermissionSetTool, ToolRemoveTool, ToolSearchTool, ToolUpgradeTool, WriteFileTool,
+    shared_file_history, shared_read_file_state,
+};
+use crate::tools::rate_limiter::RateLimiter;
+use crate::tools::tool::{
+    ApprovalRequirement, EngineVersion, Tool, ToolDiscoverySummary, ToolDomain,
 };
 use crate::tools::wasm::{
     Capabilities, OAuthRefreshConfig, ResourceLimits, SharedCredentialRegistry, WasmError,
     WasmStorageError, WasmToolRuntime, WasmToolStore, WasmToolWrapper,
 };
 use crate::workspace::Workspace;
-use crate::workspace::learnings::LearningRepository;
-use crate::workspace::tasks::TaskRepository;
+use ironclaw_llm::recording::HttpInterceptor;
+use ironclaw_llm::{LlmProvider, ToolDefinition};
+use ironclaw_skills::catalog::SkillCatalog;
+use ironclaw_skills::registry::SkillRegistry;
 
 /// Names of built-in tools that cannot be shadowed by dynamic registrations
 /// and should not be rebuilt by the self-repair system. Protected tools are
@@ -83,19 +91,27 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "routine_delete",
     "routine_fire",
     "routine_history",
-    "python",
-    "task_create",
-    "task_list",
-    "task_update",
-    "task_ready",
-    "task_export",
-    "task_archive",
-    "learning_create",
-    "learning_search",
-    "learning_promote",
-    "code_read",
-    "code_search",
-    "code_files",
+    "event_emit",
+    // Skill tools
+    "skill_list",
+    "skill_search",
+    "skill_install",
+    "skill_remove",
+    // Secret tools
+    "secret_list",
+    "secret_delete",
+    // Image tools
+    "image_generate",
+    "image_edit",
+    "image_analyze",
+    // Plan tools
+    "plan_update",
+    // Permission tools
+    "tool_permission_set",
+    // Pairing tools
+    "pairing_approve",
+    // Aliases (web_fetch is an alias for http in some contexts)
+    "web_fetch",
 ];
 
 /// Check if a tool name is a protected built-in that should not be rebuilt
@@ -391,6 +407,36 @@ impl ToolRegistry {
     /// don't need to know which engine is active.
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.tool_definitions_for_engine(self.engine_version).await
+    }
+
+    /// Get tool definitions for LLM function calling, filtered by both engine
+    /// version *and* the resolved runtime policy (#3045 PR 4 + PR 5).
+    ///
+    /// This is the model-facing tool list path: tools whose
+    /// [`Tool::runtime_affordance`] cannot be granted by the resolved
+    /// `EffectiveRuntimePolicy` are hidden before the model call. The
+    /// hosted-multi-tenant security property ("no provider-host shell visible
+    /// to the model") is enforced here. Action-time authorization in
+    /// `ironclaw_authorization` / `CapabilityHost` still runs for every
+    /// invocation that reaches dispatch.
+    pub async fn tool_definitions_visible_under(
+        &self,
+        policy: &ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy,
+    ) -> Vec<ToolDefinition> {
+        let version = self.engine_version;
+        let mut defs: Vec<ToolDefinition> = self
+            .tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| Self::is_engine_visible(tool.as_ref(), version))
+            .filter(|tool| {
+                crate::tools::runtime_filter::is_visible_under(policy, tool.runtime_affordance())
+            })
+            .map(Self::tool_definition)
+            .collect();
+        defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        defs
     }
 
     /// Get tool definitions filtered by engine version.
@@ -880,76 +926,6 @@ impl ToolRegistry {
             base_dir,
         )));
         tracing::debug!("Registered 1 vision tool (analyze)");
-    }
-
-    /// Register the sandboxed Python execution tool.
-    ///
-    /// Uses monty (Rust-native Python interpreter) for safe code execution
-    /// with configurable resource limits. No filesystem or network access.
-    pub fn register_python_tool(&self) {
-        self.register_sync(Arc::new(PythonTool::new()));
-        tracing::info!("Registered Python sandbox tool");
-    }
-
-    /// Register multi-agent task management tools.
-    ///
-    /// These allow agents to create, list, update, and coordinate tasks
-    /// across the multi-agent task graph stored in PostgreSQL.
-    pub fn register_task_tools(
-        &self,
-        repo: Arc<TaskRepository>,
-        agent_id: String,
-        user_id: String,
-    ) {
-        self.register_sync(Arc::new(TaskCreateTool::new(
-            Arc::clone(&repo),
-            agent_id.clone(),
-            user_id.clone(),
-        )));
-        self.register_sync(Arc::new(TaskListTool::new(
-            Arc::clone(&repo),
-            user_id.clone(),
-        )));
-        self.register_sync(Arc::new(TaskUpdateTool::new(
-            Arc::clone(&repo),
-            agent_id.clone(),
-            user_id.clone(),
-        )));
-        self.register_sync(Arc::new(TaskReadyTool::new(
-            Arc::clone(&repo),
-            agent_id,
-            user_id.clone(),
-        )));
-        self.register_sync(Arc::new(TaskExportTool::new(
-            Arc::clone(&repo),
-            user_id.clone(),
-        )));
-        self.register_sync(Arc::new(TaskArchiveTool::new(repo, user_id)));
-        tracing::info!("Registered 6 task management tools");
-    }
-
-    /// Register learning tools for the evidence-backed learnings system.
-    ///
-    /// Learning tools allow agents to create, search, and promote learnings
-    /// (actionable rules derived from experience). Stored in PostgreSQL.
-    pub fn register_learning_tools(&self, repo: Arc<LearningRepository>) {
-        self.register_sync(Arc::new(LearningCreateTool::new(Arc::clone(&repo))));
-        self.register_sync(Arc::new(LearningSearchTool::new(Arc::clone(&repo))));
-        self.register_sync(Arc::new(LearningPromoteTool::new(repo)));
-        tracing::info!("Registered 3 learning tools");
-    }
-
-    /// Register AST-aware code intelligence tools (tilth).
-    ///
-    /// These provide smart file reading (outline/full), symbol search (definitions
-    /// first via tree-sitter), and glob file finding with token estimates.
-    /// The shared `TilthState` holds an outline cache that persists across
-    /// invocations for session-level deduplication.
-    pub fn register_code_tools(&self, state: TilthState) {
-        self.register_sync(Arc::new(CodeReadTool::new(state.clone())));
-        self.register_sync(Arc::new(CodeSearchTool::new(state.clone())));
-        self.register_sync(Arc::new(CodeFilesTool::new(state)));
-        tracing::info!("Registered 3 code intelligence tools (tilth)");
     }
 
     /// Register the software builder tool.

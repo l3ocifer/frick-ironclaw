@@ -80,11 +80,6 @@ COPY tools-src/ tools-src/
 COPY channels-src/ channels-src/
 COPY registry/ registry/
 COPY wit/ wit/
-COPY vendor/ vendor/
-COPY skills/ skills/
-
-# Cargo validates all manifest targets; create stubs for examples we don't ship.
-RUN mkdir -p examples && echo 'fn main(){}' > examples/test_heartbeat.rs
 
 RUN set -eux; \
     mkdir -p /app/wasm-bundles/tools /app/wasm-bundles/channels; \
@@ -123,20 +118,15 @@ RUN set -eux; \
     echo "Built $count WASM extensions"; \
     [ "$count" -gt 0 ] || { echo "ERROR: No WASM extensions were built"; exit 1; }
 
-# Install tilth (AST-aware code intelligence for agents)
-RUN cargo install tilth --root /usr/local
-
-# Stage 2: Runtime
-FROM debian:bookworm-slim
+# Stage 5a: Shared runtime base
+FROM debian:bookworm-slim AS runtime-base
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/ironclaw /usr/local/bin/ironclaw
-COPY --from=builder /usr/local/bin/tilth /usr/local/bin/tilth
+COPY --from=builder /app/target/dist/ironclaw /usr/local/bin/ironclaw
 COPY --from=builder /app/migrations /app/migrations
-COPY --from=builder /app/skills /usr/local/bin/skills
 
 # Non-root user
 ENV HOME=/home/ironclaw

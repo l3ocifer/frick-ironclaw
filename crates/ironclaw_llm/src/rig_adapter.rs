@@ -440,6 +440,7 @@ fn extract_response(
                     // them. Without this, Gemini 2.5+ rejects the next
                     // request with HTTP 400. See #3225.
                     signature: tc.signature.clone(),
+                    arguments_parse_error: None,
                 });
             }
             AssistantContent::Reasoning(r) if !r.reasoning.is_empty() => {
@@ -676,6 +677,7 @@ where
             input_tokens: saturate_u32(response.usage.input_tokens),
             output_tokens: saturate_u32(response.usage.output_tokens),
             finish_reason: finish,
+            reasoning: None,
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),
             cache_creation_input_tokens: extract_cache_creation(&response.raw_response),
         };
@@ -745,6 +747,13 @@ where
             }
         }
 
+        // Strict-mode tool schemas advertise every optional as required+nullable,
+        // so the model fills unset optionals with `null`. Strip those placeholders
+        // against each tool's original schema so only provided values reach the
+        // tool. `false`: rig providers send `null`, not `""`, so a deliberately
+        // empty string from the model is preserved.
+        crate::tool_schema::strip_unset_optional_fields(&mut tool_calls, &request.tools, false);
+
         let resp = ToolCompletionResponse {
             content: text,
             tool_calls,
@@ -798,45 +807,14 @@ fn map_rig_error(model_name: &str, e: impl std::fmt::Display) -> LlmError {
     let msg = e.to_string();
     let lower = msg.to_ascii_lowercase();
 
-    const CONTEXT_PATTERNS: &[&str] = &[
-        "context_length_exceeded",
-        "maximum context length",
-        "too many tokens",
-        "payload too large",
-    ];
-
-    if CONTEXT_PATTERNS.iter().any(|p| lower.contains(p)) {
-        let (used, limit) = parse_token_counts(&lower);
+    if crate::error::is_context_length_error_message(&lower) {
+        let (used, limit) = crate::error::parse_context_token_counts(&lower);
         return LlmError::ContextLengthExceeded { used, limit };
     }
     LlmError::RequestFailed {
         provider: model_name.to_string(),
         reason: msg,
     }
-}
-
-/// Try to extract token counts from a context-length error message.
-///
-/// Handles patterns like:
-/// - "maximum context length is 128000 tokens. However, your messages resulted in 150000 tokens."
-/// - "context_length_exceeded ... 150000 tokens ... limit 128000"
-///
-/// Returns `(0, 0)` if parsing fails.
-pub(crate) fn parse_token_counts(lower: &str) -> (usize, usize) {
-    // OpenAI pattern: "maximum context length is {limit} tokens. ... resulted in {used} tokens"
-    if lower.contains("maximum context length") {
-        let numbers: Vec<usize> = lower
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse().ok())
-            .filter(|&n| n > 0)
-            .collect();
-        if numbers.len() >= 2 {
-            // First large number is typically the limit, second is the used count
-            return (numbers[1], numbers[0]);
-        }
-    }
-    (0, 0)
 }
 
 /// Normalize a tool call name returned by an OpenAI-compatible provider.
@@ -861,6 +839,39 @@ fn normalize_tool_name(name: &str, known_tools: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig::completion::CompletionError;
+    use rig::streaming::StreamingCompletionResponse;
+
+    #[derive(Clone)]
+    struct FailingCompletionModel;
+
+    impl CompletionModel for FailingCompletionModel {
+        type Response = serde_json::Value;
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self
+        }
+
+        async fn completion(
+            &self,
+            _request: RigRequest,
+        ) -> Result<rig::completion::CompletionResponse<Self::Response>, CompletionError> {
+            Err(CompletionError::ProviderError(
+                "HTTP 400 Bad Request: The input (314325 tokens) is longer than the model's context length (262144 tokens).".to_string(),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _request: RigRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            Err(CompletionError::ProviderError(
+                "stream unsupported".to_string(),
+            ))
+        }
+    }
 
     #[test]
     fn test_round_f32_to_f64_no_precision_artifacts() {
@@ -1617,6 +1628,7 @@ mod tests {
             arguments: serde_json::json!({"query": "test"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         };
         let msg = ChatMessage::assistant_with_tool_calls(Some("thinking".to_string()), vec![tc]);
         let messages = vec![msg];
@@ -1809,6 +1821,7 @@ mod tests {
             arguments: serde_json::json!({"query": "test"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         };
         let messages = vec![ChatMessage::assistant_with_tool_calls(None, vec![tc])];
         let (_preamble, history) = convert_messages(&messages);
@@ -1842,6 +1855,7 @@ mod tests {
             arguments: serde_json::json!({"query": "test"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         };
         let messages = vec![ChatMessage::assistant_with_tool_calls(None, vec![tc])];
         let (_preamble, history) = convert_messages(&messages);
@@ -1877,6 +1891,7 @@ mod tests {
             arguments: serde_json::json!({"query": "test"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         };
         let assistant_msg = ChatMessage::assistant_with_tool_calls(None, vec![tc]);
         let tool_result_msg = ChatMessage {
@@ -2199,6 +2214,7 @@ mod tests {
             arguments: serde_json::json!({"q": "rust"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         };
         let tc2 = IronToolCall {
             id: "call_b".to_string(),
@@ -2206,6 +2222,7 @@ mod tests {
             arguments: serde_json::json!({"url": "https://example.com"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         };
         let assistant = ChatMessage::assistant_with_tool_calls(None, vec![tc1, tc2]);
         let result_a = ChatMessage::tool_result("call_a", "search", "search results");
@@ -2511,6 +2528,40 @@ mod tests {
     }
 
     #[test]
+    fn test_map_rig_error_detects_longer_than_model_context_length() {
+        let err = map_rig_error(
+            "nearai",
+            "HTTP 400 Bad Request: The input (314325 tokens) is longer than the model's context length (262144 tokens).",
+        );
+        match err {
+            LlmError::ContextLengthExceeded { used, limit } => {
+                assert_eq!(used, 314325);
+                assert_eq!(limit, 262144);
+            }
+            other => panic!("Expected ContextLengthExceeded, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_maps_longer_than_context_error_to_context_length_exceeded() {
+        let adapter = RigAdapter::new(FailingCompletionModel, "nearai");
+        let err = adapter
+            .complete(CompletionRequest::new(vec![ChatMessage::user(
+                "read my email",
+            )]))
+            .await
+            .expect_err("context overflow should fail the completion");
+
+        match err {
+            LlmError::ContextLengthExceeded { used, limit } => {
+                assert_eq!(used, 314325);
+                assert_eq!(limit, 262144);
+            }
+            other => panic!("expected context-length error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_map_rig_error_bare_413_no_false_positive() {
         // Bare "413" should NOT trigger ContextLengthExceeded — avoids false
         // positives on timestamps ("2026-04-13"), token counts ("used 1413"),
@@ -2540,7 +2591,7 @@ mod tests {
     #[test]
     fn test_parse_token_counts_openai_format() {
         let msg = "this model's maximum context length is 128000 tokens. however, your messages resulted in 150000 tokens.";
-        let (used, limit) = parse_token_counts(msg);
+        let (used, limit) = crate::error::parse_context_token_counts(msg);
         assert_eq!(limit, 128000);
         assert_eq!(used, 150000);
     }
@@ -2548,7 +2599,7 @@ mod tests {
     #[test]
     fn test_parse_token_counts_unparseable_returns_zero() {
         let msg = "context_length_exceeded";
-        let (used, limit) = parse_token_counts(msg);
+        let (used, limit) = crate::error::parse_context_token_counts(msg);
         assert_eq!(used, 0);
         assert_eq!(limit, 0);
     }

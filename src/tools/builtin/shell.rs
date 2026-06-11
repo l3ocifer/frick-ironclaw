@@ -556,8 +556,6 @@ pub struct ShellTool {
     sandbox: Option<Arc<SandboxManager>>,
     /// Sandbox policy to use when sandbox is available.
     sandbox_policy: SandboxPolicy,
-    /// Command guard for blocking destructive commands.
-    command_guard: crate::safety::command_guard::CommandGuard,
 }
 
 /// Commands that read file contents. When these appear at the start of a command
@@ -782,18 +780,7 @@ impl ShellTool {
             allow_dangerous: false,
             sandbox: None,
             sandbox_policy: SandboxPolicy::ReadOnly,
-            command_guard: crate::safety::command_guard::CommandGuard::default(),
         }
-    }
-
-    /// Set a custom command guard configuration.
-    pub fn with_command_guard(
-        mut self,
-        enabled: bool,
-        fail_mode: crate::safety::command_guard::FailMode,
-    ) -> Self {
-        self.command_guard = crate::safety::command_guard::CommandGuard::new(enabled, fail_mode);
-        self
     }
 
     /// Set the working directory.
@@ -994,26 +981,7 @@ impl ShellTool {
         timeout: Option<u64>,
         extra_env: &HashMap<String, String>,
     ) -> Result<(String, i64), ToolError> {
-        // Check command guard first (dcg-inspired pattern matching)
-        let guard_verdict = self.command_guard.check(cmd);
-        if let crate::safety::command_guard::GuardVerdict::Block {
-            reason,
-            pack,
-            severity,
-            suggestion,
-        } = guard_verdict
-        {
-            let mut msg = format!(
-                "Command blocked by {} guard [{}]: {}",
-                pack, severity, reason
-            );
-            if let Some(alt) = suggestion {
-                msg.push_str(&format!("\n  Suggestion: {}", alt));
-            }
-            return Err(ToolError::NotAuthorized(msg));
-        }
-
-        // Legacy blocked commands check (fallback)
+        // Check for blocked commands
         if let Some(reason) = self.is_blocked(cmd) {
             return Err(ToolError::NotAuthorized(format!(
                 "{}: {}",
@@ -1081,6 +1049,15 @@ impl Tool for ShellTool {
         "Execute shell commands. Use for running builds, tests, git operations, and other CLI tasks. \
          Commands run in a subprocess with captured output. Long-running commands have a timeout. \
          When Docker sandbox is enabled, commands run in isolated containers for security."
+    }
+
+    fn runtime_affordance(&self) -> crate::tools::ToolRuntimeAffordance {
+        // Shell needs *some* process backend. Profiles that resolve to
+        // `process_backend == None` (e.g. `SecureDefault`) hide this tool
+        // from the model entirely. Tenant/org-dedicated process backends
+        // satisfy the affordance — the tool runs inside the matching
+        // sandbox, not on the provider host.
+        crate::tools::ToolRuntimeAffordance::AnyProcess
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

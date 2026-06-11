@@ -319,8 +319,37 @@ pub enum WorkspaceError {
     #[error("Heartbeat error: {reason}")]
     HeartbeatError { reason: String },
 
-    #[error("Storage error: {reason}")]
-    StorageError { reason: String },
+    #[error("I/O error: {reason}")]
+    IoError { reason: String },
+
+    #[error("Layer not found: {name}")]
+    LayerNotFound { name: String },
+
+    #[error("Layer '{name}' is read-only")]
+    LayerReadOnly { name: String },
+
+    #[error("Cannot write sensitive content: no private layer available for redirect")]
+    PrivacyRedirectFailed,
+
+    #[error("Write rejected for '{path}': prompt injection detected ({reason})")]
+    InjectionRejected { path: String, reason: String },
+
+    #[error("Version not found: document {document_id} version {version}")]
+    VersionNotFound { document_id: Uuid, version: i32 },
+
+    #[error("Patch failed for '{path}': {reason}")]
+    PatchFailed { path: String, reason: String },
+
+    #[error("Schema validation failed for '{path}': {}", errors.join("; "))]
+    SchemaValidation { path: String, errors: Vec<String> },
+
+    /// A user-supplied path or key was rejected by structural validation
+    /// (path-traversal, character set, length). Distinct from
+    /// `SchemaValidation` so callers can tell "your *content* is wrong"
+    /// from "your *key/path* is wrong" without string-matching error
+    /// messages.
+    #[error("Invalid path '{path}': {reason}")]
+    InvalidPath { path: String, reason: String },
 }
 
 /// Orchestrator errors (internal API, container management).

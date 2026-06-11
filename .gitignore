@@ -15,8 +15,12 @@ integrations/abound/tests/source_env_vars.sh
 # Stale insta snapshot proposals (review via `cargo insta review`)
 *.snap.new
 
+# Added by review-implementation skill
+.review/
+
 # Claude Code worktrees and lock files
 .claude/worktrees/
+.cr-worktrees/
 .claude/scheduled_tasks.lock
 
 # Sidecar tool data
@@ -42,10 +46,29 @@ artifacts/
 
 # WASM build artifacts (loaded from disk, not bundled)
 *.wasm
+!crates/ironclaw_first_party_extensions/assets/*/wasm/*.wasm
 
-# Reference repos (cloned locally, not committed)
-examples/reference-repos/
+# Traces
+trace_*.json
 
-# Sealed secrets (generated per-cluster, never commit)
-k8s/overlays/*/sealed-secret.yaml
+# Local Claude Code settings (machine-specific, should not be committed)
+.claude/settings.local.json
+.worktrees/
+.ironclaw/
+.review/
 
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+engine_trace_*.json
+tests/fixtures/llm_traces/live/github_dev_workflow_full_loop.json
+tests/fixtures/llm_traces/live/github_dev_workflow_full_loop.log
+# Per-test live-replay logs — generated when running `--ignored` live
+# tests locally. Only the .json fixtures for each scenario are checked
+# in; the .log files are local debugging artifacts.
+tests/fixtures/llm_traces/live/*.log
+
+# Local test artifacts
+.anvil/

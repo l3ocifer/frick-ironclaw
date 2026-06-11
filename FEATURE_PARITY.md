@@ -21,9 +21,9 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 |---------|----------|----------|-------|
 | Hub-and-spoke architecture | ✅ | ✅ | Web gateway as central hub |
 | WebSocket control plane | ✅ | ✅ | Gateway with WebSocket + SSE |
-| Single-user system | ✅ | ✅ | |
-| Multi-agent routing | ✅ | 🚧 | Task graph + workspace isolation per-agent |
-| Session-based messaging | ✅ | ✅ | Per-sender sessions |
+| Single-user system | ✅ | ✅ | Explicit instance owner scope for persistent routines, secrets, jobs, settings, extensions, and workspace memory |
+| Multi-agent routing | ✅ | ❌ | Workspace isolation per-agent |
+| Session-based messaging | ✅ | ✅ | Owner scope is separate from sender identity and conversation scope |
 | Loopback-first networking | ✅ | ✅ | HTTP binds to 0.0.0.0 but can be configured |
 
 ### Owner: _Unassigned_
@@ -48,7 +48,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Tailscale integration | ✅ | ❌ | |
 | Health check endpoints | ✅ | ✅ | /api/health + /api/gateway/status + /healthz + /readyz, with channel-backed readiness probes |
 | `doctor` diagnostics | ✅ | 🚧 | 16 checks: settings, LLM, DB, embeddings, routines, gateway, MCP, skills, secrets, service, Docker daemon, tunnel binaries |
-| Agent event broadcast | ✅ | 🚧 | SSE broadcast manager exists (SseManager) but tool/job-state events not fully wired |
+| Agent event broadcast | ✅ | 🚧 | SSE broadcast manager exists (SseManager). Reborn has a transport-neutral projection EventStreamManager with access/admission/rebase/lag/redaction contracts, product-safe capability activity events plus bounded display-preview events, live thinking projection updates, and the local-dev WebUI serve path now wires it into `/events` and `/ws` through the WebUI product facade; local-dev WebUI also persists terminal tool previews as ordered transcript items and includes their timeline message ids on live preview events. Production durable/live fanout remains follow-up work. |
 | Channel health monitor | ✅ | ❌ | Auto-restart with configurable interval |
 | Presence system | ✅ | ❌ | Beacons on connect, system presence for agents |
 | Trusted-proxy auth mode | ✅ | ❌ | Header-based auth for reverse proxies; `trustedProxy.allowLoopback` for same-host reverse proxies |
@@ -84,6 +84,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | iMessage | ✅ | ❌ | P3 | BlueBubbles or Linq recommended |
 | Linq | ✅ | ❌ | P3 | Real iMessage via API, no Mac required |
 | Feishu/Lark | ✅ | 🚧 | P3 | WASM channel with Event Subscription v2.0; Bitable/Docx tools planned |
+| WeCom | ✅ | 🚧 | P2 | Standalone WASM channel focused on WeCom intelligent bot WebSocket inbound/outbound, pairing, group sessions, inbound media hydration, and direct Bot media upload/send; self-built app callback + Agent API deferred |
 | LINE | ✅ | ❌ | P3 | |
 | WeChat (iLink bot) | ✅ | 🚧 | P2 | Extension-first channel (`channels-src/wechat`), single-account DM flow with QR login, typing, image send/receive, inbound file/voice/video handling, outbound image/video/file media, and SILK-to-WAV voice fallback; multi-account remains deferred |
 | WebChat | ✅ | ✅ | - | Web gateway chat |
@@ -224,14 +225,14 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | `config` | ✅ | ✅ | - | Read/write config plus validate/path helpers |
 | `backup` | ✅ | ❌ | P3 | Create/verify local backup archives |
 | `channels` | ✅ | 🚧 | P2 | `list` implemented; `enable`/`disable`/`status` deferred pending config source unification |
-| `models` | ✅ | 🚧 | P1 | `models list [<provider>]` (`--verbose`, `--json`; fetches live model list when provider specified), `models status` (`--json`), `models set <model>`, `models set-provider <provider> [--model model]` (alias normalization, config.toml + .env persistence). Remaining: `set` doesn't validate model against live list. |
+| `models` | ✅ | 🚧 | P1 | Reborn now uses a shared composition provider-admin facade for CLI `models list [<provider>]` (`--verbose`, `--json`), `models status`, `models set <model>`, `models set-provider <provider> [--model model]`, plus Product Workflow typed `model set-provider ...` parsing without touching v1 state. Remaining: live model fetching, OAuth/API-key login flows, and wiring the provider-admin ProductCommandService into product surfaces. |
 | `status` | ✅ | ✅ | - | System status (enriched session details) |
 | `agents` | ✅ | ❌ | P3 | Multi-agent management |
 | `sessions` | ✅ | ❌ | P3 | Session listing (shows subagent models) |
 | `memory` | ✅ | ✅ | - | Memory search CLI |
-| `skills` | ✅ | ✅ | - | Agent skills (SKILL.md discovery, eligibility, progressive loading) |
-| `pairing` | ✅ | ✅ | - | list/approve for channel DM pairing |
-| `nodes` | ✅ | ❌ | P3 | Device management |
+| `skills` | ✅ | ✅ | - | CLI subcommands (list, search, info) + agent tools + web API endpoints |
+| `pairing` | ✅ | ✅ | - | list/approve, account selector |
+| `nodes` | ✅ | ❌ | P3 | Device management, remove/clear flows |
 | `plugins` | ✅ | ❌ | P3 | Plugin management |
 | `hooks` | ✅ | ✅ | P2 | `hooks list` (bundled + plugin discovery, `--verbose`, `--json`) |
 | `cron` | ✅ | 🚧 | P2 | list/create/edit/enable/disable/delete/history; TODO: `cron run`, model/thinking fields |
@@ -241,6 +242,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | `sandbox` | ✅ | ✅ | - | WASM sandbox |
 | `doctor` | ✅ | 🚧 | P2 | 16 subsystem checks |
 | `logs` | ✅ | 🚧 | P3 | `logs` (gateway.log tail), `--follow` (SSE live stream), `--level` (get/set). No DB-persisted log history. |
+| `traces` | ➖ | 🚧 | - | <ul><li>IronClaw-native Trace Commons client MVP, not an OpenClaw parity feature.</li><li>Local opt-in capture, redaction, queueing, queue-status diagnostics, scoped web APIs, revocation, and periodic credit notices.</li><li>CLI opt-in writes the runtime/web user-scope policy that autonomous capture reads, and credentialed submit/status/revoke calls use bounded no-redirect HTTP.</li><li>Authenticated web paths are user-scoped and keep ingestion endpoint/credential settings out of user-managed policy updates.</li><li>Private TraceDAO server ingest/review/export/audit/retention/vector/credit infrastructure now lives in the standalone `tracedao-server` repository, with IronClaw retaining CLI/client integration wrappers.</li></ul> |
 | `update` | ✅ | ❌ | P3 | Self-update; `OPENCLAW_NO_AUTO_UPDATE=1` kill-switch |
 | `completion` | ✅ | ✅ | - | Shell completion |
 | `migrate` | ✅ | ❌ | P3 | Bundled importers for Claude Code, Claude Desktop, Hermes (config, MCP servers, skills, command prompts, model providers, credentials) |
@@ -263,7 +265,29 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | `/diagnostics` (owner-only) | ✅ | ❌ | P3 | Owner-only diagnostics export with sensitive-data preamble |
 | `/codex computer-use status/install` | ✅ | ❌ | P3 | Codex desktop control setup with marketplace discovery |
 | `/dock-*` route switches | ✅ | ❌ | P3 | Switch active session reply route through `session.identityLinks` |
-| `--container` / `OPENCLAW_CONTAINER` | ✅ | ❌ | P3 | Run CLI commands inside running Docker/Podman container |
+| `--container` / `OPENCLAW_CONTAINER` | ✅ | ❌ | P3 | Run process commands inside running Docker/Podman container |
+
+Trace Commons incremental note: reviewer quarantine and active-learning queues now surface prioritization metadata, including `review_age_hours`, `review_escalation_state`, and `review_escalation_reasons`, so CLI non-JSON output can show SLA pressure and escalation causes during triage. DB-backed review leases now let reviewer/admin principals claim, release, claim the next available tenant-scoped quarantined trace, or claim a bounded prioritized batch through `POST /v1/review/leases/claim-next`, `POST /v1/review/leases/claim-batch`, `ironclaw traces review-lease-claim-next`, and `ironclaw traces review-lease-claim-batch`, using review escalation/SLA priority ordering before writing DB lease state and typed claim/release audit rows; they also expose lease assignment metadata in review queues, support `all`, `mine`, `available`, `active`, and `expired` lease filters in API/CLI/web operator queues, and block other reviewers from finalizing while a lease is active. Analytics can now suppress aggregate cells below a configured minimum count while reporting the suppression threshold and number of hidden buckets. Tenant token entries can now carry optional RFC3339 `expires_at`/`expires` attributes, and the ingest service can accept optional HS256 signed tenant claims that bind tenant id, actor principal, role, issuer/audience when configured, allowed consent scopes/uses, and expiry without enumerating every bearer token; claim allow-lists now constrain submission, replay exports, benchmark/ranker dataset generation, process-evaluation workers, and utility-credit jobs. Operator docs now pin production asymmetric upload-claim governance to managed issuer/key rotation with EdDSA/Ed25519, leaving static tokens and HS256 claims as internal bridge paths, and `TRACE_COMMONS_REQUIRE_EDDSA_SIGNED_TOKENS` now rejects those bridge credentials on every authenticated route when enabled. Keyed signed-token secrets and EdDSA public-key files support `kid`-selected rotation, deployments can cap signed-claim lifetimes by requiring `iat` and bounding `exp - iat`, require JWT IDs before accepting signed claims, emergency-denylist signed-claim JWT IDs by `jti`, and config status exposes only key/EdDSA-key/denylist/max-TTL/JTI-policy counts plus the EdDSA-required auth gate while submitted audit rows record only the safe auth method plus hashed principal. Retention maintenance also honors `TRACE_COMMONS_LEGAL_HOLD_RETENTION_POLICIES` so configured policy classes are skipped for new expiration and purge passes, and DB-backed maintenance runs now write durable retention job/item ledger rows for resumable expire/purge/revoke bookkeeping with admin-only API plus CLI and web-operator reads for tenant-scoped jobs and per-submission lifecycle items. Maintenance DB reconciliation now runs after the retention ledger write and reports DB retention job/item counts plus current-run retention job or item-count gaps as promotion blockers. Process-evaluation workers have a CLI submit helper for `POST /v1/workers/process-evaluation`, store bounded rubric metadata under the `process_evaluation` worker kind, mirror typed hash/count-only audit metadata, can optionally append idempotent `training_utility` delayed credit for the evaluated accepted submission using an external reference, preserve separate DB derived rows per evaluator version while feeding content-free process-evaluation analytics by label, rating, and score band without double-counting DB-backed submissions, and now require tenant policy or signed-claim evaluation-use ABAC before reading or labeling accepted trace bodies. Utility-credit workers now also require the source trace plus tenant policy or signed claim to allow the requested regression/evaluation, model-training, or ranking-training utility use before appending delayed credit. Object-primary envelope writes now use unique encrypted artifact object ids per logical snapshot so review/process-evaluation writes do not overwrite ciphertext behind older submitted-envelope object refs, terminal-trace status sync can explain retained-but-excluded delayed ledger rows without exposing them through contributor credit-event reads, web enqueue/submit and CLI queue writes reject crafted requests/envelopes that try to include message text or tool payloads disallowed by the standing policy, DB stores now reject derived rows, vector entries, and export manifest items whose object, derived, or vector refs do not belong to the same tenant/submission, periodic local credit notices now include delayed ledger deltas plus credit-event counts and a scoped durable retry outbox with safe delivery attempt hashes, CLI status sync resets credit notices when delayed-credit explanations change even without a numeric delta, and autonomous runtime capture skips ineligible current traces instead of leaving held queue files while preserving queue flush/credit notices.
+
+This push also adds local autonomous queue diagnostics/status surfaces: CLI `traces queue-status` reports readiness, bearer-token environment presence, queue/held counts, retry/manual-review/policy hold counts, next retry time, durable flush/status-sync telemetry, retryable submission failure counters, last compaction reclaimed count, duplicate envelopes removed, orphan hold sidecars removed, malformed envelopes quarantined, sanitized held-reason counts, safe queue warning aggregates, warning severity, production-promotion blocking flags, safe recommended actions, sanitized failure classes, and local credit summaries; authenticated web `/api/traces/queue-status` reports scoped queue/held diagnostics plus the same durable telemetry, and `/api/traces/credit-notice` marks due notices. Due credit notices now carry local acknowledge/snooze state: CLI `traces credit --notice --ack` and authenticated `POST /api/traces/credit-notice` acknowledgement suppress the current credit fingerprint until credit changes, while `--snooze-hours` and the matching web action suppress it until a bounded deadline without exposing trace bodies or explanation text in the fingerprint. The agent loop now runs a periodic Trace Commons queue worker for opted-in owner/active-user scopes, stores retryable submission failures as typed redacted sidecars with capped backoff, skips retry-held envelopes until due, records durable scoped telemetry for queue/status-sync attempts, writes queue JSON through atomic temp-file replacement, compacts duplicate queued contribution envelopes and orphan held sidecars before submission, quarantines malformed active queue files locally instead of blocking later valid uploads, and broadcasts returned credit notices. Diagnostics warn on schema-version, consent-policy, redaction-pipeline, trace-card-redaction-pipeline, and malformed-envelope mismatches without raw bodies or raw observed mismatch values, and classify local failures into sanitized Endpoint, Credential, Network, NetworkOffline, NetworkDns, NetworkTimeout, NetworkConnectionRefused, HttpRejection, Policy, Queue, StatusSync, Submission, and Unknown buckets. EdDSA/Ed25519 public-key verification is available through default or `kid`-selected key config and JSON/file/guarded-HTTPS keysets with optional activation windows, with safe total/active/inactive/managed EdDSA config-status counts; managed EdDSA-required mode now accepts only active managed-keyset claims with issuer/audience checks. Autonomous clients can refresh short-lived EdDSA upload claims from guarded HTTPS issuers for queue flush, explicit submit, status sync, and remote revoke calls, and ingestion services now refresh guarded HTTPS issuer-managed Ed25519 keysets live with last-good preservation and optional max-stale fail-closed enforcement.
+
+Trace Commons hardening note: required DB mirror mode, object refs, PostgreSQL/libSQL storage, RLS diagnostics, and encrypted artifact storage now live in the public `zmanian/tracedao-server` repo rather than Ironclaw's shared DB abstraction. Ironclaw retains local-first trace contribution capture, upload-claim fetching/validation, queue/status/credit notice behavior, and client-facing CLI/web helpers behind the Reborn-aligned `TraceClientHost` product facade for local redaction, queueing, status sync, and credit-notice delivery.
+
+Trace Commons production-boundary note: PostgreSQL/libSQL now include a durable tenant-scoped revocation-propagation ledger for downstream invalidation and retry work across object refs, exports, vectors, derived artifacts, benchmark/ranker artifacts, credit settlements, and physical delete receipts. The revocation worker can now reverse exact tenant-scoped delayed-credit settlements with deterministic negative ledger rows, verify and physically delete exact service-local encrypted submitted/review envelope, vector worker-intermediate, benchmark artifact, and ranker export provenance object payloads for tenant-scoped object-ref items, mark matching object refs deleted, and upsert durable physical-delete receipt rows with evidence hashes, while marking unsupported stores and artifact kinds as skipped. Export call sites for replay, benchmark, and ranker slices now create and validate short-lived tenant/principal/purpose/dataset-kind access grants before producing artifacts. `TRACE_COMMONS_OBJECT_STORE=remote_service` parses production remote object-store intent but deliberately fails closed behind a disabled service-owned provider instead of falling back to plaintext files. Local autonomous status sync now keeps append-only safe history events and sanitizes server-returned credit explanations before periodic credit notices persist them, and local credit notice delivery now drains a scoped retry outbox so channel failures leave retry state instead of consuming the notice.
+
+Trace Commons revocation-worker note: the ingest service now recognizes a scoped `revocation_worker` role and exposes `POST /v1/workers/revocation-propagation` for DB-backed propagation runs. The worker claims due tenant-scoped ledger items, performs idempotent metadata/vector/export invalidation actions, reverses exact delayed-credit settlement targets with deterministic audit-safe ledger rows, physically deletes hash-verified service-local submitted/review envelope, vector worker-intermediate, benchmark artifact, and ranker export provenance payloads for exact object-ref targets, records durable physical-delete receipt items after successful or already-recorded service-local payload deletion, records unsupported physical-delete stores/artifact kinds as explicit skipped items, preserves other tenants' due work, and emits safe audit counts.
+
+Trace Commons vector-lifecycle note: vector indexing now writes deterministic local redacted-summary feature embeddings into encrypted service-local `WorkerIntermediate` vector payload objects while keeping relational vector rows metadata-only. PostgreSQL/libSQL storage can invalidate one vector entry for a tenant/submission/vector id, revocation propagation requires a vector-entry target for vector invalidation instead of broad accidental invalidation, and service-local vector payload deletes verify the encrypted object as a vector artifact before marking the object ref deleted and recording a physical-delete receipt.
+
+Trace Commons export-job note: replay dataset, benchmark conversion, ranker-candidate, and ranker-pair export call sites now mirror their short-lived one-shot access grants plus running/complete export job lifecycle rows into the PostgreSQL/libSQL DB control plane. Required DB mirror mode now fails closed if a durable export job cannot be started or completed, replay exports now mark already-started DB job rows `failed` when metadata or required object-ref body reads fail before publication, benchmark/ranker exports do the same for metadata/source collection, source object-ref revalidation, and source-read audit failures before artifact publication, and tests cover tenant-scoped grant/job persistence plus replay and benchmark/ranker failure terminalization.
+
+Trace Commons worker-export note: export-worker automation now has dedicated replay and ranker export routes, `GET|POST /v1/workers/replay-export`, `GET|POST /v1/workers/ranker/training-candidates`, and `GET|POST /v1/workers/ranker/training-pairs`, plus matching CLI helpers. These routes reuse the same consent/use ABAC, access-grant, export-job, source-hash, audit, and delayed-credit behavior as the reviewer/admin routes while keeping scheduled automation off reviewer endpoints.
+
+Trace Commons export-control observability note: admins can now list tenant-scoped durable export access grants and export jobs through `GET /v1/admin/export/access-grants` and `GET /v1/admin/export/jobs`, with status and dataset-kind filters plus matching CLI helpers. `GET /v1/admin/operational-summary` and `ironclaw traces operational-summary` now add an admin-only, tenant-scoped aggregate rollout view for submission status/risk, review SLA pressure, DB export manifests/jobs, retention jobs, vector coverage, and delayed-credit totals. Reads are DB-backed where applicable, admin-only, tenant-scoped, and audited without exposing trace bodies.
+
+Trace Commons tenant-access grant note: PostgreSQL/libSQL now include a durable tenant-scoped `trace_tenant_access_grants` storage surface for issuer-authorized principals, roles, consent scopes, allowed uses, issuer/audience/subject attribution, status, expiry, revocation metadata, and safe metadata. Admin-token routes and CLI helpers can create, list, and revoke the current tenant's grants while writing safe hash/count-only grant-update audit metadata, and the local `tenant-principal-ref` CLI helper derives stored static-token or signed-claim principal refs without printing raw credentials. `TRACE_COMMONS_REQUIRE_TENANT_ACCESS_GRANTS=true` now fails closed on trace submission, contributor credit/status readback, reviewer/audit reads, review mutations, dataset/export paths, non-revocation worker mutations, maintenance, and admin ledger/observability reads unless the authenticated tenant/principal has an active exact-role grant. Signed EdDSA/Ed25519 claims must also match any issuer, audience, and JWT `sub` subject bindings configured on the grant before scope/use narrowing is applied, while static-token bridge grants ignore those signed-claim-only bindings. Grant consent/use allow-lists intersect with static-token or EdDSA claim allow-lists and cannot upgrade the request role; revocation/self-delete, revocation propagation, config-status, tenant-policy admin, and grant-management routes stay available for deprovisioning and recovery.
+
+Trace Commons issuer/TenantCtx note: the server-side `zmanian/tracedao-server` split now owns the standalone EdDSA/Ed25519-only `tracedao-upload-claim-issuer` binary that signs short-lived contributor upload claims, authenticates workload JWTs with EdDSA only, enforces workload issuer/audience/expiry plus consent/use narrowing, optionally connects to PostgreSQL/libSQL from deployment config to require DB-backed contributor tenant-access grants using the same signed-principal hash shape as ingest, rejects RSA key material, and publishes the ingest-compatible `kid`/`public_key_pem` keyset shape. The ingest compatibility layer also now fails closed when file-backed submission metadata, derived rows, credit ledger rows, audit rows, revocation tombstones, replay manifests, export provenance, or benchmark artifacts are read from one authenticated tenant directory but carry a different embedded tenant id or tenant storage ref; service-local object-ref reads/deletes also verify tenant key refs, encrypted benchmark artifact reads verify the decrypted body tenant, and vector payload deletes verify the encrypted payload body's tenant storage ref before physical deletion.
 
 ### Owner: _Unassigned_
 
@@ -280,23 +304,61 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Global sessions | ✅ | ❌ | Optional shared context |
 | Session pruning | ✅ | ❌ | Auto cleanup old sessions; oversized `sessions.json` rotation removed; entry/age caps enforced at load |
 | Context compaction | ✅ | ✅ | Auto summarization |
-| Custom system prompts | ✅ | ✅ | Template variables |
-| Skills (modular capabilities) | ✅ | ✅ | 97 bundled skills: multi-source discovery, eligibility, progressive disclosure |
-| Thinking modes (low/med/high) | ✅ | ❌ | Configurable reasoning depth |
+| Compaction model override | ✅ | ❌ | Use a dedicated provider/model for summarization only; `agents.defaults.compaction.memoryFlush.model` exact override |
+| Compaction mid-turn precheck | ✅ | ❌ | `agents.defaults.compaction.midTurnPrecheck` triggers before next tool call instead of end-of-turn |
+| Post-compaction read audit | ✅ | ❌ | Layer 3: workspace rules appended to summaries |
+| Post-compaction context injection | ✅ | ❌ | Workspace context as system event |
+| Compaction start/end notices | ✅ | ❌ | Opt-in lifecycle notices during compaction |
+| Custom system prompts | ✅ | ✅ | Template variables, safety guardrails |
+| Skills (modular capabilities) | ✅ | ✅ | Prompt-based skills with trust gating, attenuation, activation criteria, catalog, selector; Reborn local-dev now uses catalog/list-first model-selected activation before loading full skill context |
+| Skill Workshop plugin | ✅ | ❌ | Captures reusable workflow corrections as pending or auto-applied workspace skills, threshold-based reviewer |
+| Grouped skill directories | ✅ | ✅ | `skills/<group>/<skill>/SKILL.md` discovery |
+| Skill installer metadata | ✅ | ❌ | One-click install recipes (npm/pip), API key entry, source metadata |
+| Skill routing blocks | ✅ | 🚧 | ActivationCriteria (keywords, patterns, tags) but no "Use when / Don't use when" blocks |
+| Skill path compaction | ✅ | ❌ | ~ prefix to reduce prompt tokens |
+| Thinking modes (off/minimal/low/medium/high/xhigh/adaptive/max) | ✅ | 🚧 | thinkingConfig for Gemini models; no per-level control yet; Anthropic Opus 4.7 `xhigh`+`adaptive`+`max`; DeepSeek V4 `xhigh`/`max` |
+| Per-model thinkingDefault override | ✅ | ❌ | Override thinking level per model; Anthropic Claude 4.6/4.7 defaults to adaptive |
+| Adaptive→provider thinking maps | ✅ | ❌ | `/think adaptive` maps to Gemini dynamic thinking, Anthropic adaptive, OpenAI flex |
+| Native Codex app-server runtime | ✅ | ➖ | New embedded Codex harness with PreToolUse/PostToolUse/PermissionRequest relay; replaces ACP for `codex/*` models |
+| Codex Computer Use | ✅ | ❌ | Desktop control setup with marketplace discovery, fail-closed MCP checks |
+| Codex hooks bridge | ✅ | ❌ | Codex-native tool hooks → OpenClaw plugin hooks/approvals |
+| Codex sub-agent metadata | ✅ | ❌ | Native Codex sub-agent session metadata without nested gateway patch |
+| Codex context-engine integration | ✅ | ❌ | Bootstrap, assembly, post-turn maintenance, engine-owned compaction in Codex sessions |
+| Active Memory plugin | ✅ | ❌ | Dedicated memory sub-agent right before main reply; configurable message/recent/full context modes; partial-recall on timeout; per-conversation `allowedChatIds`/`deniedChatIds` filters |
+| Inferred follow-up commitments | ✅ | ❌ | Opt-in hidden batched extraction with per-agent/per-channel scoping, heartbeat delivery, CLI management; `commitments.enabled`/`maxPerDay` |
+| `sessions_yield` | ✅ | ❌ | Orchestrators end current turn immediately, skip queued tool work, carry hidden follow-up payload to next turn |
+| Subagent forked context | ✅ | ❌ | Optional inherit-requester-transcript for native `sessions_spawn` |
+| `agents.defaults.contextInjection: "never"` | ✅ | ❌ | Disable workspace bootstrap injection per-agent |
+| `agents.defaults.experimental.localModelLean` | ✅ | ❌ | Drop heavyweight default tools for weaker local models |
+| `agents.files.get/set` workspace tools | ✅ | 🚧 | First-party scoped read/write/list/glob/grep/apply_patch capabilities exist through Reborn HostRuntime; OpenClaw-compatible `agents.files.*` aliases and realpath-via-fd hardening still pending |
+| Trajectory export | ✅ | ❌ | Default-on local trajectory capture; `/export-trajectory` bundles with redacted transcripts/events/artifacts |
 | Block-level streaming | ✅ | ❌ | |
 | Tool-level streaming | ✅ | ❌ | |
 | Z.AI tool_stream | ✅ | ❌ | Real-time tool call streaming |
 | Plugin tools | ✅ | ✅ | WASM tools |
-| Tool policies (allow/deny) | ✅ | ✅ | |
+| GSuite WASM tools | ✅ | 🚧 | Reborn bundles operation-level Google Drive/Docs/Sheets/Slides WASM packages with host-mediated HTTP egress, product-auth scoped bearer injection, and manifest-declared Google OAuth setup metadata; full live-recorded parity remains follow-up |
+| Hosted MCP extensions | ✅ | 🚧 | Reborn composes host-mediated MCP runtime, bundles the current Notion MCP supported tool set, wires Notion ProductAuth OAuth exchange/refresh, can use Reborn ProductAuth DCR OAuth setup through the host callback origin, and can activate hosted MCP packages with live `tools/list` schema discovery through host-staged product-auth credentials |
+| NEAR AI MCP extension | ✅ | 🚧 | Host-bundled Reborn MCP extension exposes `nearai.search` via host-mediated HTTP and `llm_nearai_api_key`; manifest-declared product-auth credentials can now be staged through the hosted MCP runtime/discovery bridge, while NEAR remains a static supported-tool adapter |
+| Tool policies (allow/deny) | ✅ | ✅ | Reborn now stores scoped persistent `AlwaysAllow` approval policies for manifest-allow capabilities and replays them at the current sandbox scope; product-facing revoke paths remain follow-up while the policy-store revoke interface is available |
 | Exec approvals (`/approve`) | ✅ | ✅ | TUI approval overlay |
 | Tool inventory cache | ✅ | ❌ | Coalesced effective-tool inventory cache with channel-registry invalidation |
 | Pending exec approval `errorMessage` cleanup | ✅ | ❌ | Failed restart-interrupted approval-pending sessions instead of replaying stale ids |
 | Elevated mode | ✅ | ❌ | Privileged execution |
-| Subagent support | ✅ | ✅ | Task framework |
-| Sandboxed Python execution | ❌ | ✅ | monty (Rust-native Python interpreter) |
-| Task graph (multi-agent) | ❌ | ✅ | PostgreSQL DAG, beads-compatible JSONL |
-| Semantic file merge | ❌ | ✅ | weave-core entity-level 3-way merge |
-| Auth profiles | ✅ | ❌ | Multiple auth strategies |
+| Subagent support | ✅ | ✅ | Task framework; spawn-by-account-aware bindings, model overrides preserved; Reborn `spawn_subagent` is blocking-only while background delivery is deferred (#4147) |
+| `/subagents spawn` command | ✅ | ❌ | Spawn from chat |
+| Auth profiles | ✅ | ❌ | Multiple auth strategies; replaceDefaultModels migration semantics |
+| Generic API key rotation | ✅ | ❌ | Rotate keys across providers |
+| Stuck loop detection | ✅ | ❌ | Exponential backoff on stuck agent loops; unknown-tool guard default-on |
+| llms.txt discovery | ✅ | ❌ | Auto-discover site metadata |
+| Multiple images per tool call | ✅ | ❌ | Single tool call, multiple images |
+| Web search extension | ✅ | 🚧 | Host-bundled `web-access` extension provides no-config Exa MCP search and saved-result content retrieval; Brave backend and generic fetch parity still pending |
+| URL allowlist (web_search/fetch) | ✅ | ❌ | Restrict web tool targets |
+| suppressToolErrors config | ✅ | ❌ | Hide tool errors from user |
+| Intent-first tool display | ✅ | ❌ | Details and exec summaries |
+| Transcript file size in status | ✅ | ❌ | Show size in session status |
+| Stuck-session recovery | ✅ | ❌ | Conservative recovery releases stale lanes while preserving active embedded runs/replies |
+| `Runner:` in `/status` | ✅ | ❌ | Reports embedded Pi/CLI-backed/ACP harness in session status |
+| Voice Wake routing | ✅ | ❌ | Wake phrases can target named agent or session via gateway routing APIs |
 
 ### Owner: _Unassigned_
 
@@ -307,13 +369,42 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Provider | OpenClaw | IronClaw | Priority | Notes |
 |----------|----------|----------|----------|-------|
 | NEAR AI | ✅ | ✅ | - | Primary provider |
-| Anthropic (Claude) | ✅ | 🚧 | - | Via NEAR AI proxy |
-| OpenAI | ✅ | 🚧 | - | Via NEAR AI proxy |
-| AWS Bedrock | ✅ | ❌ | P3 | |
-| Google Gemini | ✅ | ✅ | - | via `rig::providers::gemini` (full support) |
-| OpenRouter | ✅ | ✅ | - | Native intelligent router (`src/llm/router.rs`) — 15-dimension weighted classification, 4 profiles (auto/eco/premium/free), session pinning, rate-limit cooldown, agentic detection |
-| Ollama (local) | ✅ | ✅ | - | via `rig::providers::ollama` (full support) |
-| node-llama-cpp | ✅ | ➖ | - | N/A for Rust |
+| Anthropic (Claude) | ✅ | 🚧 | - | Via NEAR AI proxy; Opus 4.7 (default, adaptive+xhigh+max), Opus 4.6, Sonnet 4.6 |
+| OpenAI | ✅ | 🚧 | - | Via NEAR AI proxy; GPT-5.5 default, GPT-5.4-pro forward-compat, Codex OAuth, Responses API; image generation (`gpt-image-2`) via Codex OAuth |
+| OpenAI Codex (native app-server) | ✅ | ➖ | - | App-server >=0.125.0 with native MCP hooks, dynamic tools, approval relay |
+| AWS Bedrock | ✅ | ✅ | - | Native Converse API; Claude Opus 4.7 thinking profile (xhigh/adaptive/max); IAM bearer token refresh for Mantle |
+| Google Gemini | ✅ | ✅ | - | OAuth (PKCE + S256), function calling, thinkingConfig, generationConfig; TTS (`gemini-embedding-2-preview`); image gen native API; ADC-backed Vertex |
+| Google Gemini Live (realtime) | ✅ | ❌ | - | Realtime voice provider for Voice Call/Google Meet, bidirectional audio + function calls |
+| io.net | ✅ | ✅ | P3 | Via `ionet` adapter |
+| Mistral | ✅ | ✅ | P3 | Via `mistral` adapter; Voice Call streaming STT |
+| Yandex AI Studio | ✅ | ✅ | P3 | Via `yandex` adapter |
+| Cloudflare Workers AI | ✅ | ✅ | P3 | Via `cloudflare` adapter |
+| NVIDIA API | ✅ | ✅ | P3 | Via `nvidia` adapter; OpenClaw added bundled provider with API-key onboarding, static catalog, literal model-ref picker, NIM string-content compat |
+| OpenRouter | ✅ | ✅ | - | Via OpenAI-compatible provider; OpenClaw added native video generation, `openrouter:auto`/`openrouter:free` aliases, Hunter/Healer Alpha, free-model fallback for `models scan` |
+| Tinfoil | ❌ | ✅ | - | Private inference provider (IronClaw-only) |
+| OpenAI-compatible | ❌ | ✅ | - | Generic OpenAI-compatible endpoint (RigAdapter); OpenAI-style image inputs default missing `image_url.detail` to `auto` |
+| GitHub Copilot | ✅ | ✅ | - | Dedicated provider with OAuth token exchange; default Opus model is `claude-opus-4.7`; GUI/RPC wizard device-code auth; `gpt-5.4` xhigh thinking |
+| Ollama (local) | ✅ | ✅ | - | OpenClaw added Cloud + Local + cloud-only modes, browser sign-in, signed `/api/experimental/web_search`, `params.num_ctx`/`params.think`/`params.keep_alive`, `/api/show` capability detection |
+| Perplexity | ✅ | ❌ | P3 | Freshness parameter for web_search |
+| MiniMax | ✅ | ❌ | P3 | Regional endpoint selection; portal OAuth + Token Plan + `MINIMAX_API_KEY`; image-01, music-2.6, video; `MiniMax-VL-01` for vision |
+| GLM-5 | ✅ | ✅ | P3 | Via Z.AI provider (`zai`) using OpenAI-compatible chat completions |
+| Tencent Cloud (TokenHub) | ✅ | ❌ | P3 | Bundled provider; Hy3 catalog with tiered pricing |
+| DeepInfra | ✅ | ❌ | P3 | Bundled provider with `DEEPINFRA_API_KEY`, dynamic OpenAI-compatible discovery, image gen/edit, image/audio understanding, TTS, text-to-video, embeddings |
+| Cerebras | ✅ | ❌ | P3 | Bundled plugin with onboarding, static catalog, manifest endpoint metadata |
+| Z.AI / GLM-5 | ✅ | ✅ | - | OpenClaw added bundled GLM catalog/auth in plugin manifest, `params.preserveThinking` for `reasoning_content` replay |
+| Qwen / Model Studio | ✅ | ❌ | P3 | Standard DashScope endpoints (CN + global) + Coding Plan; vLLM Qwen thinking controls |
+| DeepSeek | ✅ | ❌ | P3 | V4 Pro/V4 Flash bundled, V4 Flash onboarding default, native `xhigh`/`max` thinking levels, `reasoning_content` replay support |
+| Moonshot / Kimi | ✅ | ❌ | P3 | Kimi K2.6 default; native Anthropic-format tool calls; CN API endpoint support; `kimi-coding` web search via `KIMI_API_KEY` |
+| xAI | ✅ | ❌ | P3 | Image gen (`grok-imagine-image`/`pro`), reference-image edits, six TTS voices (MP3/WAV/PCM/G.711), `grok-stt` audio transcription, realtime STT for Voice Call |
+| Tencent Yuanbao | ✅ | ❌ | P3 | External plugin (`openclaw-plugin-yuanbao`) for chat |
+| Vercel AI Gateway | ✅ | ❌ | P3 | Provider-owned thinking levels for trusted upstream refs |
+| Codex/OpenAI image generation | ✅ | ❌ | P2 | `gpt-image-2`/`gpt-image-1.5` via Codex OAuth or API key; multipart reference-image edits; Azure deployment-scoped image URLs |
+| OpenRouter image/video generation | ✅ | ❌ | P3 | Image gen + reference edits; native video generation through `video_generate` |
+| MiniMax music/video | ✅ | ❌ | P3 | `music-2.6`, `video_generate`, `MiniMax-portal` registration |
+| Google Veo (video gen) | ✅ | ❌ | P3 | Direct MLDev `video.uri` downloads; REST `predictLongRunning` fallback |
+| fal Seedance 2.0 | ✅ | ❌ | P3 | Reference-to-video with multi-image/video/audio input |
+| Comfy (image/video/music) | ✅ | ❌ | P3 | `plugins.entries.comfy.config` workflow + cloud auth |
+| node-llama-cpp | ✅ | ➖ | - | OpenClaw made it optional (no longer auto-installed); local embeddings now opt-in |
 | llama.cpp (native) | ❌ | 🔮 | P3 | Rust bindings |
 
 ### Model Features
@@ -322,7 +413,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 |---------|----------|----------|-------|
 | Auto-discovery | ✅ | ❌ | Manifest-backed `modelCatalog` with aliases/suppressions; cold installed-index fast path |
 | Failover chains | ✅ | ✅ | `FailoverProvider` with configurable `fallback_model` |
-| Cooldown management | ✅ | ✅ | Lock-free per-provider cooldown in `FailoverProvider` + router 60s cooldowns |
+| Cooldown management | ✅ | ✅ | Lock-free per-provider cooldown in `FailoverProvider` |
 | Per-session model override | ✅ | ✅ | Model selector in TUI |
 | Model selection UI | ✅ | ✅ | TUI keyboard shortcut; OpenClaw added Quick Settings, mobile-aware picker |
 | Per-model thinkingDefault | ✅ | ❌ | Override thinking level per model in config |
@@ -583,6 +674,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Feature | OpenClaw | IronClaw | Priority | Notes |
 |---------|----------|----------|----------|-------|
 | Cron jobs | ✅ | ✅ | - | Routines with cron trigger; runtime state split into `jobs-state.json`; `sessionTarget: "current"`/`session:<id>` bindings |
+| Reborn scheduled trigger loop | ➖ | 🚧 | P2 | Reborn-native trigger persistence, backend parity, atomic fire claim/update APIs, poller core, caller-level harness, first-party `trigger_*` capabilities, and composition-owned worker lifecycle are in progress; external result delivery, production readiness policy, active-run retention/tombstone semantics, and production jitter source selection remain follow-up |
 | Per-job model fallback override | ✅ | ❌ | P2 | `payload.fallbacks` overrides agent-level fallbacks |
 | Cron stagger controls | ✅ | ❌ | P3 | Default stagger for scheduled jobs |
 | Cron finished-run webhook | ✅ | ❌ | P3 | Webhook on job completion |
@@ -632,7 +724,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Device pairing | ✅ | ❌ | Single-use bootstrap setup codes; metadata-upgrade auto-approval for shared-secret loopback; scope/role/metadata pairing approval flows |
 | Tailscale identity | ✅ | ❌ | Tailscale-authenticated Control UI bypass for browser device identity |
 | Trusted-proxy auth | ✅ | ❌ | Header-based reverse proxy auth; `trustedProxy.allowLoopback` |
-| OAuth flows | ✅ | 🚧 | NEAR AI OAuth + Gemini OAuth (PKCE, S256) + hosted extension/MCP OAuth broker; external auth-proxy rollout still pending; OpenClaw added bootstrap-token redemption scope allowlist |
+| OAuth flows | ✅ | 🚧 | NEAR AI OAuth + Gemini OAuth (PKCE, S256) + hosted extension/MCP OAuth broker; external auth-proxy rollout still pending; OpenClaw added bootstrap-token redemption scope allowlist. Reborn `serve` now has browser SSO login for WebChat v2 (Google + GitHub; Google PKCE S256, state CSRF, cleartext-redirect guard) behind `webui-v2-beta`, with fail-closed verified-email-domain admission and per-user identity binding (distinct OAuth identity → distinct user, stateless tenant-bound HMAC session). Local-dev trigger polling also seeds admitted WebUI SSO users into trigger-fire access when enabled |
 | DM pairing verification | ✅ | ✅ | ironclaw pairing approve, host APIs |
 | Allowlist/blocklist | ✅ | 🚧 | allow_from + pairing store; canonical `dmPolicy="open"` only with effective wildcard across all channels |
 | Per-group tool policies | ✅ | ❌ | Group-id validation against session/spawned context before applying group-scoped tool policies |
@@ -643,10 +735,10 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | SSRF IPv6 transition bypass block | ✅ | ❌ | Block IPv4-mapped IPv6 bypasses |
 | Cron webhook SSRF guard | ✅ | ❌ | SSRF checks on webhook delivery |
 | Loopback-first | ✅ | 🚧 | HTTP binds 0.0.0.0 |
-| Docker sandbox | ✅ | ✅ | Orchestrator/worker containers; opt-in `sandbox.docker.gpus` passthrough |
+| Docker sandbox | ✅ | ✅ | Orchestrator/worker containers; opt-in `sandbox.docker.gpus` passthrough; Reborn process sandbox MVP adds typed `SandboxProcessPlan`, backend-neutral `ProcessSandboxBackend`, hardened Docker command construction, fail-closed unenforced network hosts, explicit timeout/cancel cleanup, loop-to-host `SandboxProcessPlan` validation/spawn dispatch, and a host-runtime approval/lease spawn path for `system.process_sandbox.run`; production MITM broker/product wiring still partial |
 | Podman support | ✅ | ❌ | `--container` accepts both Docker + Podman |
 | WASM sandbox | ❌ | ✅ | IronClaw innovation |
-| Sandbox env sanitization | ✅ | 🚧 | Shell tool scrubs env vars (secret detection); docker container env sanitization partial |
+| Sandbox env sanitization | ✅ | 🚧 | Shell tool scrubs env vars (secret detection); Reborn process sandbox rejects sensitive raw env values in plans and uses placeholders for brokered credentials, but production secure-capture and MITM transport wiring remain partial |
 | `OPENCLAW_*` env block | ✅ | ❌ | Untrusted workspace `.env` cannot inject OpenClaw runtime-control vars |
 | Workspace `.env` injection blocks | ✅ | ❌ | Block `CLOUDSDK_PYTHON`, ambient Homebrew, Windows system PATH vars, `MINIMAX_API_HOST`, `npm_execpath` |
 | Tool policies | ✅ | ✅ | |
@@ -731,19 +823,16 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ### P1 - High Priority
 
-- ❌ Slack channel (real implementation)
+- 🚧 Slack channel (real implementation): Reborn host-beta route can be explicitly mounted by `ironclaw-reborn serve` with Slack Events API signing, DM/app-mention routing through Product Workflow/Reborn, final-reply delivery, host-state-backed personal binding pairing, WebUI v2 admin-managed allowed-channel picker, durable WebUI channel-route assignment APIs, provider-side default outbound target inventory for shared channels and explicitly provisioned personal DMs, and deterministic chat-side connect action metadata; DMs execute as the paired actor, while shared channel turns route to allowed dynamic or static channel subjects and fail closed for unrouted channels in admin-managed mode; production install/setup hardening and fuller E2E coverage remain follow-up.
 - ✅ Telegram channel (WASM, polling-first setup, DM pairing, caption, /start)
 - ❌ WhatsApp channel
 - ✅ Multi-provider failover (`FailoverProvider` with retryable error classification)
 - ✅ Hooks system (core lifecycle hooks + bundled/plugin/workspace hooks + outbound webhooks)
 
 ### P2 - Medium Priority
-- ✅ Cron job scheduling (routines)
-- ✅ Web Control UI (chat, memory, jobs, logs, extensions, routines)
-- ✅ WebChat channel (web gateway)
-- 🚧 Media handling (caption support; no image/PDF processing)
-- ✅ CLI subcommands (onboard, config, status, memory, doctor)
-- ✅ Ollama/local model support (default: qwen3-coder:30b)
+
+- ❌ Media handling (images, PDFs)
+- ✅ Ollama/local model support (via rig::providers::ollama)
 - ❌ Configuration hot-reload
 - ✅ Tool-driven webhook ingress (`/webhook/tools/{tool}` -> host-verified + tool-normalized `system_event` routines)
 - ❌ Channel health monitor with auto-restart
@@ -753,11 +842,21 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 - ❌ Discord channel
 - ❌ Matrix channel
-- ❌ Other messaging platforms
-- ❌ TTS/audio features
-- ❌ Video support
-- ✅ Skills system (97 skills in src/skills/, SKILL.md discovery from 6 sources, eligibility, progressive loading)
-- ❌ Plugin registry
+- ❌ Other messaging platforms (Yuanbao, WeCom, Google Meet, Voice Call)
+- ❌ TTS/audio features (12+ providers added in OpenClaw; see Section 6 TTS/STT subsection)
+- ❌ Video support (OpenRouter/MiniMax/Veo/fal/Sora)
+- 🚧 Skills routing blocks (activation criteria exist, but no "Use when / Don't use when")
+- ❌ Plugin registry / persisted plugin index / `git:` installs
+- ❌ Streaming (block/tool/Z.AI tool_stream)
+- ❌ Memory: temporal decay, MMR re-ranking, query expansion, multimodal indexing, people-aware wiki
+- ❌ Control UI i18n (now 12+ locales upstream)
+- ❌ Stuck loop detection
+- ❌ Codex native app-server runtime + Computer Use
+- ❌ Talk Mode / realtime voice (browser + backend)
+- ❌ OpenTelemetry diagnostics + Prometheus exporter
+- ❌ Active Memory + Skill Workshop + Trajectory export
+- ❌ Outbound proxy routing + `proxy validate`
+- ❌ `migrate` (Claude/Hermes import)
 
 ---
 
@@ -786,33 +885,8 @@ IronClaw intentionally differs from OpenClaw in these ways:
 4. **NEAR AI focus**: Primary provider with session-based auth
 5. **No mobile/desktop apps**: Focus on server-side and CLI initially
 6. **WASM channels**: Novel extension mechanism not in OpenClaw
-7. **Sandboxed Python**: monty — Rust-native Python interpreter with resource limits + external function bridge
-8. **Task graph**: PostgreSQL DAG for multi-agent coordination (beads-inspired) + memory decay archival
-9. **Semantic merge**: weave-core entity-level 3-way merge, wired into workspace write path for auto-merge
-10. **Bundled skills**: 97 skills bundled in repo, auto-discovered from exe/env/CWD
-11. **Token compression**: 5-stage deterministic pipeline (observations, dedup, dictionary, patterns, text opt) + salience scoring wired into compaction
-12. **Command guard**: 20 security packs covering git, filesystem, database, containers, cloud, system, storage, secrets, remote, CI/CD, networking, DNS, backup, messaging, search, package managers, env vars
-13. **Integrity monitor**: SHA-256 workspace file drift detection, wired into heartbeat cycle
-14. **Intelligent LLM router**: 15-dimension weighted classifier, 4 routing profiles, 24-model catalog, session pinning, rate-limit cooldown, agentic auto-detection, cost estimation with savings tracking
-15. **Database MCP tooling**: [genai-toolbox](https://github.com/googleapis/genai-toolbox) assessed for structured DB tools via MCP sidecar (Phase 6 — K3s deployment)
-16. **BOOT.md on startup**: Runs workspace BOOT.md as first agent turn with full tool access on gateway start
-17. **Memory flush with tools**: Pre-compaction flush executes memory tools (memory_write, memory_read, memory_search, memory_append) in a loop (max 3 iterations)
-18. **Daily session reset**: Auto-resets sessions at configurable hour boundary (default: disabled, set `daily_reset_hour` 0-23)
-19. **Learnings system**: Evidence-backed rules with confidence scoring, observation counting, dedup, lifecycle (candidate→active→deprecated), 3 LLM tools, active learnings injected into system prompt
-20. **Salience scoring**: Turn/session importance scoring for intelligent compaction (preserves high-salience turns verbatim, summarizes low-salience)
-21. **Cross-machine session merge**: Content-hash dedup prevents duplicate session files during Frack↔Frick database sync
+7. **Tinfoil private inference**: IronClaw-only provider for private/encrypted inference
+8. **GitHub WASM tool**: Native GitHub integration as WASM tool
+9. **Prompt-based skills**: Different approach than OpenClaw capability bundles (trust gating, attenuation)
 
 These are intentional architectural choices, not gaps to be filled.
-
-### Reference Repo Count
-
-25 repositories assessed in `examples/reference-repos/`. See [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md) for full assessment of each.
-
-### Roadmap from Reference Repos
-
-| Pattern | Source | Priority | Status |
-|---------|--------|----------|--------|
-| Learnings system (evidence-backed rules) | contrail | Phase 6b | ✅ Done — PostgreSQL-backed with 3 LLM tools + prompt injection |
-| Salience scoring for compaction | contrail | Phase 6b | ✅ Done — turn/session scoring, salience-based partition in compaction |
-| Cross-machine session merge | contrail | Phase 6b | ✅ Done — content-hash dedup on session save |
-| Database MCP toolbox | genai-toolbox | Phase 6 | Planned |

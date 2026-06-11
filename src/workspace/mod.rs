@@ -42,23 +42,27 @@
 
 mod chunker;
 mod document;
-mod embedding_cache;
-mod embeddings;
 pub mod extension_state;
 pub mod hygiene;
-pub mod learnings;
-mod logseq;
-pub mod merge;
+pub mod layer;
+pub mod privacy;
+mod reborn_identity_context;
 #[cfg(feature = "postgres")]
 mod repository;
 pub mod schema;
 mod search;
-pub mod tasks;
+pub mod settings_adapter;
+pub use settings_adapter::WorkspaceSettingsAdapter;
+pub mod settings_schemas;
 
 pub use chunker::{ChunkConfig, chunk_document};
-pub use document::{MemoryChunk, MemoryDocument, WorkspaceEntry, paths};
-pub use embeddings::{EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OpenAiEmbeddings};
-pub use logseq::load_logseq_context;
+pub use document::{
+    ADMIN_SCOPE, CONFIG_FILE_NAME, ChunkWrite, DocumentMetadata, DocumentVersion, HygieneMetadata,
+    IDENTITY_PATHS, MemoryChunk, MemoryDocument, PatchResult, VersionSummary, WorkspaceEntry,
+    content_sha256, is_config_path, is_identity_path, is_reserved_scope, merge_workspace_entries,
+    paths,
+};
+pub use reborn_identity_context::WorkspaceIdentityContextSource;
 #[cfg(feature = "postgres")]
 pub use repository::Repository;
 pub use search::{
@@ -84,6 +88,9 @@ use deadpool_postgres::Pool;
 use uuid::Uuid;
 
 use crate::error::WorkspaceError;
+use ironclaw_embeddings::{
+    CachedEmbeddingProvider, EmbeddingCacheConfig, EmbeddingError, EmbeddingProvider,
+};
 use ironclaw_safety::{Sanitizer, Severity};
 
 /// Files injected into the system prompt. Writes to these are scanned for
@@ -349,58 +356,143 @@ impl WorkspaceStorage {
         }
     }
 
-    /// Check if a document with this content hash exists for the given user.
-    /// Used for cross-machine session dedup (Phase 6b).
-    async fn has_content_hash(
+    // ==================== Multi-scope read methods ====================
+
+    async fn hybrid_search_multi(
         &self,
-        user_id: &str,
-        content_hash: &str,
-    ) -> Result<bool, WorkspaceError> {
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        embedding: Option<&[f32]>,
+        config: &SearchConfig,
+    ) -> Result<Vec<SearchResult>, WorkspaceError> {
         match self {
             #[cfg(feature = "postgres")]
-            Self::Repo(repo) => repo.has_content_hash(user_id, content_hash).await,
-            Self::Db(_) => Ok(false), // Not supported for generic DB backend
+            Self::Repo(repo) => {
+                repo.hybrid_search_multi(user_ids, agent_id, query, embedding, config)
+                    .await
+            }
+            Self::Db(db) => {
+                db.hybrid_search_multi(user_ids, agent_id, query, embedding, config)
+                    .await
+            }
         }
     }
 
-    /// Set the content hash for a document (after write).
-    async fn set_content_hash(
+    async fn get_document_by_path_multi(
         &self,
-        doc_id: Uuid,
-        content_hash: &str,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        path: &str,
+    ) -> Result<MemoryDocument, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.get_document_by_path_multi(user_ids, agent_id, path)
+                    .await
+            }
+            Self::Db(db) => {
+                db.get_document_by_path_multi(user_ids, agent_id, path)
+                    .await
+            }
+        }
+    }
+
+    // ==================== Metadata ====================
+
+    async fn update_document_metadata(
+        &self,
+        id: Uuid,
+        metadata: &serde_json::Value,
     ) -> Result<(), WorkspaceError> {
         match self {
             #[cfg(feature = "postgres")]
-            Self::Repo(repo) => repo.set_content_hash(doc_id, content_hash).await,
-            Self::Db(_) => Ok(()), // No-op for generic DB backend
+            Self::Repo(repo) => repo.update_document_metadata(id, metadata).await,
+            Self::Db(db) => db.update_document_metadata(id, metadata).await,
         }
     }
-}
 
-/// Maximum characters per file loaded into the bootstrap system prompt.
-/// Files exceeding this are truncated with a 70/20/10 head/tail split.
-/// ~20K chars ≈ ~5K tokens — leaves room for multiple files in context.
-const BOOTSTRAP_FILE_BUDGET: usize = 20_000;
-
-/// Truncate content for bootstrap injection using a 70/20/10 head/tail split.
-///
-/// If `content` fits within `budget`, returns it unchanged.
-/// Otherwise: 70% from the head, 20% from the tail, 10% for the marker.
-/// This preserves the most important parts (beginning = structure/identity,
-/// end = recent entries) while cutting the stale middle.
-fn truncate_bootstrap(content: &str, budget: usize) -> String {
-    if content.len() <= budget {
-        return content.to_string();
+    async fn find_config_documents(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.find_config_documents(user_id, agent_id).await,
+            Self::Db(db) => db.find_config_documents(user_id, agent_id).await,
+        }
     }
-    let head_budget = budget * 70 / 100;
-    let tail_budget = budget * 20 / 100;
-    let head = &content[..head_budget];
-    let tail = &content[content.len().saturating_sub(tail_budget)..];
-    let cut_chars = content.len() - head_budget - tail_budget;
-    format!(
-        "{}\n\n[...{} characters truncated...]\n\n{}",
-        head, cut_chars, tail
-    )
+
+    // ==================== Versioning ====================
+
+    async fn save_version(
+        &self,
+        document_id: Uuid,
+        content: &str,
+        content_hash: &str,
+        changed_by: Option<&str>,
+    ) -> Result<i32, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.save_version(document_id, content, content_hash, changed_by)
+                    .await
+            }
+            Self::Db(db) => {
+                db.save_version(document_id, content, content_hash, changed_by)
+                    .await
+            }
+        }
+    }
+
+    async fn get_version(
+        &self,
+        document_id: Uuid,
+        version: i32,
+    ) -> Result<DocumentVersion, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.get_version(document_id, version).await,
+            Self::Db(db) => db.get_version(document_id, version).await,
+        }
+    }
+
+    async fn list_versions(
+        &self,
+        document_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<VersionSummary>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.list_versions(document_id, limit).await,
+            Self::Db(db) => db.list_versions(document_id, limit).await,
+        }
+    }
+
+    #[allow(dead_code)] // Part of WorkspaceStore trait; used by DB backends directly
+    async fn get_latest_version_number(
+        &self,
+        document_id: Uuid,
+    ) -> Result<Option<i32>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.get_latest_version_number(document_id).await,
+            Self::Db(db) => db.get_latest_version_number(document_id).await,
+        }
+    }
+
+    async fn prune_versions(
+        &self,
+        document_id: Uuid,
+        keep_count: i32,
+    ) -> Result<u64, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => repo.prune_versions(document_id, keep_count).await,
+            Self::Db(db) => db.prune_versions(document_id, keep_count).await,
+        }
+    }
 }
 
 /// Default template seeded into HEARTBEAT.md on first access.
@@ -1088,101 +1180,6 @@ impl Workspace {
         self.storage.get_document_by_id(doc.id).await
     }
 
-    /// Write content with automatic semantic merge on conflict.
-    ///
-    /// If `expected_base` is provided and differs from the current content,
-    /// a 3-way semantic merge is performed using weave-core. This prevents
-    /// data loss when multiple agents edit the same file concurrently.
-    ///
-    /// - If the file is new or empty, writes directly.
-    /// - If `expected_base` matches current content, writes directly (no conflict).
-    /// - If `expected_base` differs from current content, performs a 3-way merge
-    ///   using `merge_prefer_ours()` which auto-resolves conflicts by preferring
-    ///   the local agent's version.
-    ///
-    /// Returns the final document after write.
-    pub async fn write_with_merge(
-        &self,
-        path: &str,
-        content: &str,
-        expected_base: Option<&str>,
-    ) -> Result<MemoryDocument, WorkspaceError> {
-        let normalized = normalize_path(path);
-        let doc = self
-            .storage
-            .get_or_create_document_by_path(&self.user_id, self.agent_id, &normalized)
-            .await?;
-
-        let current_content = &doc.content;
-
-        // Determine if we need to merge
-        let final_content = match expected_base {
-            Some(base) if !current_content.is_empty() && current_content != base => {
-                // Conflict: current content has changed since our base
-                tracing::info!(
-                    path = normalized,
-                    base_len = base.len(),
-                    ours_len = content.len(),
-                    theirs_len = current_content.len(),
-                    "Concurrent edit detected, performing semantic merge"
-                );
-
-                let merged = merge::merge_prefer_ours(base, content, current_content, &normalized);
-
-                tracing::debug!(
-                    path = normalized,
-                    merged_len = merged.len(),
-                    "Semantic merge complete"
-                );
-
-                merged
-            }
-            _ => {
-                // No conflict: either no base, empty file, or base matches current
-                content.to_string()
-            }
-        };
-
-        self.storage
-            .update_document(doc.id, &final_content)
-            .await?;
-        self.reindex_document(doc.id).await?;
-        self.storage.get_document_by_id(doc.id).await
-    }
-
-    /// Write with content-hash dedup for cross-machine session merge.
-    ///
-    /// Computes a SHA-256 hash of the content and checks if a document with
-    /// that hash already exists for this user. If it does, skip the write
-    /// (idempotent). This prevents duplicate session files when Frack and
-    /// Frick sync their workspace databases.
-    ///
-    /// Returns `Ok(true)` if content was written, `Ok(false)` if deduplicated.
-    pub async fn write_dedup(
-        &self,
-        path: &str,
-        content: &str,
-    ) -> Result<bool, WorkspaceError> {
-        use sha2::{Digest, Sha256};
-
-        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
-
-        // Check if content with this hash already exists
-        if self.storage.has_content_hash(&self.user_id, &hash).await? {
-            tracing::debug!(
-                path = path,
-                hash = &hash[..12],
-                "Content-hash dedup: skipping duplicate write"
-            );
-            return Ok(false);
-        }
-
-        // Write normally, then set the content_hash
-        let doc = self.write(path, content).await?;
-        self.storage.set_content_hash(doc.id, &hash).await?;
-        Ok(true)
-    }
-
     /// Append content to a file.
     ///
     /// Creates the file if it doesn't exist.
@@ -1646,30 +1643,85 @@ impl Workspace {
 
     /// Build the system prompt from identity files.
     ///
-    /// Loads AGENTS.md, SOUL.md, USER.md, and IDENTITY.md, then daily logs.
-    /// When `include_memory` is true (main/direct session only), also loads MEMORY.md
-    /// and optionally prepends `logseq_context` for Logseq bootstrap.
-    pub async fn system_prompt(
+    /// Loads AGENTS.md, SOUL.md, USER.md, IDENTITY.md, and (in non-group
+    /// contexts) MEMORY.md to compose the agent's system prompt.
+    ///
+    /// Shorthand for `system_prompt_for_context(false)`.
+    pub async fn system_prompt(&self) -> Result<String, WorkspaceError> {
+        self.system_prompt_for_context(false).await
+    }
+
+    /// Build the system prompt with timezone-aware daily log dates.
+    ///
+    /// Uses the given timezone to determine "today" and "yesterday" for daily log injection.
+    pub async fn system_prompt_for_context_tz(
         &self,
-        include_memory: bool,
-        logseq_context: Option<&str>,
+        is_group_chat: bool,
+        tz: chrono_tz::Tz,
     ) -> Result<String, WorkspaceError> {
-        self.system_prompt_with_learnings(include_memory, logseq_context, None)
+        self.system_prompt_for_context_inner(is_group_chat, Some(tz))
             .await
     }
 
-    /// Build system prompt with optional learnings context.
+    /// Build the system prompt, optionally excluding personal memory.
     ///
-    /// `learnings_context` is a pre-formatted string of active learnings.
-    /// Only injected in main sessions (same privacy scope as MEMORY.md).
-    ///
-    /// Files exceeding `BOOTSTRAP_FILE_BUDGET` chars are truncated using a 70/20/10
-    /// head/tail split: 70% from the head, 20% from the tail, middle cut with marker.
-    pub async fn system_prompt_with_learnings(
+    /// When `is_group_chat` is true, MEMORY.md is excluded to prevent
+    /// leaking personal context into group conversations.
+    pub async fn system_prompt_for_context(
         &self,
-        include_memory: bool,
-        logseq_context: Option<&str>,
-        learnings_context: Option<&str>,
+        is_group_chat: bool,
+    ) -> Result<String, WorkspaceError> {
+        self.system_prompt_for_context_inner(is_group_chat, None)
+            .await
+    }
+
+    /// Inner implementation for system prompt building.
+    /// Read the admin system prompt, using the shared cache if available.
+    ///
+    /// Returns `None` if no admin prompt has been set, the document is empty,
+    /// or a non-recoverable error occurred. Only `DocumentNotFound` is silent;
+    /// other errors are logged at `debug!`.
+    async fn read_admin_prompt(&self) -> Option<String> {
+        // Fast path: check shared cache.
+        if let Some(ref cache) = self.admin_prompt_cache {
+            let guard = cache.read().await;
+            if let Some(ref content) = *guard {
+                return if content.is_empty() {
+                    None
+                } else {
+                    Some(content.clone())
+                };
+            }
+        }
+
+        // Slow path: DB read.
+        let result = match self
+            .storage
+            .get_document_by_path(ADMIN_SCOPE, None, paths::SYSTEM)
+            .await
+        {
+            Ok(doc) if !doc.content.is_empty() => Some(doc.content),
+            Ok(_) => None,
+            Err(WorkspaceError::DocumentNotFound { .. }) => None,
+            Err(e) => {
+                tracing::debug!("Failed to read admin system prompt: {}", e);
+                return None; // Don't cache errors
+            }
+        };
+
+        // Populate cache.
+        if let Some(ref cache) = self.admin_prompt_cache {
+            let mut guard = cache.write().await;
+            *guard = Some(result.clone().unwrap_or_default());
+        }
+
+        result
+    }
+
+    async fn system_prompt_for_context_inner(
+        &self,
+        is_group_chat: bool,
+        tz: Option<chrono_tz::Tz>,
     ) -> Result<String, WorkspaceError> {
         let mut parts = Vec::new();
 
@@ -1734,8 +1786,7 @@ impl Workspace {
             if let Ok(doc) = self.read_primary(path).await
                 && !doc.content.is_empty()
             {
-                let content = truncate_bootstrap(&doc.content, BOOTSTRAP_FILE_BUDGET);
-                parts.push(format!("{}\n\n{}", header, content));
+                parts.push(format!("{}\n\n{}", header, doc.content));
             }
         }
 
@@ -1772,30 +1823,7 @@ impl Workspace {
                 } else {
                     "## Yesterday's Notes"
                 };
-                let content = truncate_bootstrap(&doc.content, BOOTSTRAP_FILE_BUDGET);
-                parts.push(format!("{}\n\n{}", header, content));
-            }
-        }
-
-        // Long-term memory: only in main/direct sessions (privacy).
-        if include_memory {
-            let mut memory_parts = Vec::new();
-            if let Some(ctx) = logseq_context.filter(|s| !s.is_empty()) {
-                memory_parts.push(format!("## Logseq Memory Context\n\n{}", ctx));
-            }
-            if let Ok(doc) = self.read(paths::MEMORY).await {
-                if !doc.content.is_empty() {
-                    let content = truncate_bootstrap(&doc.content, BOOTSTRAP_FILE_BUDGET);
-                    memory_parts.push(content);
-                }
-            }
-            if !memory_parts.is_empty() {
-                parts.push(format!("## Long-term Memory\n\n{}", memory_parts.join("\n\n---\n\n")));
-            }
-
-            // Active learnings (experience-derived rules)
-            if let Some(ctx) = learnings_context.filter(|s| !s.is_empty()) {
-                parts.push(ctx.to_string());
+                parts.push(format!("{}\n\n{}", header, doc.content));
             }
         }
 
@@ -2457,7 +2485,7 @@ impl Workspace {
                         "Failed to embed chunk {}: {}{}",
                         chunk.id,
                         e,
-                        if matches!(e, embeddings::EmbeddingError::AuthFailed) {
+                        if matches!(e, EmbeddingError::AuthFailed) {
                             ". Check OPENAI_API_KEY or set EMBEDDING_PROVIDER=ollama for local embeddings"
                         } else {
                             ""

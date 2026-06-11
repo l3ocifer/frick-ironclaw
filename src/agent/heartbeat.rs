@@ -26,12 +26,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Timelike;
-use tokio::sync::{mpsc, Mutex};
+use chrono::TimeZone as _;
+use chrono_tz::Tz;
+use tokio::sync::mpsc;
 
 use crate::channels::OutgoingResponse;
-use crate::llm::{ChatMessage, CompletionRequest, FinishReason, LlmProvider};
-use crate::safety::integrity::IntegrityMonitor;
+use crate::tenant::SystemScope;
 use crate::workspace::Workspace;
 use crate::workspace::hygiene::HygieneConfig;
 use ironclaw_llm::{ChatMessage, CompletionRequest, LlmProvider, Reasoning};
@@ -49,10 +49,17 @@ pub struct HeartbeatConfig {
     pub notify_user_id: Option<String>,
     /// Channel to notify on heartbeat findings.
     pub notify_channel: Option<String>,
-    /// Quiet hours start (0-23, local time). Heartbeat skips during these hours.
-    pub quiet_hours_start: Option<u8>,
-    /// Quiet hours end (0-23, local time).
-    pub quiet_hours_end: Option<u8>,
+    /// Fixed time-of-day to fire (24h). When set, interval is ignored.
+    pub fire_at: Option<chrono::NaiveTime>,
+    /// Hour (0-23) when quiet hours start.
+    pub quiet_hours_start: Option<u32>,
+    /// Hour (0-23) when quiet hours end.
+    pub quiet_hours_end: Option<u32>,
+    /// Timezone for fire_at and quiet hours evaluation (IANA name).
+    pub timezone: Option<String>,
+    /// When true, cycle through all users with routines instead of
+    /// running heartbeat for a single user. Requires a database store.
+    pub multi_tenant: bool,
 }
 
 impl Default for HeartbeatConfig {
@@ -63,8 +70,11 @@ impl Default for HeartbeatConfig {
             max_failures: 3,
             notify_user_id: None,
             notify_channel: None,
+            fire_at: None,
             quiet_hours_start: None,
             quiet_hours_end: None,
+            timezone: None,
+            multi_tenant: false,
         }
     }
 }
@@ -174,8 +184,6 @@ pub struct HeartbeatRunner {
     response_tx: Option<mpsc::Sender<OutgoingResponse>>,
     store: Option<SystemScope>,
     consecutive_failures: u32,
-    /// Optional integrity monitor for workspace file drift detection.
-    integrity: Option<Arc<Mutex<IntegrityMonitor>>>,
 }
 
 impl HeartbeatRunner {
@@ -194,7 +202,6 @@ impl HeartbeatRunner {
             response_tx: None,
             store: None,
             consecutive_failures: 0,
-            integrity: None,
         }
     }
 
@@ -204,9 +211,9 @@ impl HeartbeatRunner {
         self
     }
 
-    /// Set the integrity monitor for workspace file drift detection.
-    pub fn with_integrity_monitor(mut self, monitor: Arc<Mutex<IntegrityMonitor>>) -> Self {
-        self.integrity = Some(monitor);
+    /// Set the system-scoped database store for persistent heartbeat conversations.
+    pub fn with_store(mut self, store: SystemScope) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -276,11 +283,6 @@ impl HeartbeatRunner {
                 }
             });
 
-            if self.is_quiet_hours() {
-                tracing::debug!("Heartbeat skipped: quiet hours");
-                continue;
-            }
-
             match self.check_heartbeat().await {
                 HeartbeatResult::Ok => {
                     tracing::trace!("Heartbeat OK");
@@ -310,31 +312,8 @@ impl HeartbeatRunner {
         }
     }
 
-    /// Check if current local time falls within configured quiet hours.
-    fn is_quiet_hours(&self) -> bool {
-        let (Some(start), Some(end)) = (self.config.quiet_hours_start, self.config.quiet_hours_end) else {
-            return false;
-        };
-        let now_hour = chrono::Local::now().hour() as u8;
-        if start <= end {
-            // Simple range: e.g., 23..7 doesn't apply, but 9..17 does
-            now_hour >= start && now_hour < end
-        } else {
-            // Wraps midnight: e.g., 23..7 means 23,0,1,2,3,4,5,6
-            now_hour >= start || now_hour < end
-        }
-    }
-
     /// Run a single heartbeat check.
     pub async fn check_heartbeat(&self) -> HeartbeatResult {
-        // Run integrity check first (if configured)
-        if let Some(ref integrity) = self.integrity {
-            match self.run_integrity_check(integrity).await {
-                Some(result) => return result,
-                None => {} // No violations, continue
-            }
-        }
-
         // Get the heartbeat checklist
         let checklist = match self.workspace.heartbeat_checklist().await {
             Ok(Some(content)) if !is_effectively_empty(&content) => content,
@@ -358,7 +337,7 @@ impl HeartbeatRunner {
         );
 
         // Get the system prompt for context
-        let system_prompt = match self.workspace.system_prompt(true, None).await {
+        let system_prompt = match self.workspace.system_prompt().await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("Failed to get system prompt for heartbeat: {}", e);
@@ -418,54 +397,6 @@ impl HeartbeatRunner {
         }
 
         HeartbeatResult::NeedsAttention(content.to_string())
-    }
-
-    /// Run workspace integrity check and return a result if violations are found.
-    ///
-    /// Returns `Some(HeartbeatResult)` if there are violations that need attention,
-    /// `None` if everything is clean.
-    async fn run_integrity_check(
-        &self,
-        integrity: &Arc<Mutex<IntegrityMonitor>>,
-    ) -> Option<HeartbeatResult> {
-        let mut monitor = integrity.lock().await;
-        let violations = monitor.check(&self.workspace).await;
-
-        if violations.is_empty() {
-            return None;
-        }
-
-        // Build a report of violations
-        let mut report = String::from("⚠️ **Workspace Integrity Alert**\n\n");
-        let mut needs_attention = false;
-
-        for v in &violations {
-            report.push_str(&format!("- {v}\n"));
-            if v.mode == crate::safety::integrity::ProtectionMode::Alert {
-                needs_attention = true;
-            }
-        }
-
-        let restored_count = violations.iter().filter(|v| v.restored).count();
-        if restored_count > 0 {
-            report.push_str(&format!(
-                "\n{restored_count} file(s) auto-restored from approved baseline."
-            ));
-        }
-
-        tracing::info!(
-            violations = violations.len(),
-            restored = restored_count,
-            "Integrity check found violations"
-        );
-
-        if needs_attention {
-            Some(HeartbeatResult::NeedsAttention(report))
-        } else {
-            // All violations were auto-restored, just log it
-            tracing::info!("All integrity violations auto-restored");
-            None
-        }
     }
 
     /// Send a notification about heartbeat findings.
@@ -570,14 +501,14 @@ pub fn spawn_heartbeat(
     workspace: Arc<Workspace>,
     llm: Arc<dyn LlmProvider>,
     response_tx: Option<mpsc::Sender<OutgoingResponse>>,
-    integrity: Option<Arc<Mutex<IntegrityMonitor>>>,
+    store: Option<SystemScope>,
 ) -> tokio::task::JoinHandle<()> {
     let mut runner = HeartbeatRunner::new(config, hygiene_config, workspace, llm);
     if let Some(tx) = response_tx {
         runner = runner.with_response_channel(tx);
     }
-    if let Some(monitor) = integrity {
-        runner = runner.with_integrity_monitor(monitor);
+    if let Some(s) = store {
+        runner = runner.with_store(s);
     }
 
     tokio::spawn(async move {

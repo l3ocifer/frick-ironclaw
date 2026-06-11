@@ -83,14 +83,15 @@ Validated by `ThreadState::can_transition_to()`. Terminal states: `Done`, `Faile
 
 ## Learning Missions
 
-Four event-driven missions fire automatically after thread completion:
+Five event-driven missions, firing through `fire_on_system_event()` (wired by `start_event_listener()`) on the system event each one subscribes to:
 
 1. **Error diagnosis** (`self-improvement`) — fires when a thread completes with trace issues. Diagnoses root cause and applies prompt overlays or orchestrator patches.
-2. **Skill repair** (`skill-repair`) — fires when a completed thread used an active skill but the trace suggests the skill instructions were stale, incomplete, or missing verification. Applies the smallest safe versioned update to the implicated skill.
-3. **Skill extraction** (`skill-extraction`) — fires when a thread succeeds with 5+ steps and 3+ tool actions. Extracts reusable skills with activation metadata, CodeAct code snippets, and domain tags. Output stored as `DocType::Skill` MemoryDoc.
-4. **Conversation insights** (`conversation-insights`) — fires every 5 completed threads in a project. Extracts user preferences, domain knowledge, and workflow patterns.
+2. **Skill repair** (`skill-repair`) — fires on `engine`/`thread_completed_with_skill_gap` when a completed thread used an active skill but the trace suggests the skill instructions were stale, incomplete, or missing verification. Applies the smallest safe versioned update to the implicated skill.
+3. **Skill extraction** (`skill-extraction`) — fires on `engine`/`thread_completed_with_learnings` when a thread succeeds with 5+ steps and 3+ tool actions. Extracts reusable skills with activation metadata, CodeAct code snippets, and domain tags. Output stored as `DocType::Skill` MemoryDoc.
+4. **Conversation insights** (`conversation-insights`) — fires on `engine`/`conversation_insights_due` (every 5 completed threads in a project). Extracts user preferences, domain knowledge, and workflow patterns.
+5. **Expected behavior** (`expected-behavior`) — fires on `user_feedback`/`expected_behavior` (a user-reported expectation gap), **not** thread completion. Investigates the gap and applies fixes.
 
-Created by `MissionManager::ensure_learning_missions()` at project bootstrap.
+`MissionManager::ensure_learning_missions()` idempotently *bootstraps* (registers) all five at project setup — it does not fire them.
 
 ## Data Retention: Never Delete LLM Output
 
@@ -129,8 +130,10 @@ preflight raises an `Authentication` gate at execute time, the inline-await
 machinery parks the VM, and the OAuth callback delivers the resolved
 credential to retry the action. Integrations that need user-driven setup
 (`NeedsSetup`, `Inactive`, `AvailableNotInstalled`) are listed under
-`Activatable Integrations` and the model tells the user to install/activate
-them through the IronClaw UI — the model cannot enable them itself.
+`Activatable Integrations` and the model installs them by calling
+`tool_install(name="<name>")` directly (issue #3533 / PR #3559 — the
+hidden gate on `tool_install` from #2868 was removed; the tool's
+`requires_approval = UnlessAutoApproved` mediates user consent).
 
 **Context as variables** (not attention input):
 - Thread messages injected as `context` Python variable

@@ -9,8 +9,6 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use crate::agent::compressor::CompressorPipeline;
-use crate::agent::compressor::salience;
 use crate::agent::context_monitor::{CompactionStrategy, ContextBreakdown};
 use crate::agent::session::Thread;
 use crate::error::Error;
@@ -35,16 +33,12 @@ pub struct CompactionResult {
 /// Compacts conversation context to stay within limits.
 pub struct ContextCompactor {
     llm: Arc<dyn LlmProvider>,
-    compressor: CompressorPipeline,
 }
 
 impl ContextCompactor {
     /// Create a new context compactor.
     pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
-        Self {
-            llm,
-            compressor: CompressorPipeline::default(),
-        }
+        Self { llm }
     }
 
     /// Compact a thread's context using the given strategy.
@@ -82,8 +76,7 @@ impl ContextCompactor {
         })
     }
 
-    /// Compact by summarizing old turns, using salience scoring to preserve
-    /// high-importance turns verbatim and only summarize low-salience ones.
+    /// Compact by summarizing old turns.
     async fn compact_with_summary(
         &self,
         thread: &mut Thread,
@@ -94,65 +87,21 @@ impl ContextCompactor {
             return Ok(CompactionPartial::empty());
         }
 
+        // Get turns to summarize
         let turns_to_remove = thread.turns.len() - keep_recent;
         let old_turns = &thread.turns[..turns_to_remove];
 
-        // Score each old turn for salience
-        let scored_turns: Vec<(String, String)> = old_turns
-            .iter()
-            .flat_map(|turn| {
-                let mut pairs = vec![(turn.user_input.clone(), "user".to_string())];
-                if let Some(ref response) = turn.response {
-                    pairs.push((response.clone(), "assistant".to_string()));
-                }
-                pairs
-            })
-            .collect();
-
-        // Partition into keep-verbatim (high salience) and summarize (low salience)
-        let (keep_indices, summarize_indices) =
-            salience::partition_by_salience(&scored_turns, 1.8);
-
-        // Build high-salience preservations as a compact "key moments" section
-        let preserved: Vec<String> = keep_indices
-            .iter()
-            .filter_map(|&i| scored_turns.get(i))
-            .map(|(content, role)| format!("[{}]: {}", role, truncate_turn(content, 200)))
-            .collect();
-
-        // Build messages to summarize (only low-salience turns)
-        let to_summarize: Vec<ChatMessage> = summarize_indices
-            .iter()
-            .filter_map(|&i| scored_turns.get(i))
-            .map(|(content, role)| {
-                if role == "user" {
-                    ChatMessage::user(content)
-                } else {
-                    ChatMessage::assistant(content)
-                }
-            })
-            .collect();
-
-        // Generate summary from low-salience turns
-        let mut summary = if !to_summarize.is_empty() {
-            self.generate_summary(&to_summarize).await?
-        } else {
-            String::new()
-        };
-
-        // Append preserved high-salience moments
-        if !preserved.is_empty() {
-            summary.push_str("\n\n## Key Moments (preserved)\n\n");
-            for p in &preserved {
-                summary.push_str(&format!("- {}\n", p));
+        // Build messages for summarization
+        let mut to_summarize = Vec::new();
+        for turn in old_turns {
+            to_summarize.push(ChatMessage::user(&turn.user_input));
+            if let Some(ref response) = turn.response {
+                to_summarize.push(ChatMessage::assistant(response));
             }
         }
 
-        tracing::debug!(
-            "Salience-based compaction: {} turns kept verbatim, {} summarized",
-            keep_indices.len(),
-            summarize_indices.len()
-        );
+        // Generate summary
+        let summary = self.generate_summary(&to_summarize).await?;
 
         // Write to workspace if available.
         // If archival fails, preserve turns to avoid context loss.
@@ -235,22 +184,7 @@ impl ContextCompactor {
     }
 
     /// Generate a summary of messages using the LLM.
-    ///
-    /// Runs the compression pipeline first to reduce token count before the
-    /// LLM summarization call.
     async fn generate_summary(&self, messages: &[ChatMessage]) -> Result<String, Error> {
-        // Compress messages before summarizing to reduce LLM input tokens
-        let compressed = self.compressor.compress(messages);
-        let working_messages = &compressed.messages;
-        if compressed.ratio < 1.0 {
-            tracing::debug!(
-                ratio = format!("{:.1}%", compressed.ratio * 100.0),
-                tokens_saved = compressed.tokens_before - compressed.tokens_after,
-                stages = ?compressed.stages.iter().map(|s| format!("{}:{}", s.name, s.tokens_saved)).collect::<Vec<_>>(),
-                "Pre-summary compression applied"
-            );
-        }
-
         let prompt = ChatMessage::system(
             r#"Summarize the following conversation concisely. Focus on:
 - Key decisions made
@@ -264,7 +198,7 @@ Be brief but capture all important details. Use bullet points."#,
         let mut request_messages = vec![prompt];
 
         // Add a user message with the conversation to summarize
-        let formatted = working_messages
+        let formatted = messages
             .iter()
             .map(|m| {
                 let role_str = match m.role {
@@ -352,15 +286,6 @@ impl CompactionPartial {
             summary_written: false,
             summary: None,
         }
-    }
-}
-
-/// Truncate a turn's content to `max_chars`, appending "…" if truncated.
-fn truncate_turn(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max_chars])
     }
 }
 

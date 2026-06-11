@@ -192,19 +192,24 @@ pub struct Settings {
     #[serde(default)]
     pub openai_compatible_base_url: Option<String>,
 
-    // === Step 3b: Intelligent Routing ===
-    /// Routing profile: "auto", "eco", "premium", "free".
-    /// When set, enables intelligent request-based model selection.
-    #[serde(default)]
-    pub routing_profile: Option<String>,
+    /// **Deprecated.** Bedrock region — moved to
+    /// `llm_builtin_overrides["bedrock"].extras["region"]` in Layer D.
+    /// Existing values are migrated on load via
+    /// [`Settings::migrate_legacy_provider_fields`]; new code must read
+    /// from / write to the extras bag instead. Kept for one release so
+    /// users upgrading from older settings.json files don't lose data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedrock_region: Option<String>,
 
-    /// Force agentic routing mode (auto-detects tool-heavy requests).
-    #[serde(default)]
-    pub routing_force_agentic: Option<bool>,
+    /// **Deprecated.** Bedrock cross-region inference prefix — moved to
+    /// `llm_builtin_overrides["bedrock"].extras["cross_region"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedrock_cross_region: Option<String>,
 
-    /// Enable session pinning (reuse selected model within a session).
-    #[serde(default)]
-    pub routing_session_pinning: Option<bool>,
+    /// **Deprecated.** AWS profile name for Bedrock — moved to
+    /// `llm_builtin_overrides["bedrock"].extras["profile"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedrock_profile: Option<String>,
 
     // === Step 4: Model Selection ===
     /// Currently selected model.
@@ -268,183 +273,37 @@ pub struct Settings {
     #[serde(default)]
     pub builder: BuilderSettings,
 
-    /// Memory and Logseq integration.
+    /// Routine scheduling and execution configuration.
     #[serde(default)]
-    pub memory: MemorySettings,
+    pub routines: RoutineSettings,
 
-    /// Agent identity (ERC-8004, wallet, agent card).
-    #[serde(default)]
-    pub identity: IdentitySettings,
-
-    /// Skills configuration (discovery, per-skill enable/disable, compatibility).
+    /// Skills system configuration.
     #[serde(default)]
     pub skills: SkillsSettings,
-}
 
-/// Agent Skills configuration.
-///
-/// Controls which skill directories are scanned, per-skill overrides,
-/// and compatibility with Claude/Cursor skill ecosystems.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillsSettings {
-    /// Additional skill directories to scan (beyond bundled, managed, workspace).
+    /// Memory hygiene configuration.
     #[serde(default)]
-    pub extra_dirs: Vec<String>,
+    pub hygiene: HygieneSettings,
 
-    /// Allowlist for bundled skills. If non-empty, only listed bundled skills are loaded.
-    /// Empty = all bundled skills allowed.
+    /// Workspace search fusion configuration.
     #[serde(default)]
-    pub allow_bundled: Vec<String>,
+    pub search: SearchSettings,
 
-    /// Whether to also scan `~/.claude/skills/` for Anthropic ecosystem compatibility.
-    #[serde(default = "default_true")]
-    pub include_claude_skills: bool,
-
-    /// Whether to also scan `~/.cursor/skills/` for Cursor IDE compatibility.
-    #[serde(default = "default_true")]
-    pub include_cursor_skills: bool,
-
-    /// Per-skill configuration overrides.
+    /// Mission configuration.
     #[serde(default)]
-    pub entries: std::collections::HashMap<String, SkillEntrySettings>,
-}
+    pub missions: MissionSettings,
 
-impl Default for SkillsSettings {
-    fn default() -> Self {
-        Self {
-            extra_dirs: Vec::new(),
-            allow_bundled: Vec::new(),
-            include_claude_skills: true,
-            include_cursor_skills: true,
-            entries: std::collections::HashMap::new(),
-        }
-    }
-}
-
-/// Per-skill configuration override.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SkillEntrySettings {
-    /// Explicitly enable or disable this skill.
+    /// Transcription configuration.
     #[serde(default)]
-    pub enabled: Option<bool>,
+    pub transcription: Option<TranscriptionSettings>,
 
-    /// API key for the skill's primary environment variable.
+    /// Per-tool permission overrides.
+    ///
+    /// Keys are tool names; persisted values are authoritative. Absent tools
+    /// fall back to seeded defaults for well-known tools, then `AskEachTime`.
     #[serde(default)]
-    pub api_key: Option<String>,
-
-    /// Additional environment variable overrides for this skill.
-    #[serde(default)]
-    pub env: std::collections::HashMap<String, String>,
-}
-
-/// Memory flush (pre-compaction) and Logseq bootstrap.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MemorySettings {
-    /// Pre-compaction memory flush. When enabled, run a silent turn before compaction
-    /// to remind the model to write durable notes to memory.
-    #[serde(default)]
-    pub compaction_memory_flush: Option<MemoryFlushSettings>,
-
-    /// Logseq graph integration. When graph_path is set, inject relevant Logseq notes into MEMORY context at bootstrap.
-    #[serde(default)]
-    pub logseq: Option<LogseqSettings>,
-}
-
-/// Pre-compaction memory flush configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryFlushSettings {
-    /// Enable the pre-compaction memory flush (default: true when section present).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// Soft token threshold before compaction; flush runs when context is within this many tokens of the limit.
-    #[serde(default = "default_memory_flush_soft_threshold")]
-    pub soft_threshold_tokens: usize,
-
-    /// System prompt for the silent flush turn.
-    #[serde(default = "default_memory_flush_system_prompt")]
-    pub system_prompt: String,
-
-    /// User prompt for the silent flush turn (e.g. "Write any lasting notes... reply with NO_REPLY if nothing to store").
-    #[serde(default = "default_memory_flush_prompt")]
-    pub prompt: String,
-}
-
-fn default_memory_flush_soft_threshold() -> usize {
-    4000
-}
-
-fn default_memory_flush_system_prompt() -> String {
-    "Session nearing compaction. Store durable memories now.".to_string()
-}
-
-fn default_memory_flush_prompt() -> String {
-    "Write any lasting notes to memory (e.g. daily log or MEMORY.md); reply with NO_REPLY if nothing to store.".to_string()
-}
-
-impl Default for MemoryFlushSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            soft_threshold_tokens: default_memory_flush_soft_threshold(),
-            system_prompt: default_memory_flush_system_prompt(),
-            prompt: default_memory_flush_prompt(),
-        }
-    }
-}
-
-/// Logseq graph integration. Reads from graph path and injects into MEMORY context.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogseqSettings {
-    /// Path to Logseq graph (e.g. ~/Logseq/notes-sync). Resolved with tilde expansion.
-    #[serde(default)]
-    pub graph_path: Option<String>,
-
-    /// AI memory namespace under graph pages (default: ai-memory).
-    #[serde(default = "default_logseq_ai_namespace")]
-    pub ai_namespace: String,
-
-    /// Max characters to inject (approx 4 chars per token; default ~2000 tokens).
-    #[serde(default = "default_logseq_max_tokens")]
-    pub max_tokens: usize,
-
-    /// Include shared user profile from ai_namespace/shared/ (default: true).
-    #[serde(default = "default_true")]
-    pub include_user_profile: bool,
-
-    /// Include agent preferences from ai_namespace/{agent}/preferences.md (default: true).
-    #[serde(default = "default_true")]
-    pub include_preferences: bool,
-
-    /// Include recent decisions from ai_namespace/{agent}/decisions.md (default: true).
-    #[serde(default = "default_true")]
-    pub include_decisions: bool,
-
-    /// Include shared voice/craft directives from ai_namespace/shared/voice.md (default: true).
-    #[serde(default = "default_true")]
-    pub include_voice: bool,
-}
-
-fn default_logseq_ai_namespace() -> String {
-    "ai-memory".to_string()
-}
-
-fn default_logseq_max_tokens() -> usize {
-    2000
-}
-
-impl Default for LogseqSettings {
-    fn default() -> Self {
-        Self {
-            graph_path: None,
-            ai_namespace: default_logseq_ai_namespace(),
-            max_tokens: default_logseq_max_tokens(),
-            include_user_profile: true,
-            include_preferences: true,
-            include_decisions: true,
-            include_voice: true,
-        }
-    }
+    pub tool_permissions:
+        std::collections::HashMap<String, crate::tools::permissions::PermissionState>,
 }
 
 /// Source for the secrets master key.
@@ -620,6 +479,14 @@ pub struct ChannelSettings {
     #[serde(default)]
     pub wasm_channel_owner_ids: std::collections::HashMap<String, i64>,
 
+    /// Runtime config overrides for WASM channels.
+    ///
+    /// Keys use `<channel>:<config_key>` format (for example,
+    /// `wecom:allow_from`), and values are passed to the channel config as
+    /// JSON values.
+    #[serde(default)]
+    pub wasm_channel_runtime_overrides: std::collections::HashMap<String, serde_json::Value>,
+
     /// Enabled WASM channels by name.
     /// Primarily used by the setup wizard to track which channels were configured.
     ///
@@ -661,6 +528,7 @@ impl Default for ChannelSettings {
             signal_group_policy: None,
             signal_group_allow_from: None,
             wasm_channel_owner_ids: std::collections::HashMap::new(),
+            wasm_channel_runtime_overrides: std::collections::HashMap::new(),
             wasm_channels: Vec::new(),
             wasm_channels_enabled: true,
             wasm_channels_dir: None,
@@ -688,14 +556,21 @@ pub struct HeartbeatSettings {
     #[serde(default)]
     pub notify_user: Option<String>,
 
-    /// Quiet hours start (0-23, local time). Heartbeat skips during quiet hours
-    /// unless an urgent check triggers. Default: None (always active).
+    /// Fixed time-of-day to fire (HH:MM, 24h). When set, interval_secs is ignored.
     #[serde(default)]
-    pub quiet_hours_start: Option<u8>,
+    pub fire_at: Option<String>,
 
-    /// Quiet hours end (0-23, local time). Default: None.
+    /// Hour (0-23) when quiet hours start (heartbeat skipped).
     #[serde(default)]
-    pub quiet_hours_end: Option<u8>,
+    pub quiet_hours_start: Option<u32>,
+
+    /// Hour (0-23) when quiet hours end (heartbeat resumes).
+    #[serde(default)]
+    pub quiet_hours_end: Option<u32>,
+
+    /// Timezone for fire_at and quiet hours (IANA name, e.g. "Pacific/Auckland").
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -709,8 +584,10 @@ impl Default for HeartbeatSettings {
             interval_secs: default_heartbeat_interval(),
             notify_channel: None,
             notify_user: None,
+            fire_at: None,
             quiet_hours_start: None,
             quiet_hours_end: None,
+            timezone: None,
         }
     }
 }
@@ -751,15 +628,21 @@ pub struct AgentSettings {
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout_secs: u64,
 
-    /// Daily session reset hour (0-23, local time). Sessions older than this
-    /// hour boundary auto-reset. None = disabled.
-    #[serde(default)]
-    pub daily_reset_hour: Option<u8>,
+    /// Maximum tool-call iterations per agentic loop invocation (default: 50).
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_tool_iterations: usize,
 
-    /// Reserve tokens floor for compaction. When set, compaction triggers when
-    /// remaining tokens drop below this floor (instead of the default ratio).
+    /// When true, skip tool approval checks entirely. For benchmarks/CI.
     #[serde(default)]
-    pub compaction_reserve_tokens_floor: Option<usize>,
+    pub auto_approve_tools: bool,
+
+    /// Default timezone for new sessions (IANA name, e.g. "America/New_York").
+    #[serde(default = "default_timezone")]
+    pub default_timezone: String,
+
+    /// Maximum tokens per job (0 = unlimited).
+    #[serde(default)]
+    pub max_tokens_per_job: u64,
 }
 
 fn default_agent_name() -> String {
@@ -813,8 +696,10 @@ impl Default for AgentSettings {
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
             session_idle_timeout_secs: default_session_idle_timeout(),
-            daily_reset_hour: None,
-            compaction_reserve_tokens_floor: None,
+            max_tool_iterations: default_max_tool_iterations(),
+            auto_approve_tools: false,
+            default_timezone: default_timezone(),
+            max_tokens_per_job: 0,
         }
     }
 }
@@ -968,133 +853,6 @@ pub struct SafetySettings {
     /// Whether injection check is enabled.
     #[serde(default = "default_true")]
     pub injection_check_enabled: bool,
-
-    /// Command guard configuration.
-    #[serde(default)]
-    pub command_guard: CommandGuardSettings,
-
-    /// Workspace integrity monitoring.
-    #[serde(default)]
-    pub integrity: IntegritySettings,
-}
-
-/// Command guard (destructive command blocking) settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommandGuardSettings {
-    /// Whether the command guard is enabled (default: true).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// Fail mode: "open" (allow on error) or "closed" (block on error).
-    #[serde(default = "default_fail_mode")]
-    pub fail_mode: String,
-}
-
-fn default_fail_mode() -> String {
-    "open".to_string()
-}
-
-impl Default for CommandGuardSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            fail_mode: default_fail_mode(),
-        }
-    }
-}
-
-/// Workspace integrity monitoring settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntegritySettings {
-    /// Whether integrity monitoring is enabled (default: true).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// Whether to auto-restore files in Restore mode (default: true).
-    #[serde(default = "default_true")]
-    pub auto_restore: bool,
-
-    /// Check interval in heartbeat cycles (default: 1 — every heartbeat).
-    #[serde(default = "default_integrity_interval")]
-    pub check_interval: u64,
-}
-
-fn default_integrity_interval() -> u64 {
-    1
-}
-
-impl Default for IntegritySettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            auto_restore: true,
-            check_interval: default_integrity_interval(),
-        }
-    }
-}
-
-/// Agent identity configuration (ERC-8004).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IdentitySettings {
-    /// Agent display name (used in agent card). Falls back to agent.name if not set.
-    #[serde(default)]
-    pub agent_name: Option<String>,
-
-    /// Source for the Ethereum keypair used for on-chain identity.
-    #[serde(default)]
-    pub ethereum_key_source: KeySource,
-
-    /// ERC-8004 network for on-chain registration (e.g., "ethereum_mainnet", "base", "sepolia").
-    /// None = local identity only, no on-chain registration.
-    #[serde(default)]
-    pub erc8004_network: Option<String>,
-
-    /// ERC-8004 agent ID (token ID) after on-chain registration. None = not registered.
-    #[serde(default)]
-    pub erc8004_agent_id: Option<u64>,
-
-    /// Service endpoints advertised in the agent card.
-    #[serde(default)]
-    pub services: Vec<ServiceEndpointSettings>,
-
-    /// Agent description for the registration file.
-    #[serde(default)]
-    pub description: Option<String>,
-
-    /// Agent image URL for the registration file.
-    #[serde(default)]
-    pub image_url: Option<String>,
-
-    /// Whether to serve /.well-known/agent-card.json from the gateway.
-    #[serde(default = "default_true")]
-    pub serve_agent_card: bool,
-}
-
-/// A service endpoint in the agent card.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceEndpointSettings {
-    /// Service name (e.g., "MCP", "A2A", "web").
-    pub name: String,
-    /// Endpoint URL.
-    pub endpoint: String,
-    /// Protocol version (optional).
-    #[serde(default)]
-    pub version: Option<String>,
-}
-
-impl Default for IdentitySettings {
-    fn default() -> Self {
-        Self {
-            agent_name: None,
-            ethereum_key_source: KeySource::None,
-            erc8004_network: None,
-            erc8004_agent_id: None,
-            services: Vec::new(),
-            description: None,
-            image_url: None,
-            serve_agent_card: true,
-        }
-    }
 }
 
 fn default_max_output_length() -> usize {
@@ -1106,8 +864,6 @@ impl Default for SafetySettings {
         Self {
             max_output_length: default_max_output_length(),
             injection_check_enabled: true,
-            command_guard: CommandGuardSettings::default(),
-            integrity: IntegritySettings::default(),
         }
     }
 }
@@ -1236,6 +992,10 @@ pub struct SkillsSettings {
     /// Maximum total context tokens allocated to skill prompts.
     #[serde(default = "default_skills_max_context_tokens")]
     pub max_context_tokens: usize,
+
+    /// Whether regex activation criteria may auto-load skills.
+    #[serde(default = "default_true")]
+    pub regex_activation_enabled: bool,
 }
 
 fn default_skills_max_active() -> usize {
@@ -1252,6 +1012,7 @@ impl Default for SkillsSettings {
             enabled: true,
             max_active_skills: default_skills_max_active(),
             max_context_tokens: default_skills_max_context_tokens(),
+            regex_activation_enabled: true,
         }
     }
 }
@@ -1939,6 +1700,54 @@ mod tests {
         assert_eq!(
             settings.channels.wasm_channel_owner_ids.get("telegram"),
             Some(&987654321)
+        );
+    }
+
+    #[test]
+    fn test_wasm_channel_runtime_overrides_db_round_trip() {
+        let mut settings = Settings::default();
+        settings.channels.wasm_channel_runtime_overrides.insert(
+            "wecom:dm_policy".to_string(),
+            serde_json::json!("allowlist"),
+        );
+        settings.channels.wasm_channel_runtime_overrides.insert(
+            "wecom:allow_from".to_string(),
+            serde_json::json!(["zhangsan", "lisi"]),
+        );
+
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+        assert_eq!(
+            restored
+                .channels
+                .wasm_channel_runtime_overrides
+                .get("wecom:dm_policy"),
+            Some(&serde_json::json!("allowlist"))
+        );
+        assert_eq!(
+            restored
+                .channels
+                .wasm_channel_runtime_overrides
+                .get("wecom:allow_from"),
+            Some(&serde_json::json!(["zhangsan", "lisi"]))
+        );
+    }
+
+    #[test]
+    fn test_wasm_channel_runtime_overrides_via_set() {
+        let mut settings = Settings::default();
+        settings
+            .set(
+                "channels.wasm_channel_runtime_overrides.wecom:allow_from",
+                "[\"zhangsan\"]",
+            )
+            .unwrap();
+        assert_eq!(
+            settings
+                .channels
+                .wasm_channel_runtime_overrides
+                .get("wecom:allow_from"),
+            Some(&serde_json::json!(["zhangsan"]))
         );
     }
 
@@ -3383,6 +3192,36 @@ bedrock_profile = "prod-bedrock"
         assert!(settings.bedrock_region.is_none());
         assert!(settings.bedrock_cross_region.is_none());
         assert!(settings.bedrock_profile.is_none());
+    }
+
+    /// Regression guard: `SkillsSettings.regex_activation_enabled = false` must
+    /// survive a `to_db_map` → `from_db_map` round-trip.  A serialization
+    /// regression (e.g. `serde(default)` applied without a matching
+    /// `serde(skip_serializing_if)`) would cause the field to be omitted from
+    /// the map and silently revert to `true` on reload.
+    #[test]
+    fn test_db_map_round_trip_preserves_skills_regex_activation() {
+        let settings = Settings {
+            skills: crate::settings::SkillsSettings {
+                regex_activation_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let map = settings.to_db_map();
+        let restored = Settings::from_db_map(&map);
+        assert!(
+            !restored.skills.regex_activation_enabled,
+            "skills.regex_activation_enabled=false must survive DB round-trip"
+        );
+        // Confirm the default (true) is also preserved when round-tripping the
+        // default settings so we don't accidentally strip the default path.
+        let default_map = Settings::default().to_db_map();
+        let restored_default = Settings::from_db_map(&default_map);
+        assert!(
+            restored_default.skills.regex_activation_enabled,
+            "default skills.regex_activation_enabled=true must survive DB round-trip"
+        );
     }
 
     /// `migrate_legacy_provider_fields` is idempotent in-memory: once the
