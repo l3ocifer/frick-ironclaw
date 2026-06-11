@@ -36,6 +36,7 @@ COPY channels-src/ channels-src/
 COPY tools-src/    tools-src/
 COPY wit/          wit/
 COPY skills/       skills/
+COPY profiles/     profiles/
 COPY providers.json providers.json
 COPY build.rs    ./
 
