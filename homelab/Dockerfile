@@ -23,12 +23,20 @@ WORKDIR /app
 # Layer cache: lockfiles first
 COPY Cargo.toml Cargo.lock ./
 
-# Source — directories per upstream Dockerfile + IronClaw layout
-COPY src/        src/
-COPY migrations/ migrations/
-COPY wit/        wit/
-COPY vendor/     vendor/
-COPY skills/     skills/
+# Source — directories per upstream Dockerfile + IronClaw layout.
+# 2026-06-11: vendor/ removed upstream (weave-core no longer vendored);
+# crates/, tests/, registry/, channels-src/, tools-src/ and providers.json
+# added to match upstream's root Dockerfile COPY set.
+COPY src/          src/
+COPY crates/       crates/
+COPY tests/        tests/
+COPY migrations/   migrations/
+COPY registry/     registry/
+COPY channels-src/ channels-src/
+COPY tools-src/    tools-src/
+COPY wit/          wit/
+COPY skills/       skills/
+COPY providers.json providers.json
 COPY build.rs    ./
 
 # Cargo validates manifest targets; create stub for examples we don't ship
