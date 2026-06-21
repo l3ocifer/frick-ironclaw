@@ -1,4 +1,4 @@
-FROM rust:1.86-slim-bookworm
+FROM rust:1.96-slim-bookworm
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
