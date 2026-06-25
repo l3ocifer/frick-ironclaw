@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "slack-v2-host-beta")]
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -263,6 +265,12 @@ fn active_run_index(
                 TriggerActiveRunState::Terminal {
                     status: terminal_run_history_status(run.status),
                 }
+            } else if is_human_interaction_gate(run.status) {
+                // A scheduled fire runs unattended, so an approval/auth gate
+                // will never be answered. Surface it as Blocked so the poller
+                // clears the active fire instead of letting one stuck run block
+                // every future scheduled run of the trigger (#4986).
+                TriggerActiveRunState::Blocked
             } else {
                 TriggerActiveRunState::Nonterminal
             };
@@ -282,6 +290,19 @@ fn active_run_state_from_index(
         .get(&(request.tenant_id.clone(), request.run_id))
         .copied()
         .unwrap_or(TriggerActiveRunState::Missing)
+}
+
+/// A run parked on a gate that needs a human to act (tool-approval or auth).
+/// An unattended scheduled fire cannot satisfy these, so the poller treats
+/// them as non-advancing and clears the fire. `BlockedResource` and
+/// `BlockedDependentRun` are deliberately excluded — those resolve on their
+/// own as the resource frees up or the dependent run finishes, so they stay
+/// `Nonterminal` and keep their place in the schedule.
+fn is_human_interaction_gate(status: TurnStatus) -> bool {
+    matches!(
+        status,
+        TurnStatus::BlockedApproval | TurnStatus::BlockedAuth
+    )
 }
 
 fn terminal_run_history_status(status: TurnStatus) -> TriggerRunHistoryStatus {
@@ -319,7 +340,7 @@ impl<S> LocalTriggerTurnSnapshotSource<S> {
     }
 }
 
-#[cfg(feature = "libsql")]
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 #[async_trait]
 impl<F> TriggerTurnSnapshotSource
     for LocalTriggerTurnSnapshotSource<ironclaw_turns::FilesystemTurnStateStore<F>>
@@ -334,7 +355,7 @@ where
     }
 }
 
-#[cfg(not(feature = "libsql"))]
+#[cfg(not(any(feature = "libsql", feature = "postgres")))]
 #[async_trait]
 impl TriggerTurnSnapshotSource
     for LocalTriggerTurnSnapshotSource<ironclaw_turns::InMemoryTurnStateStore>
@@ -344,7 +365,7 @@ impl TriggerTurnSnapshotSource
     }
 }
 
-#[cfg(feature = "libsql")]
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 fn trigger_backend_error(error: impl std::fmt::Display) -> TriggerError {
     TriggerError::Backend {
         reason: error.to_string(),
@@ -561,6 +582,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn human_interaction_gates_map_to_blocked_other_blocks_stay_nonterminal() {
+        // #4986: approval/auth gates can never be answered by an unattended
+        // fire, so they must surface as Blocked (poller clears the fire).
+        // Resource/dependent-run waits resolve on their own and stay
+        // Nonterminal so they keep their schedule slot.
+        let tenant_id = TenantId::new("trigger-blocked-state-tenant").expect("tenant id");
+        let approval_run = TurnRunId::new();
+        let auth_run = TurnRunId::new();
+        let resource_run = TurnRunId::new();
+        let dependent_run = TurnRunId::new();
+        let snapshot_source = Arc::new(StaticSnapshotSource {
+            snapshot: TurnPersistenceSnapshot {
+                runs: vec![
+                    turn_run_record(&tenant_id, approval_run, TurnStatus::BlockedApproval),
+                    turn_run_record(&tenant_id, auth_run, TurnStatus::BlockedAuth),
+                    turn_run_record(&tenant_id, resource_run, TurnStatus::BlockedResource),
+                    turn_run_record(&tenant_id, dependent_run, TurnStatus::BlockedDependentRun),
+                ],
+                ..TurnPersistenceSnapshot::default()
+            },
+        });
+        let lookup = SnapshotActiveRunLookup::new(snapshot_source);
+        let fire_slot = Utc::now();
+        let request = |run_id| TriggerActiveRunStateRequest {
+            tenant_id: tenant_id.clone(),
+            trigger_id: TriggerId::new(),
+            fire_slot,
+            run_id,
+        };
+
+        let results = lookup
+            .active_run_states(vec![
+                request(approval_run),
+                request(auth_run),
+                request(resource_run),
+                request(dependent_run),
+            ])
+            .await;
+
+        assert!(matches!(results[0], Ok(TriggerActiveRunState::Blocked)));
+        assert!(matches!(results[1], Ok(TriggerActiveRunState::Blocked)));
+        assert!(matches!(results[2], Ok(TriggerActiveRunState::Nonterminal)));
+        assert!(matches!(results[3], Ok(TriggerActiveRunState::Nonterminal)));
+    }
+
+    #[tokio::test]
     async fn active_run_batch_lookup_returns_empty_without_snapshot() {
         let snapshot_source = Arc::new(CountingSnapshotSource::default());
         let lookup = SnapshotActiveRunLookup::new(snapshot_source.clone());
@@ -643,6 +710,8 @@ mod tests {
             parent_run_id: None,
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
+            product_context: None,
+            resume_disposition: None,
         }
     }
 
@@ -717,8 +786,8 @@ mod tests {
         use ironclaw_host_api::{AgentId, TenantId, ThreadId, Timestamp, UserId};
         use ironclaw_triggers::{
             InMemoryTriggerRepository, TriggerActiveRunLookup, TriggerActiveRunState,
-            TriggerActiveRunStateRequest, TriggerCompletionPolicy, TriggerError, TriggerFire,
-            TriggerId, TriggerInboundContentRef, TriggerMaterializedPrompt, TriggerPollerWorker,
+            TriggerActiveRunStateRequest, TriggerError, TriggerFire, TriggerId,
+            TriggerInboundContentRef, TriggerMaterializedPrompt, TriggerPollerWorker,
             TriggerPollerWorkerConfig, TriggerPollerWorkerDeps, TriggerPromptMaterializer,
             TriggerRecord, TriggerRepository, TriggerSchedule, TriggerSourceKind, TriggerState,
             TrustedTriggerFireSubmitOutcome, TrustedTriggerFireSubmitter,
@@ -760,23 +829,33 @@ mod tests {
         }
 
         /// Inner submitter that always returns `Accepted` with a pre-set run_id
-        /// and scope. Used to exercise the wrapper without going through the
-        /// real submission pipeline.
+        /// and a scope derived from the request's creator. Used to exercise the
+        /// wrapper without going through the real submission pipeline.
         struct FixedAcceptedSubmitter {
             run_id: TurnRunId,
-            scope: TurnScope,
         }
 
         #[async_trait]
         impl TrustedTriggerFireSubmitter for FixedAcceptedSubmitter {
             async fn submit_trusted_trigger_fire(
                 &self,
-                _request: TrustedTriggerSubmitRequest,
+                request: TrustedTriggerSubmitRequest,
             ) -> Result<TrustedTriggerFireSubmitOutcome, TriggerError> {
+                let creator = request.fire().creator_user_id.clone();
+                // Mirror the post-Task-2 production shape: fabricate the scope
+                // with the trigger creator as explicit owner so the fixture
+                // matches what the real trusted-submit path now produces.
+                let scope = TurnScope::new_with_owner(
+                    wrapper_tenant(),
+                    Some(AgentId::new("hook-wrapper-agent").expect("agent")),
+                    None,
+                    hook_wrapper_thread_id(self.run_id),
+                    Some(creator),
+                );
                 Ok(TrustedTriggerFireSubmitOutcome::Accepted {
                     run_id: self.run_id,
                     submitted_at: Utc::now(),
-                    turn_scope: self.scope.clone(),
+                    turn_scope: scope,
                 })
             }
         }
@@ -814,10 +893,8 @@ mod tests {
             TenantId::new("hook-wrapper-tenant").expect("tenant")
         }
 
-        fn wrapper_scope(run_id: TurnRunId) -> TurnScope {
-            let agent = AgentId::new("hook-wrapper-agent").expect("agent");
-            let thread = ThreadId::new(format!("hook-wrapper-thread-{run_id}")).expect("thread");
-            TurnScope::new(wrapper_tenant(), Some(agent), None, thread)
+        fn hook_wrapper_thread_id(run_id: TurnRunId) -> ThreadId {
+            ThreadId::new(format!("hook-wrapper-thread-{run_id}")).expect("thread id")
         }
 
         /// Seed one due trigger in `repo` and return the fire slot timestamp.
@@ -835,7 +912,6 @@ mod tests {
                 name: "hook-wrapper-trigger".to_string(),
                 source: TriggerSourceKind::Schedule,
                 schedule: TriggerSchedule::cron("* * * * *").expect("cron"),
-                completion_policy: TriggerCompletionPolicy::Recurring,
                 prompt: "hook wrapper test prompt".to_string(),
                 state: TriggerState::Scheduled,
                 next_run_at: fire_slot,
@@ -885,11 +961,7 @@ mod tests {
             seed_due_trigger(&repo, fire_slot).await;
 
             let run_id = TurnRunId::new();
-            let scope = wrapper_scope(run_id);
-            let inner = Arc::new(FixedAcceptedSubmitter {
-                run_id,
-                scope: scope.clone(),
-            });
+            let inner = Arc::new(FixedAcceptedSubmitter { run_id });
             let hook_slot: Arc<OnceLock<Arc<dyn PostSubmitDeliveryHook>>> =
                 Arc::new(OnceLock::new());
 
@@ -927,11 +999,7 @@ mod tests {
             seed_due_trigger(&repo, fire_slot).await;
 
             let run_id = TurnRunId::new();
-            let scope = wrapper_scope(run_id);
-            let inner = Arc::new(FixedAcceptedSubmitter {
-                run_id,
-                scope: scope.clone(),
-            });
+            let inner = Arc::new(FixedAcceptedSubmitter { run_id });
             let hook_slot: Arc<OnceLock<Arc<dyn PostSubmitDeliveryHook>>> =
                 Arc::new(OnceLock::new());
 
@@ -959,14 +1027,20 @@ mod tests {
             let calls = recording.calls();
             assert_eq!(calls.len(), 1, "hook must fire exactly once");
 
-            let (_, called_run_id, called_scope) = &calls[0];
+            let (recorded_fire, called_run_id, called_scope) = &calls[0];
             assert_eq!(
                 *called_run_id, run_id,
                 "hook must receive the accepted run_id"
             );
+            let expected_thread_id = hook_wrapper_thread_id(run_id);
             assert_eq!(
-                called_scope.thread_id, scope.thread_id,
+                called_scope.thread_id, expected_thread_id,
                 "hook must receive the accepted turn_scope thread_id"
+            );
+            assert_eq!(
+                called_scope.explicit_owner_user_id(),
+                Some(&recorded_fire.creator_user_id),
+                "post-submit hook must receive a TurnScope owned by the trigger creator"
             );
         }
     }

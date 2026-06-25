@@ -1,17 +1,30 @@
 use ironclaw_extensions::{
-    CapabilityDeclV2, CapabilityVisibility, ExtensionAssetPath, ExtensionManifest,
+    CapabilityDeclV2, CapabilityVisibility, ExtensionAssetPath, ExtensionManifestRecord,
     ExtensionPackage, ExtensionRuntime, ManifestSource,
 };
 use ironclaw_filesystem::{FileType, FilesystemError, RootFilesystem};
-use ironclaw_host_api::{CapabilityId, ExtensionId, VirtualPath, sha256_digest_token};
+use ironclaw_first_party_extensions::is_gsuite_extension_id;
+use ironclaw_host_api::{
+    CapabilityId, ExtensionId, RuntimeCredentialAccountProviderId, VirtualPath, sha256_digest_token,
+};
+use ironclaw_product_adapter_registry::product_adapter_sections;
+use ironclaw_product_adapters::ProductSurfaceKind;
 use ironclaw_product_workflow::{
     LifecycleExtensionCredentialRequirement, LifecycleExtensionCredentialSetup,
     LifecycleExtensionOnboarding, LifecycleExtensionRuntimeKind, LifecycleExtensionSource,
-    LifecycleExtensionSummary, LifecyclePackageKind, LifecyclePackageRef, ProductWorkflowError,
+    LifecycleExtensionSummary, LifecycleExtensionSurfaceKind, LifecyclePackageKind,
+    LifecyclePackageRef, ProductWorkflowError,
 };
 use toml::Value;
 
-use crate::nearai_mcp::{NearAiMcpEndpoint, nearai_mcp_endpoint_from_env};
+use crate::extension_credential_requirements::{
+    can_merge_lifecycle_credential_setup, merge_lifecycle_credential_setup,
+    product_auth_credential_source,
+};
+use crate::nearai_mcp::{
+    NearAiMcpBootstrapConfig, NearAiMcpEndpoint, durable_product_auth_storage_enabled,
+    nearai_mcp_endpoint_from_base, nearai_mcp_endpoint_from_env,
+};
 
 const GITHUB_MANIFEST: &str =
     include_str!("../../ironclaw_first_party_extensions/assets/github/manifest.toml");
@@ -47,6 +60,41 @@ const WEB_ACCESS_MANIFEST: &str =
     include_str!("../../ironclaw_first_party_extensions/assets/web-access/manifest.toml");
 const NEARAI_MCP_MANIFEST: &str =
     include_str!("../../ironclaw_first_party_extensions/assets/nearai-mcp/manifest.toml");
+#[cfg(feature = "slack-v2-host-beta")]
+const SLACK_MANIFEST: &str =
+    include_str!("../../ironclaw_first_party_extensions/assets/slack/manifest.toml");
+const NEARAI_EXTENSION_ID: &str = HostManagedCredentialExtension::NearAi.id();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostManagedCredentialExtension {
+    NearAi,
+}
+
+impl HostManagedCredentialExtension {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::NearAi => "nearai",
+        }
+    }
+
+    fn from_package_ref(package_ref: &LifecyclePackageRef) -> Option<Self> {
+        #[cfg(not(feature = "root-llm-provider"))]
+        {
+            let _ = package_ref;
+            None
+        }
+        #[cfg(feature = "root-llm-provider")]
+        {
+            if package_ref.kind != LifecyclePackageKind::Extension {
+                return None;
+            }
+            match package_ref.id.as_str() {
+                id if id == Self::NearAi.id() => Some(Self::NearAi),
+                _ => None,
+            }
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AvailableExtensionAsset {
@@ -65,6 +113,12 @@ pub(crate) struct AvailableExtensionPackage {
     pub(crate) package_ref: LifecyclePackageRef,
     pub(crate) manifest_toml: String,
     pub(crate) package: ExtensionPackage,
+    /// Surface kinds projected once from the manifest record at construction and
+    /// cached here. Deliberately not re-derived in `summary()`: the projection
+    /// (`product_adapter_sections`) needs the full `ExtensionManifestRecord`, and
+    /// each loader parses the manifest exactly once (see
+    /// `surface_kinds_from_manifest_record`). Keep in sync at construction.
+    pub(crate) surface_kinds: Vec<LifecycleExtensionSurfaceKind>,
     pub(crate) assets: Vec<AvailableExtensionAsset>,
 }
 
@@ -83,16 +137,28 @@ impl AvailableExtensionPackage {
             description: self.package.manifest.description.clone(),
             source: LifecycleExtensionSource::HostBundled,
             runtime_kind: runtime_kind(&self.package.manifest.runtime),
+            surface_kinds: self.surface_kinds.clone(),
             visible_capability_ids,
             visible_read_only_capability_ids,
             credential_requirements: credential_requirements(self),
-            onboarding: onboarding(self.package_ref.id.as_str()),
+            onboarding: onboarding(&self.package_ref),
         }
     }
 }
 
-fn onboarding(package_id: &str) -> Option<LifecycleExtensionOnboarding> {
-    match package_id {
+fn onboarding(package_ref: &LifecyclePackageRef) -> Option<LifecycleExtensionOnboarding> {
+    if is_host_managed_credential_extension(package_ref) {
+        return Some(onboarding_message(
+            "NEAR AI MCP uses the NEAR AI credentials configured for the assistant. If NEAR AI is not configured yet, add a NEAR AI API key in assistant inference settings before activating this extension.",
+            Some(
+                "Configure NEAR AI for the assistant with an API key; MCP reuses that credential.",
+            ),
+            None,
+            "After NEAR AI is configured for the assistant, activate NEAR AI MCP to publish its tools.",
+        ));
+    }
+
+    match package_ref.id.as_str() {
         "github" => Some(onboarding_message(
             "GitHub needs a personal access token before its repository and pull request tools can run.",
             Some(
@@ -109,21 +175,15 @@ fn onboarding(package_id: &str) -> Option<LifecycleExtensionOnboarding> {
         )),
         "google-calendar" => Some(onboarding_message(
             "Google Calendar needs Google OAuth authorization before calendar tools can run.",
-            Some("Authorize the Google account that IronClaw should use for calendar events."),
+            Some("Authorize the Google account that IronClaw should use for Google Calendar."),
             None,
             "After authorization completes, activate Google Calendar to publish its tools.",
         )),
         "notion" => Some(onboarding_message(
             "Notion needs OAuth authorization before MCP tools can run.",
-            Some("Authorize the Notion workspace that IronClaw should access for MCP requests."),
+            Some("Authorize the Notion workspace that IronClaw should access."),
             None,
             "After authorization completes, activate Notion to publish its MCP tools.",
-        )),
-        "nearai" => Some(onboarding_message(
-            "NEAR AI needs an API key before its MCP tools can run.",
-            Some("Paste the NEAR AI API key IronClaw should use for hosted MCP requests."),
-            None,
-            "After saving the API key, activate NEAR AI to publish its MCP tools.",
         )),
         "web-access" => Some(onboarding_message(
             "Web Access does not need credentials. Activate it to make web search and saved-result retrieval tools available.",
@@ -159,29 +219,31 @@ fn runtime_kind(runtime: &ExtensionRuntime) -> LifecycleExtensionRuntimeKind {
     }
 }
 
+fn is_host_managed_credential_extension(package_ref: &LifecyclePackageRef) -> bool {
+    HostManagedCredentialExtension::from_package_ref(package_ref).is_some()
+}
+
 fn credential_requirements(
     package: &AvailableExtensionPackage,
 ) -> Vec<LifecycleExtensionCredentialRequirement> {
+    if is_host_managed_credential_extension(&package.package_ref) {
+        return Vec::new();
+    }
+
     let mut groups: Vec<CredentialRequirementGroup> = Vec::new();
     for capability in &package.package.manifest.capabilities {
         for requirement in &capability.runtime_credentials {
-            let ironclaw_host_api::RuntimeCredentialRequirementSource::ProductAuthAccount {
-                provider,
-                setup,
-            } = &requirement.source
-            else {
+            let Some((provider, setup)) = product_auth_credential_source(requirement) else {
                 continue;
             };
             let handle = requirement.handle.as_str().to_string();
-            let provider = provider.as_str().to_string();
-            let setup = credential_setup(setup);
             if let Some(seen) = groups.iter_mut().find(|seen| {
                 seen.handle == handle
                     && seen.provider == provider
-                    && can_merge_credential_setup(&seen.setup, &setup)
+                    && can_merge_lifecycle_credential_setup(&seen.setup, &setup)
             }) {
                 seen.required |= requirement.required;
-                merge_credential_setup(&mut seen.setup, setup);
+                merge_lifecycle_credential_setup(&mut seen.setup, setup);
                 continue;
             }
             groups.push(CredentialRequirementGroup {
@@ -206,7 +268,7 @@ fn credential_requirements(
                 } else {
                     group.handle.clone()
                 },
-                provider: group.provider.clone(),
+                provider: group.provider.as_str().to_string(),
                 required: group.required,
                 setup: group.setup.clone(),
             }
@@ -214,33 +276,9 @@ fn credential_requirements(
         .collect()
 }
 
-fn can_merge_credential_setup(
-    existing: &LifecycleExtensionCredentialSetup,
-    candidate: &LifecycleExtensionCredentialSetup,
-) -> bool {
-    existing == candidate
-}
-
-fn merge_credential_setup(
-    existing: &mut LifecycleExtensionCredentialSetup,
-    candidate: LifecycleExtensionCredentialSetup,
-) {
-    if let (
-        LifecycleExtensionCredentialSetup::OAuth { scopes: existing },
-        LifecycleExtensionCredentialSetup::OAuth { scopes: candidate },
-    ) = (existing, candidate)
-    {
-        for scope in candidate {
-            if !existing.contains(&scope) {
-                existing.push(scope);
-            }
-        }
-    }
-}
-
 struct CredentialRequirementGroup {
     handle: String,
-    provider: String,
+    provider: RuntimeCredentialAccountProviderId,
     required: bool,
     setup: LifecycleExtensionCredentialSetup,
 }
@@ -256,21 +294,6 @@ fn credential_requirement_name(
     format!("{}__{}", group.handle, ordinal)
 }
 
-fn credential_setup(
-    setup: &ironclaw_host_api::RuntimeCredentialAccountSetup,
-) -> LifecycleExtensionCredentialSetup {
-    match setup {
-        ironclaw_host_api::RuntimeCredentialAccountSetup::ManualToken => {
-            LifecycleExtensionCredentialSetup::ManualToken
-        }
-        ironclaw_host_api::RuntimeCredentialAccountSetup::OAuth { scopes } => {
-            LifecycleExtensionCredentialSetup::OAuth {
-                scopes: scopes.clone(),
-            }
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct AvailableExtensionCatalog {
     packages: Vec<AvailableExtensionPackage>,
@@ -281,19 +304,30 @@ impl AvailableExtensionCatalog {
         Self { packages }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_first_party_assets() -> Result<Self, ProductWorkflowError> {
-        Ok(Self::from_packages(vec![
+        Self::from_first_party_assets_with_nearai_mcp_config(None)
+    }
+
+    pub(crate) fn from_first_party_assets_with_nearai_mcp_config(
+        nearai_mcp_config: Option<&NearAiMcpBootstrapConfig>,
+    ) -> Result<Self, ProductWorkflowError> {
+        #[cfg_attr(not(feature = "slack-v2-host-beta"), allow(unused_mut))]
+        let mut packages = vec![
             github_package()?,
             notion_mcp_package()?,
             web_access_package()?,
-            nearai_mcp_package()?,
+            nearai_mcp_package(nearai_mcp_config)?,
             google_calendar_package()?,
             google_docs_package()?,
             google_drive_package()?,
             google_sheets_package()?,
             google_slides_package()?,
             gmail_package()?,
-        ]))
+        ];
+        #[cfg(feature = "slack-v2-host-beta")]
+        packages.push(slack_package()?);
+        Ok(Self::from_packages(packages))
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
@@ -327,27 +361,9 @@ impl AvailableExtensionCatalog {
         query: &str,
     ) -> impl Iterator<Item = &'a AvailableExtensionPackage> + 'a {
         let normalized_query = query.trim().to_ascii_lowercase();
-        self.packages.iter().filter(move |package| {
-            normalized_query.is_empty()
-                || package
-                    .package_ref
-                    .id
-                    .as_str()
-                    .to_ascii_lowercase()
-                    .contains(&normalized_query)
-                || package
-                    .package
-                    .manifest
-                    .name
-                    .to_ascii_lowercase()
-                    .contains(&normalized_query)
-                || package
-                    .package
-                    .manifest
-                    .description
-                    .to_ascii_lowercase()
-                    .contains(&normalized_query)
-        })
+        self.packages
+            .iter()
+            .filter(move |package| package_matches_search(package, &normalized_query))
     }
 
     pub(crate) fn resolve(
@@ -361,6 +377,49 @@ impl AvailableExtensionCatalog {
             .ok_or_else(|| ProductWorkflowError::InvalidBindingRequest {
                 reason: "available extension was not found".to_string(),
             })
+    }
+}
+
+fn package_matches_search(package: &AvailableExtensionPackage, normalized_query: &str) -> bool {
+    normalized_query.is_empty()
+        || package_search_terms(package)
+            .iter()
+            .any(|term| term.contains(normalized_query))
+}
+
+fn package_search_terms(package: &AvailableExtensionPackage) -> Vec<String> {
+    let mut terms = Vec::new();
+    push_search_term(&mut terms, package.package_ref.id.as_str());
+    push_search_term(&mut terms, &package.package.manifest.name);
+    push_search_term(&mut terms, &package.package.manifest.description);
+    if let ExtensionRuntime::FirstParty { service } = &package.package.manifest.runtime {
+        push_search_term(&mut terms, service);
+    }
+    for capability in &package.package.manifest.capabilities {
+        for credential in &capability.runtime_credentials {
+            if let Some((provider, _setup)) = product_auth_credential_source(credential) {
+                push_search_term(&mut terms, provider.as_str());
+            }
+        }
+    }
+    if is_gsuite_extension_id(&package.package.manifest.id) {
+        for alias in [
+            "google",
+            "gsuite",
+            "g suite",
+            "workspace",
+            "google workspace",
+        ] {
+            push_search_term(&mut terms, alias);
+        }
+    }
+    terms
+}
+
+fn push_search_term(terms: &mut Vec<String>, term: impl AsRef<str>) {
+    let term = term.as_ref().trim().to_ascii_lowercase();
+    if !term.is_empty() {
+        terms.push(term);
     }
 }
 
@@ -386,9 +445,16 @@ fn web_access_package() -> Result<AvailableExtensionPackage, ProductWorkflowErro
     )
 }
 
-fn nearai_mcp_package() -> Result<AvailableExtensionPackage, ProductWorkflowError> {
-    let manifest = nearai_mcp_manifest_toml()?;
-    bundled_extension_package("nearai", "NEAR AI", &manifest, nearai_mcp_assets(&manifest))
+fn nearai_mcp_package(
+    config: Option<&NearAiMcpBootstrapConfig>,
+) -> Result<AvailableExtensionPackage, ProductWorkflowError> {
+    let manifest = nearai_mcp_manifest_toml_for_config(config)?;
+    bundled_extension_package(
+        NEARAI_EXTENSION_ID,
+        "NEAR AI",
+        &manifest,
+        nearai_mcp_assets(&manifest),
+    )
 }
 
 fn google_calendar_package() -> Result<AvailableExtensionPackage, ProductWorkflowError> {
@@ -440,6 +506,11 @@ fn gmail_package() -> Result<AvailableExtensionPackage, ProductWorkflowError> {
     bundled_extension_package("gmail", "Gmail", GMAIL_MANIFEST, gmail_assets())
 }
 
+#[cfg(feature = "slack-v2-host-beta")]
+fn slack_package() -> Result<AvailableExtensionPackage, ProductWorkflowError> {
+    bundled_extension_package("slack", "Slack", SLACK_MANIFEST, slack_assets())
+}
+
 pub(crate) fn google_calendar_manifest_digest() -> String {
     sha256_digest_token(GOOGLE_CALENDAR_MANIFEST.as_bytes())
 }
@@ -472,8 +543,22 @@ pub(crate) fn web_access_manifest_digest() -> String {
     sha256_digest_token(WEB_ACCESS_MANIFEST.as_bytes())
 }
 
-pub(crate) fn nearai_mcp_manifest_toml() -> Result<String, ProductWorkflowError> {
-    let endpoint = nearai_mcp_endpoint_from_env().map_err(map_binding_error)?;
+#[cfg(feature = "slack-v2-host-beta")]
+pub(crate) fn slack_manifest_digest() -> String {
+    sha256_digest_token(SLACK_MANIFEST.as_bytes())
+}
+
+pub(crate) fn nearai_mcp_manifest_toml_for_config(
+    config: Option<&NearAiMcpBootstrapConfig>,
+) -> Result<String, ProductWorkflowError> {
+    let endpoint = if durable_product_auth_storage_enabled() {
+        match config {
+            Some(config) => config.endpoint().map_err(map_binding_error)?,
+            None => nearai_mcp_endpoint_from_env().map_err(map_binding_error)?,
+        }
+    } else {
+        nearai_mcp_endpoint_from_base(None).map_err(map_binding_error)?
+    };
     nearai_mcp_manifest_toml_for_endpoint(&endpoint)
 }
 
@@ -547,27 +632,53 @@ fn bundled_extension_package(
                 reason: format!("host API contracts rejected bundled {label} extension: {error}"),
             }
         })?;
-    let manifest = ExtensionManifest::parse_with_optional_host_api_contracts(
+    let record = ExtensionManifestRecord::from_toml_with_contracts(
         manifest_toml,
         ManifestSource::HostBundled,
         &host_ports,
+        None,
         &contracts,
     )
     .map_err(|error| ProductWorkflowError::InvalidBindingRequest {
         reason: format!("bundled {label} extension manifest is invalid: {error}"),
     })?;
-    let package =
-        ExtensionPackage::from_manifest_toml(manifest, root, manifest_toml).map_err(|error| {
-            ProductWorkflowError::InvalidBindingRequest {
-                reason: format!("bundled {label} extension package is invalid: {error}"),
-            }
-        })?;
+    let surface_kinds = surface_kinds_from_manifest_record(&record, label)?;
+    let manifest = record.manifest().clone().try_into().map_err(|error| {
+        ProductWorkflowError::InvalidBindingRequest {
+            reason: format!("bundled {label} extension manifest is invalid: {error}"),
+        }
+    })?;
+    let package = ExtensionPackage::from_manifest_toml(manifest, root, record.raw_toml()).map_err(
+        |error| ProductWorkflowError::InvalidBindingRequest {
+            reason: format!("bundled {label} extension package is invalid: {error}"),
+        },
+    )?;
     Ok(AvailableExtensionPackage {
         package_ref,
-        manifest_toml: manifest_toml.to_string(),
+        manifest_toml: record.raw_toml().to_string(),
         package,
+        surface_kinds,
         assets,
     })
+}
+
+fn surface_kinds_from_manifest_record(
+    record: &ExtensionManifestRecord,
+    label: &str,
+) -> Result<Vec<LifecycleExtensionSurfaceKind>, ProductWorkflowError> {
+    let adapters = product_adapter_sections(record).map_err(|error| {
+        ProductWorkflowError::InvalidBindingRequest {
+            reason: format!("{label} ProductAdapter manifest projection is invalid: {error}"),
+        }
+    })?;
+    let mut surface_kinds = Vec::new();
+    if adapters
+        .iter()
+        .any(|adapter| adapter.surface_kind() == ProductSurfaceKind::ExternalChannel)
+    {
+        surface_kinds.push(LifecycleExtensionSurfaceKind::ExternalChannel);
+    }
+    Ok(surface_kinds)
 }
 
 fn github_assets() -> Vec<AvailableExtensionAsset> {
@@ -596,6 +707,8 @@ fn github_assets() -> Vec<AvailableExtensionAsset> {
 
     vec![
         bytes_asset("manifest.toml", GITHUB_MANIFEST.as_bytes()),
+        github_schema_asset!("add_issue_assignees.input.v1.json"),
+        github_schema_asset!("add_issue_labels.input.v1.json"),
         github_schema_asset!("comment_issue.input.v1.json"),
         github_schema_asset!("comment_issue.output.v1.json"),
         github_schema_asset!("create_branch.input.v1.json"),
@@ -616,24 +729,38 @@ fn github_assets() -> Vec<AvailableExtensionAsset> {
         github_schema_asset!("get_pull_request_files.input.v1.json"),
         github_schema_asset!("get_pull_request_reviews.input.v1.json"),
         github_schema_asset!("get_repo.input.v1.json"),
+        github_schema_asset!("get_authenticated_user.input.v1.json"),
+        github_schema_asset!("get_workflow_run_artifacts.input.v1.json"),
+        github_schema_asset!("get_workflow_run_jobs.input.v1.json"),
         github_schema_asset!("get_workflow_runs.input.v1.json"),
         github_schema_asset!("handle_webhook.input.v1.json"),
         github_schema_asset!("list_branches.input.v1.json"),
         github_schema_asset!("list_issue_comments.input.v1.json"),
         github_schema_asset!("list_issues.input.v1.json"),
         github_schema_asset!("list_pull_request_comments.input.v1.json"),
+        github_schema_asset!("list_pull_request_review_threads.input.v1.json"),
         github_schema_asset!("list_pull_requests.input.v1.json"),
         github_schema_asset!("list_releases.input.v1.json"),
         github_schema_asset!("list_repos.input.v1.json"),
         github_schema_asset!("merge_pull_request.input.v1.json"),
         github_schema_asset!("raw_output.v1.json"),
+        github_schema_asset!("remove_issue_assignees.input.v1.json"),
+        github_schema_asset!("remove_issue_label.input.v1.json"),
         github_schema_asset!("reply_pull_request_comment.input.v1.json"),
+        github_schema_asset!("rerun_failed_workflow_run_jobs.input.v1.json"),
+        github_schema_asset!("rerun_workflow_job.input.v1.json"),
+        github_schema_asset!("resolve_review_thread.input.v1.json"),
         github_schema_asset!("search_code.input.v1.json"),
         github_schema_asset!("search_issues.input.v1.json"),
         github_schema_asset!("search_issues.output.v1.json"),
         github_schema_asset!("search_issues_pull_requests.input.v1.json"),
         github_schema_asset!("search_repositories.input.v1.json"),
         github_schema_asset!("trigger_workflow.input.v1.json"),
+        github_schema_asset!("unresolve_review_thread.input.v1.json"),
+        github_schema_asset!("update_issue.input.v1.json"),
+        github_schema_asset!("update_pull_request.input.v1.json"),
+        github_prompt_asset!("add_issue_assignees.md"),
+        github_prompt_asset!("add_issue_labels.md"),
         github_prompt_asset!("comment_issue.md"),
         github_prompt_asset!("create_branch.md"),
         github_prompt_asset!("create_issue.md"),
@@ -652,22 +779,34 @@ fn github_assets() -> Vec<AvailableExtensionAsset> {
         github_prompt_asset!("get_pull_request_files.md"),
         github_prompt_asset!("get_pull_request_reviews.md"),
         github_prompt_asset!("get_repo.md"),
+        github_prompt_asset!("get_authenticated_user.md"),
+        github_prompt_asset!("get_workflow_run_artifacts.md"),
+        github_prompt_asset!("get_workflow_run_jobs.md"),
         github_prompt_asset!("get_workflow_runs.md"),
         github_prompt_asset!("handle_webhook.md"),
         github_prompt_asset!("list_branches.md"),
         github_prompt_asset!("list_issue_comments.md"),
         github_prompt_asset!("list_issues.md"),
         github_prompt_asset!("list_pull_request_comments.md"),
+        github_prompt_asset!("list_pull_request_review_threads.md"),
         github_prompt_asset!("list_pull_requests.md"),
         github_prompt_asset!("list_releases.md"),
         github_prompt_asset!("list_repos.md"),
         github_prompt_asset!("merge_pull_request.md"),
+        github_prompt_asset!("remove_issue_assignees.md"),
+        github_prompt_asset!("remove_issue_label.md"),
         github_prompt_asset!("reply_pull_request_comment.md"),
+        github_prompt_asset!("rerun_failed_workflow_run_jobs.md"),
+        github_prompt_asset!("rerun_workflow_job.md"),
+        github_prompt_asset!("resolve_review_thread.md"),
         github_prompt_asset!("search_code.md"),
         github_prompt_asset!("search_issues.md"),
         github_prompt_asset!("search_issues_pull_requests.md"),
         github_prompt_asset!("search_repositories.md"),
         github_prompt_asset!("trigger_workflow.md"),
+        github_prompt_asset!("unresolve_review_thread.md"),
+        github_prompt_asset!("update_issue.md"),
+        github_prompt_asset!("update_pull_request.md"),
         bytes_asset("wasm/github_tool.wasm", GITHUB_WASM_MODULE),
     ]
 }
@@ -1240,6 +1379,11 @@ fn gmail_assets() -> Vec<AvailableExtensionAsset> {
     ]
 }
 
+#[cfg(feature = "slack-v2-host-beta")]
+fn slack_assets() -> Vec<AvailableExtensionAsset> {
+    vec![bytes_asset("manifest.toml", SLACK_MANIFEST.as_bytes())]
+}
+
 fn bytes_asset(path: &str, bytes: &[u8]) -> AvailableExtensionAsset {
     AvailableExtensionAsset {
         path: path.to_string(),
@@ -1343,7 +1487,10 @@ where
         if entry.file_type != FileType::Directory {
             continue;
         }
-        if ExtensionId::new(entry.name.clone()).is_err() {
+        let Ok(extension_id) = ExtensionId::new(entry.name.clone()) else {
+            continue;
+        };
+        if reserved_host_bundled_extension_id(&extension_id) {
             continue;
         }
         let manifest_path = VirtualPath::new(format!(
@@ -1367,18 +1514,25 @@ where
                 reason: format!("available extension manifest is not UTF-8: {error}"),
             }
         })?;
-        let manifest = ExtensionManifest::parse_with_optional_host_api_contracts(
-            &manifest_toml,
+        let record = ExtensionManifestRecord::from_toml_with_contracts(
+            manifest_toml,
             ManifestSource::HostBundled,
             &host_ports,
+            None,
             &contracts,
         )
         .map_err(map_binding_error)?;
-        let package = ExtensionPackage::from_manifest_toml(manifest, entry.path, &manifest_toml)
+        let surface_kinds = surface_kinds_from_manifest_record(&record, entry.name.as_str())?;
+        let manifest = record
+            .manifest()
+            .clone()
+            .try_into()
+            .map_err(map_binding_error)?;
+        let package = ExtensionPackage::from_manifest_toml(manifest, entry.path, record.raw_toml())
             .map_err(map_binding_error)?;
         let mut assets = vec![AvailableExtensionAsset {
             path: "manifest.toml".to_string(),
-            content: AvailableExtensionAssetContent::Bytes(manifest_toml.as_bytes().to_vec()),
+            content: AvailableExtensionAssetContent::Bytes(record.raw_toml().as_bytes().to_vec()),
         }];
         if let ExtensionRuntime::Wasm { module } = &package.manifest.runtime {
             let module_path = module
@@ -1394,12 +1548,20 @@ where
                 LifecyclePackageKind::Extension,
                 package.id.as_str(),
             )?,
-            manifest_toml,
+            manifest_toml: record.raw_toml().to_string(),
             package,
+            surface_kinds,
             assets,
         });
     }
     Ok(packages)
+}
+
+fn reserved_host_bundled_extension_id(extension_id: &ExtensionId) -> bool {
+    matches!(
+        extension_id.as_str(),
+        "github" | "notion" | "web-access" | "slack" | NEARAI_EXTENSION_ID
+    ) || is_gsuite_extension_id(extension_id)
 }
 
 fn extension_asset_path(
@@ -1448,7 +1610,7 @@ fn visible_capabilities(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{BTreeSet, HashMap, HashSet},
         sync::{Arc, Mutex},
         time::SystemTime,
     };
@@ -1460,13 +1622,11 @@ mod tests {
         InMemoryBackend,
     };
     use ironclaw_host_api::{
-        EffectKind, HostPortCatalog, RuntimeCredentialAccountSetup,
+        EffectKind, HostPortCatalog, PermissionMode, RuntimeCredentialAccountSetup,
         RuntimeCredentialRequirementSource,
     };
 
     use super::*;
-    use crate::nearai_mcp::nearai_mcp_endpoint_from_base;
-
     #[test]
     fn visible_capability_ids_include_write_effects() {
         let extension = test_extension_package();
@@ -1505,7 +1665,7 @@ mod tests {
             "github",
             "notion",
             "web-access",
-            "nearai",
+            NEARAI_EXTENSION_ID,
             "google-calendar",
             "google-docs",
             "google-drive",
@@ -1548,6 +1708,108 @@ mod tests {
     }
 
     #[test]
+    fn bundled_gsuite_extensions_match_google_workspace_aliases() {
+        let catalog = AvailableExtensionCatalog::from_first_party_assets().unwrap();
+        let expected = BTreeSet::from([
+            "gmail",
+            "google-calendar",
+            "google-docs",
+            "google-drive",
+            "google-sheets",
+            "google-slides",
+        ]);
+
+        for query in ["google", "gsuite", "workspace"] {
+            let ids = catalog
+                .search(query)
+                .map(|package| package.package_ref.id.as_str())
+                .collect::<BTreeSet<_>>();
+
+            assert!(
+                expected.is_subset(&ids),
+                "{query} should discover every GSuite package; got {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_github_read_only_capabilities_default_allow_without_relaxing_writes() {
+        let catalog = AvailableExtensionCatalog::from_first_party_assets().unwrap();
+        let package_ref =
+            LifecyclePackageRef::new(LifecyclePackageKind::Extension, "github").unwrap();
+        let github = catalog.resolve(&package_ref).unwrap();
+        let mut allowed_read_only = BTreeSet::new();
+        let mut ask_required = BTreeSet::new();
+        let sensitive_token_backed_reads = BTreeSet::from(["github.search_code"]);
+
+        for capability in &github.package.manifest.capabilities {
+            let requires_explicit_approval = capability.effects.iter().any(|effect| {
+                effect.is_write() || matches!(effect, EffectKind::DispatchCapability)
+            }) || sensitive_token_backed_reads
+                .contains(capability.id.as_str());
+            if requires_explicit_approval {
+                assert_eq!(
+                    capability.default_permission,
+                    PermissionMode::Ask,
+                    "{} should still ask before effectful or broad token-backed GitHub actions",
+                    capability.id
+                );
+                ask_required.insert(capability.id.as_str());
+            } else {
+                assert_eq!(
+                    capability.default_permission,
+                    PermissionMode::Allow,
+                    "{} should not require an extra approval prompt for GitHub reads",
+                    capability.id
+                );
+                allowed_read_only.insert(capability.id.as_str());
+            }
+        }
+
+        assert!(allowed_read_only.contains("github.get_repo"));
+        assert!(allowed_read_only.contains("github.get_authenticated_user"));
+        assert!(allowed_read_only.contains("github.list_branches"));
+        assert!(ask_required.contains("github.search_code"));
+        assert!(ask_required.contains("github.create_issue"));
+        assert!(ask_required.contains("github.handle_webhook"));
+    }
+
+    #[test]
+    fn bundled_web_access_defers_github_repository_tasks_to_github_extension() {
+        let catalog = AvailableExtensionCatalog::from_first_party_assets().unwrap();
+        let package_ref =
+            LifecyclePackageRef::new(LifecyclePackageKind::Extension, "web-access").unwrap();
+        let package = catalog.resolve(&package_ref).unwrap();
+        let search = package
+            .package
+            .manifest
+            .capabilities
+            .iter()
+            .find(|capability| capability.id.as_str() == "web-access.search")
+            .expect("web access search capability");
+        assert!(
+            search
+                .description
+                .contains("Prefer GitHub extension capabilities"),
+            "web-access.search description should route GitHub repository data to GitHub tools"
+        );
+
+        let prompt_asset = package
+            .assets
+            .iter()
+            .find(|asset| asset.path == "prompts/web-access/search.md")
+            .expect("web access search prompt");
+        let AvailableExtensionAssetContent::Bytes(bytes) = &prompt_asset.content else {
+            panic!("web access prompt should be bundled bytes");
+        };
+        let prompt = std::str::from_utf8(bytes).expect("prompt should be UTF-8");
+        assert!(
+            prompt.contains("prefer the GitHub extension capabilities"),
+            "web-access.search prompt should route GitHub repository data to GitHub tools"
+        );
+    }
+
+    #[test]
     fn bundled_extension_summaries_include_onboarding_messages() {
         let catalog = AvailableExtensionCatalog::from_first_party_assets().unwrap();
 
@@ -1559,7 +1821,11 @@ mod tests {
                 "Google Calendar needs Google OAuth authorization",
             ),
             ("notion", "Notion needs OAuth authorization"),
-            ("nearai", "NEAR AI needs an API key"),
+            #[cfg(feature = "root-llm-provider")]
+            (
+                NEARAI_EXTENSION_ID,
+                "NEAR AI MCP uses the NEAR AI credentials",
+            ),
             ("web-access", "Web Access does not need credentials"),
         ] {
             let package_ref =
@@ -1579,7 +1845,132 @@ mod tests {
                 onboarding.credential_next_step.is_some(),
                 "{extension_id} must include the next user step"
             );
+            if matches!(extension_id, "gmail" | "google-calendar" | "notion") {
+                assert!(
+                    onboarding
+                        .credential_instructions
+                        .as_deref()
+                        .is_some_and(|instructions| {
+                            instructions.starts_with("Authorize ")
+                                && !instructions.contains("Install")
+                        }),
+                    "{extension_id} configure onboarding should not repeat install-first copy"
+                );
+                assert!(
+                    onboarding
+                        .credential_next_step
+                        .as_deref()
+                        .is_some_and(|step| {
+                            step.starts_with("After authorization completes")
+                                && step.contains("activate")
+                                && !step.contains("Install")
+                        }),
+                    "{extension_id} configure next step should describe post-authorization activation"
+                );
+            } else if extension_id == "github" {
+                assert!(
+                    onboarding
+                        .credential_instructions
+                        .as_deref()
+                        .is_some_and(|instructions| {
+                            (instructions.contains("Paste") || instructions.contains("paste"))
+                                && !instructions.contains("Install")
+                        }),
+                    "{extension_id} configure onboarding should describe token entry without install-first copy"
+                );
+                assert!(
+                    onboarding
+                        .credential_next_step
+                        .as_deref()
+                        .is_some_and(|step| {
+                            step.starts_with("After saving")
+                                && step.contains("activate")
+                                && !step.contains("Install")
+                        }),
+                    "{extension_id} configure next step should describe activation after saving credentials"
+                );
+            } else if extension_id == NEARAI_EXTENSION_ID {
+                assert_eq!(
+                    onboarding.credential_instructions.as_deref(),
+                    Some(
+                        "Configure NEAR AI for the assistant with an API key; MCP reuses that credential."
+                    )
+                );
+                assert_eq!(
+                    onboarding.credential_next_step.as_deref(),
+                    Some(
+                        "After NEAR AI is configured for the assistant, activate NEAR AI MCP to publish its tools."
+                    )
+                );
+            } else if extension_id == "web-access" {
+                assert_eq!(
+                    onboarding.credential_next_step.as_deref(),
+                    Some("Activate Web Access to publish its tools."),
+                    "web-access configure next step should not repeat install-first copy"
+                );
+            } else {
+                assert!(
+                    onboarding
+                        .credential_next_step
+                        .as_deref()
+                        .is_some_and(|step| step.contains("Install") && step.contains("activate")),
+                    "{extension_id} onboarding should preserve install-then-activate ordering"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn host_managed_credential_extension_detection_is_centralized() {
+        let nearai_ref =
+            LifecyclePackageRef::new(LifecyclePackageKind::Extension, NEARAI_EXTENSION_ID)
+                .expect("valid NEAR AI extension ref");
+        let notion_ref = LifecyclePackageRef::new(LifecyclePackageKind::Extension, "notion")
+            .expect("valid Notion extension ref");
+        let mcp_ref = LifecyclePackageRef::new(LifecyclePackageKind::Mcp, NEARAI_EXTENSION_ID)
+            .expect("valid MCP ref");
+
+        #[cfg(feature = "root-llm-provider")]
+        assert!(is_host_managed_credential_extension(&nearai_ref));
+        #[cfg(not(feature = "root-llm-provider"))]
+        assert!(!is_host_managed_credential_extension(&nearai_ref));
+        assert!(!is_host_managed_credential_extension(&notion_ref));
+        assert!(!is_host_managed_credential_extension(&mcp_ref));
+    }
+
+    #[test]
+    fn bundled_nearai_keeps_runtime_credentials_out_of_browser_setup_summary() {
+        let catalog = AvailableExtensionCatalog::from_first_party_assets().unwrap();
+        let package_ref =
+            LifecyclePackageRef::new(LifecyclePackageKind::Extension, NEARAI_EXTENSION_ID).unwrap();
+        let package = catalog.resolve(&package_ref).unwrap();
+        let summary = package.summary();
+
+        #[cfg(feature = "root-llm-provider")]
+        assert!(
+            summary.credential_requirements.is_empty(),
+            "NEAR AI MCP uses assistant-level NEAR AI credentials and must not \
+             project an extension credential setup prompt"
+        );
+        #[cfg(not(feature = "root-llm-provider"))]
+        assert!(
+            !summary.credential_requirements.is_empty(),
+            "NEAR AI MCP should only suppress extension credential setup prompts \
+             when the root NEAR AI provider owns the credential"
+        );
+
+        let search = package
+            .package
+            .manifest
+            .capabilities
+            .iter()
+            .find(|capability| capability.id.as_str() == "nearai.web_search")
+            .expect("nearai web search capability");
+        assert_eq!(search.runtime_credentials.len(), 1);
+        assert_eq!(
+            search.runtime_credentials[0].handle,
+            ironclaw_host_api::SecretHandle::new("llm_nearai_api_key").unwrap()
+        );
     }
 
     #[test]
@@ -1599,7 +1990,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_google_credentials_project_oauth_setup_per_declared_scope_set() {
+    fn bundled_google_credentials_project_single_oauth_setup_with_scope_union() {
         let catalog = AvailableExtensionCatalog::from_first_party_assets().unwrap();
 
         for extension_id in [
@@ -1621,7 +2012,7 @@ mod tests {
                 .collect::<Vec<_>>();
 
             let mut credential_count = 0;
-            let mut expected_setup_scopes: Vec<String> = Vec::new();
+            let mut expected_setup_scopes = BTreeSet::new();
             for capability in &package.package.manifest.capabilities {
                 for credential in &capability.runtime_credentials {
                     let RuntimeCredentialRequirementSource::ProductAuthAccount { provider, setup } =
@@ -1645,32 +2036,25 @@ mod tests {
                         "{extension_id} capability {} OAuth setup scopes should match requested provider scopes",
                         capability.id
                     );
-                    for scope in scopes {
-                        if !expected_setup_scopes.contains(scope) {
-                            expected_setup_scopes.push(scope.clone());
-                        }
-                    }
+                    expected_setup_scopes.extend(scopes.iter().cloned());
                     credential_count += 1;
                 }
             }
 
             assert_eq!(
                 google_requirements.len(),
-                expected_setup_scopes.len(),
-                "{extension_id} lifecycle setup should show one Google OAuth request per distinct scope set"
+                1,
+                "{extension_id} lifecycle setup should show one Google OAuth request"
             );
-            for (requirement, expected_scope) in
-                google_requirements.iter().zip(expected_setup_scopes.iter())
-            {
-                let LifecycleExtensionCredentialSetup::OAuth { scopes } = &requirement.setup else {
-                    panic!("{extension_id} should expose Google OAuth setup");
-                };
-                assert_eq!(
-                    scopes.as_slice(),
-                    std::slice::from_ref(expected_scope),
-                    "{extension_id} lifecycle setup should preserve each capability OAuth scope set"
-                );
-            }
+            let LifecycleExtensionCredentialSetup::OAuth { scopes } = &google_requirements[0].setup
+            else {
+                panic!("{extension_id} should expose Google OAuth setup");
+            };
+            assert_eq!(
+                scopes.iter().cloned().collect::<BTreeSet<_>>(),
+                expected_setup_scopes,
+                "{extension_id} lifecycle setup should include every capability OAuth scope"
+            );
             assert!(
                 credential_count > 0,
                 "{extension_id} should declare runtime credentials"
@@ -1724,6 +2108,70 @@ mod tests {
         assert!(upload_file.effects.contains(&EffectKind::ExternalWrite));
     }
 
+    #[cfg(feature = "slack-v2-host-beta")]
+    #[test]
+    fn bundled_slack_package_declares_product_adapter_channel_surface() {
+        let catalog = AvailableExtensionCatalog::from_first_party_assets().unwrap();
+        let package_ref =
+            LifecyclePackageRef::new(LifecyclePackageKind::Extension, "slack").unwrap();
+        let package = catalog.resolve(&package_ref).unwrap();
+
+        assert_eq!(package.package.manifest.id.as_str(), "slack");
+        assert!(matches!(
+            package.package.manifest.runtime,
+            ExtensionRuntime::FirstParty { ref service } if service == "slack_v2_host_beta"
+        ));
+        assert_eq!(package.package.manifest.capabilities.len(), 0);
+        assert!(package.package.manifest.host_apis.iter().any(|host_api| {
+            host_api.id.as_str() == "ironclaw.product_adapter/v1"
+                && host_api.section.as_str() == "product_adapter.inbound"
+        }));
+
+        let summary = package.summary();
+        assert_eq!(
+            summary.surface_kinds,
+            vec![LifecycleExtensionSurfaceKind::ExternalChannel]
+        );
+        assert_eq!(summary.visible_capability_ids, Vec::<String>::new());
+    }
+
+    #[test]
+    fn non_channel_product_adapter_surface_does_not_project_channel_surface() {
+        const MANIFEST: &str = r#"
+schema_version = "reborn.extension_manifest.v2"
+id = "web-product"
+name = "Web Product"
+version = "0.1.0"
+description = "A web product adapter."
+trust = "first_party_requested"
+
+[runtime]
+kind = "first_party"
+service = "web_product"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.web"
+
+[product_adapter.web]
+surface_kind = "web"
+
+[product_adapter.web.auth]
+kind = "bearer_token"
+
+[product_adapter.web.capabilities]
+flags = ["inbound_messages"]
+
+[[product_adapter.web.required_credentials]]
+handle = "web_token"
+"#;
+
+        let package = bundled_extension_package("web-product", "Web Product", MANIFEST, Vec::new())
+            .expect("valid package");
+
+        assert_eq!(package.summary().surface_kinds, Vec::new());
+    }
+
     #[tokio::test]
     async fn materialize_bundled_github_writes_manifest_schema_refs() {
         let fs = InMemoryBackend::default();
@@ -1753,6 +2201,26 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let update_issue_schema = fs
+            .read_file(
+                &VirtualPath::new(
+                    "/system/extensions/github/schemas/github/update_issue.input.v1.json",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&update_issue_schema)
+                .unwrap()
+                .contains("GitHub update_issue input")
+        );
+        fs.read_file(
+            &VirtualPath::new("/system/extensions/github/prompts/github/update_issue.md").unwrap(),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1764,6 +2232,8 @@ mod tests {
         assert!(google_sheets_manifest_digest().starts_with("sha256:"));
         assert!(google_slides_manifest_digest().starts_with("sha256:"));
         assert!(gmail_manifest_digest().starts_with("sha256:"));
+        #[cfg(feature = "slack-v2-host-beta")]
+        assert!(slack_manifest_digest().starts_with("sha256:"));
     }
 
     #[test]
@@ -1788,6 +2258,24 @@ mod tests {
         assert_eq!(
             manifest["capabilities"][0]["runtime_credentials"][0]["audience"]["port"].as_integer(),
             Some(8443)
+        );
+    }
+
+    #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+    #[test]
+    fn nearai_manifest_renderer_ignores_config_endpoint_without_durable_product_auth() {
+        let config = NearAiMcpBootstrapConfig::new(
+            "http://invalid-nearai.example.test",
+            secrecy::SecretString::from("nearai-test-key"),
+        )
+        .unwrap();
+
+        let manifest_toml = nearai_mcp_manifest_toml_for_config(Some(&config)).unwrap();
+        let manifest: Value = toml::from_str(&manifest_toml).unwrap();
+
+        assert_eq!(
+            manifest["runtime"]["url"].as_str(),
+            Some("https://cloud-api.near.ai/mcp")
         );
     }
 
@@ -1913,6 +2401,96 @@ mod tests {
         .unwrap();
 
         assert_eq!(catalog.search("").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn filesystem_catalog_skips_reserved_host_bundled_extension_ids() {
+        let fs = InMemoryBackend::default();
+        fs.write_file(
+            &VirtualPath::new("/system/extensions/gmail/manifest.toml").unwrap(),
+            b"not parsed because gmail is host-bundled",
+        )
+        .await
+        .unwrap();
+        fs.write_file(
+            &VirtualPath::new("/system/extensions/slack/manifest.toml").unwrap(),
+            b"not parsed because slack is host-bundled",
+        )
+        .await
+        .unwrap();
+
+        let catalog = AvailableExtensionCatalog::from_filesystem_root(
+            &fs,
+            &VirtualPath::new("/system/extensions").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(catalog.search("").count(), 0);
+        assert_eq!(catalog.search("slack").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn filesystem_manifest_external_channel_surface_kind_projects_to_lifecycle_surface() {
+        const MANIFEST: &str = r#"
+schema_version = "reborn.extension_manifest.v2"
+id = "channel-ext"
+name = "Channel Ext"
+version = "0.1.0"
+description = "A filesystem-discovered external channel extension."
+trust = "first_party_requested"
+
+[runtime]
+kind = "first_party"
+service = "channel_ext_host"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.inbound"
+
+[product_adapter.inbound]
+surface_kind = "external_channel"
+
+[product_adapter.inbound.auth]
+kind = "request_signature"
+header_name = "X-Channel-Signature"
+timestamp_header_name = "X-Channel-Timestamp"
+
+[product_adapter.inbound.capabilities]
+flags = ["inbound_messages"]
+
+[[product_adapter.inbound.required_credentials]]
+handle = "channel_ext_token"
+
+[[product_adapter.inbound.egress]]
+host = "example.com"
+credential_handle = "channel_ext_token"
+"#;
+
+        let fs = InMemoryBackend::default();
+        fs.write_file(
+            &VirtualPath::new("/system/extensions/channel-ext/manifest.toml").unwrap(),
+            MANIFEST.as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let catalog = AvailableExtensionCatalog::from_filesystem_root(
+            &fs,
+            &VirtualPath::new("/system/extensions").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let results = catalog.search("channel-ext").collect::<Vec<_>>();
+        assert_eq!(results.len(), 1, "filesystem manifest should be loaded");
+
+        let package = results.into_iter().next().unwrap();
+        assert_eq!(
+            package.summary().surface_kinds,
+            vec![LifecycleExtensionSurfaceKind::ExternalChannel],
+            "filesystem-loaded external_channel manifest must project ExternalChannel surface kind"
+        );
     }
 
     #[derive(Default)]
@@ -2089,6 +2667,7 @@ output_schema_ref = "schemas/write.output.json"
                 .unwrap(),
             manifest_toml: MANIFEST.to_string(),
             package,
+            surface_kinds: Vec::new(),
             assets: vec![
                 AvailableExtensionAsset {
                     path: "manifest.toml".to_string(),

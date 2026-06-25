@@ -17,7 +17,7 @@
 //! fails the change is still persisted and applies on the next restart, so the
 //! operator is never left with a silently-dropped edit (the failure is logged).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -176,11 +176,12 @@ impl RebornLlmConfigService {
         let list = self.admin_list_async().await.map_err(map_admin_error)?;
         let builtin_registry = ironclaw_llm::ProviderRegistry::try_load_from_path(None)
             .map_err(|_| LlmConfigServiceError::Unavailable)?;
+        let stored_key_provider_ids = self.stored_key_provider_ids_for_snapshot().await?;
 
         let mut providers = Vec::with_capacity(list.providers.len());
         let mut active = None;
         for info in list.providers {
-            let stored_key_set = self.stored_key_set_for_snapshot(&info.id).await;
+            let stored_key_set = stored_key_provider_ids.contains(&info.id);
             let builtin = builtin_registry.find(&info.id).is_some();
             let metadata = info.metadata;
             let env_key_set = metadata.as_ref().is_some_and(metadata_env_key_set);
@@ -222,16 +223,17 @@ impl RebornLlmConfigService {
         Ok(LlmConfigSnapshot { providers, active })
     }
 
-    async fn stored_key_set_for_snapshot(&self, provider_id: &str) -> bool {
-        match self.keys.exists(provider_id).await {
-            Ok(stored_key_set) => stored_key_set,
+    async fn stored_key_provider_ids_for_snapshot(
+        &self,
+    ) -> Result<HashSet<String>, LlmConfigServiceError> {
+        match self.keys.stored_provider_ids().await {
+            Ok(stored_key_provider_ids) => Ok(stored_key_provider_ids),
             Err(error) => {
-                tracing::warn!(
-                    provider_id,
+                tracing::error!(
                     error = %error,
-                    "LLM provider snapshot could not read stored key metadata; reporting api_key_set=false"
+                    "LLM provider snapshot could not list stored key metadata"
                 );
-                false
+                Err(LlmConfigServiceError::Unavailable)
             }
         }
     }
@@ -291,13 +293,24 @@ impl RebornLlmConfigService {
             {
                 apply_stored_api_key(&mut config, stored);
             }
-        } else {
+        } else if self
+            .keys
+            .exists(&request.provider_id)
+            .await
+            .map_err(|_| LlmConfigServiceError::Unavailable)?
+        {
+            // A stored key exists but this probe targets an overridden endpoint:
+            // refuse to inject it (a caller-controlled base_url could exfiltrate
+            // it). The caller must supply an inline key to probe elsewhere.
             return Err(LlmConfigServiceError::InvalidRequest {
                 field: Some("api_key".to_string()),
                 reason: "inline api_key is required when probing an overridden provider endpoint"
                     .to_string(),
             });
         }
+        // Otherwise there is neither an inline key nor a stored key to protect,
+        // so probe keyless — local OpenAI-compatible endpoints (e.g. Ollama)
+        // need no auth and must not be blocked behind a phantom key requirement.
 
         let session = ironclaw_llm::create_session_manager(config.session.clone()).await;
         ironclaw_llm::build_static_provider_chain(&config, session)
@@ -547,21 +560,34 @@ impl LlmConfigService for RebornLlmConfigService {
         _caller: WebUiAuthenticatedCaller,
         request: LlmProbeRequest,
     ) -> Result<LlmProbeResult, LlmConfigServiceError> {
+        let endpoint = probe_endpoint_label(&request);
         let provider = self.probe_provider(&request).await?;
         match provider.list_models().await {
             Ok(models) if !models.is_empty() => Ok(LlmProbeResult {
                 ok: true,
                 message: format!("connection ok — {} models available", models.len()),
             }),
+            // The endpoint answered but advertised no models. Connectivity is
+            // confirmed, but don't overstate it as a verified model list.
             Ok(_) => Ok(LlmProbeResult {
                 ok: true,
-                message: "provider configured; this adapter does not expose a model list to verify"
-                    .to_string(),
+                message: format!("connected to {endpoint}, but it reported no models"),
             }),
-            Err(_) => Ok(LlmProbeResult {
-                ok: false,
-                message: "could not reach the provider with these settings".to_string(),
-            }),
+            // A failed `list_models` is the connectivity signal: the discovery
+            // request never reached a live endpoint. Name the address so the
+            // operator can see which host was unreachable.
+            Err(error) => {
+                tracing::debug!(
+                    provider_id = %request.provider_id,
+                    adapter = %request.adapter,
+                    error = %error,
+                    "test_connection probe failed"
+                );
+                Ok(LlmProbeResult {
+                    ok: false,
+                    message: format!("could not reach {endpoint} with these settings"),
+                })
+            }
         }
     }
 
@@ -577,11 +603,19 @@ impl LlmConfigService for RebornLlmConfigService {
                 models,
                 message: String::new(),
             }),
-            Err(_) => Ok(LlmModelsResult {
-                ok: false,
-                models: Vec::new(),
-                message: "could not list models for this provider".to_string(),
-            }),
+            Err(error) => {
+                tracing::debug!(
+                    provider_id = %request.provider_id,
+                    adapter = %request.adapter,
+                    error = %error,
+                    "list_models probe failed"
+                );
+                Ok(LlmModelsResult {
+                    ok: false,
+                    models: Vec::new(),
+                    message: "could not list models for this provider".to_string(),
+                })
+            }
         }
     }
 
@@ -810,11 +844,24 @@ pub(crate) const NEARAI_LOGIN_CALLBACK_PATH: &str =
     "/api/webchat/v2/llm/nearai/{state}/auth/callback";
 
 /// Reduce a browser-supplied origin to a bare `scheme://host[:port]`, rejecting
-/// anything with a path/query or a non-http scheme. NEAR AI redirects the token
-/// here, so it must be a clean same-machine origin.
+/// anything with userinfo, a path, a query, or a fragment, plus non-http(s)
+/// schemes. NEAR AI redirects the login token to this origin, so it must be a
+/// clean origin with no smuggled structure — extra components are rejected
+/// outright rather than silently normalized away.
 fn sanitize_origin(raw: &str) -> Option<String> {
     let parsed = url::Url::parse(raw.trim()).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    // A bare origin has no credentials, only a root ("" or "/") path, and no
+    // query or fragment. Anything else is not an origin we will trust to build
+    // the token-bearing callback URL.
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
         return None;
     }
     let host = parsed.host_str()?;
@@ -870,6 +917,33 @@ fn normalized_endpoint(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.trim_end_matches('/').to_string())
+}
+
+/// Human-readable endpoint for probe-result messages so a connectivity failure
+/// names the address that was actually tried (e.g. `http://localhost:11434`)
+/// rather than a generic "the provider". Prefers the caller's override URL,
+/// then the builtin provider's default endpoint, then a generic fallback. Only
+/// ever returns the endpoint URL — never a key or other secret.
+fn probe_endpoint_label(request: &LlmProbeRequest) -> String {
+    if let Some(url) = request
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        return url.to_string();
+    }
+    if let Ok(registry) = ProviderRegistry::try_load_from_path(None)
+        && let Some(definition) = registry.find(&request.provider_id)
+        && let Some(base_url) = definition
+            .default_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    {
+        return base_url.to_string();
+    }
+    "the provider endpoint".to_string()
 }
 
 /// Resolve the overlay `ProviderDefinition` to write for an upsert.
@@ -999,6 +1073,8 @@ fn map_admin_error(error: crate::RebornProviderAdminError) -> LlmConfigServiceEr
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use ironclaw_host_api::{AgentId, ProjectId, ResourceScope, SecretHandle, TenantId, UserId};
     use ironclaw_reborn_config::{RebornHome, RebornProfile};
@@ -1021,6 +1097,91 @@ mod tests {
         LlmKeyStore::new(Arc::new(InMemorySecretStore::new()))
     }
 
+    struct CountingMetadataSecretStore {
+        inner: InMemorySecretStore,
+        metadata_calls: Arc<AtomicUsize>,
+        metadata_for_scope_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingMetadataSecretStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemorySecretStore::new(),
+                metadata_calls: Arc::new(AtomicUsize::new(0)),
+                metadata_for_scope_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SecretStore for CountingMetadataSecretStore {
+        async fn put(
+            &self,
+            scope: ResourceScope,
+            handle: SecretHandle,
+            material: SecretMaterial,
+            expires_at: Option<ironclaw_host_api::Timestamp>,
+        ) -> Result<SecretMetadata, SecretStoreError> {
+            self.inner.put(scope, handle, material, expires_at).await
+        }
+
+        async fn metadata(
+            &self,
+            scope: &ResourceScope,
+            handle: &SecretHandle,
+        ) -> Result<Option<SecretMetadata>, SecretStoreError> {
+            self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.metadata(scope, handle).await
+        }
+
+        async fn metadata_for_scope(
+            &self,
+            scope: &ResourceScope,
+        ) -> Result<Vec<SecretMetadata>, SecretStoreError> {
+            self.metadata_for_scope_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.metadata_for_scope(scope).await
+        }
+
+        async fn delete(
+            &self,
+            scope: &ResourceScope,
+            handle: &SecretHandle,
+        ) -> Result<bool, SecretStoreError> {
+            self.inner.delete(scope, handle).await
+        }
+
+        async fn lease_once(
+            &self,
+            scope: &ResourceScope,
+            handle: &SecretHandle,
+        ) -> Result<SecretLease, SecretStoreError> {
+            self.inner.lease_once(scope, handle).await
+        }
+
+        async fn consume(
+            &self,
+            scope: &ResourceScope,
+            lease_id: SecretLeaseId,
+        ) -> Result<SecretMaterial, SecretStoreError> {
+            self.inner.consume(scope, lease_id).await
+        }
+
+        async fn revoke(
+            &self,
+            scope: &ResourceScope,
+            lease_id: SecretLeaseId,
+        ) -> Result<SecretLease, SecretStoreError> {
+            self.inner.revoke(scope, lease_id).await
+        }
+
+        async fn leases_for_scope(
+            &self,
+            scope: &ResourceScope,
+        ) -> Result<Vec<SecretLease>, SecretStoreError> {
+            self.inner.leases_for_scope(scope).await
+        }
+    }
+
     struct MetadataUnavailableSecretStore {
         inner: InMemorySecretStore,
     }
@@ -1040,8 +1201,9 @@ mod tests {
             scope: ResourceScope,
             handle: SecretHandle,
             material: SecretMaterial,
+            expires_at: Option<ironclaw_host_api::Timestamp>,
         ) -> Result<SecretMetadata, SecretStoreError> {
-            self.inner.put(scope, handle, material).await
+            self.inner.put(scope, handle, material, expires_at).await
         }
 
         async fn metadata(
@@ -1049,6 +1211,15 @@ mod tests {
             _scope: &ResourceScope,
             _handle: &SecretHandle,
         ) -> Result<Option<SecretMetadata>, SecretStoreError> {
+            Err(SecretStoreError::StoreUnavailable {
+                reason: "metadata index unavailable".to_string(),
+            })
+        }
+
+        async fn metadata_for_scope(
+            &self,
+            _scope: &ResourceScope,
+        ) -> Result<Vec<SecretMetadata>, SecretStoreError> {
             Err(SecretStoreError::StoreUnavailable {
                 reason: "metadata index unavailable".to_string(),
             })
@@ -1142,6 +1313,36 @@ mod tests {
             "state must not be reusable after a successful callback"
         );
         assert!(!store.consume("missing-state").await);
+    }
+
+    #[test]
+    fn sanitize_origin_accepts_bare_origins_only() {
+        assert_eq!(
+            sanitize_origin("https://app.example.com"),
+            Some("https://app.example.com".to_string())
+        );
+        assert_eq!(
+            sanitize_origin("http://localhost:3000"),
+            Some("http://localhost:3000".to_string())
+        );
+        // A trailing root slash is still a bare origin.
+        assert_eq!(
+            sanitize_origin("https://app.example.com/"),
+            Some("https://app.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_origin_rejects_smuggled_structure_and_bad_schemes() {
+        // Path, query, fragment, and userinfo must be rejected outright, not
+        // silently dropped — they are not part of a trusted callback origin.
+        assert_eq!(sanitize_origin("https://app.example.com/evil/path"), None);
+        assert_eq!(sanitize_origin("https://app.example.com/?x=1"), None);
+        assert_eq!(sanitize_origin("https://app.example.com/#frag"), None);
+        assert_eq!(sanitize_origin("https://user:pass@app.example.com"), None);
+        assert_eq!(sanitize_origin("ftp://app.example.com"), None);
+        assert_eq!(sanitize_origin("javascript:alert(1)"), None);
+        assert_eq!(sanitize_origin("not a url"), None);
     }
 
     #[test]
@@ -1323,6 +1524,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_batches_stored_key_metadata_lookup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reborn_home = temp.path().join("reborn-home");
+        let boot = boot_for_home(&reborn_home);
+        let store = Arc::new(CountingMetadataSecretStore::new());
+        let metadata_calls = Arc::clone(&store.metadata_calls);
+        let metadata_for_scope_calls = Arc::clone(&store.metadata_for_scope_calls);
+        let service = RebornLlmConfigService::new(boot, LlmKeyStore::new(store));
+
+        let snapshot = service.snapshot(caller()).await.expect("snapshot");
+
+        assert!(
+            !snapshot.providers.is_empty(),
+            "snapshot should include registry providers"
+        );
+        assert_eq!(
+            metadata_for_scope_calls.load(Ordering::SeqCst),
+            1,
+            "snapshot must list stored key metadata once"
+        );
+        assert_eq!(
+            metadata_calls.load(Ordering::SeqCst),
+            0,
+            "snapshot must not probe stored keys one provider at a time"
+        );
+    }
+
+    #[tokio::test]
     async fn probe_override_requires_inline_key_before_using_stored_key() {
         let temp = tempfile::tempdir().expect("tempdir");
         let reborn_home = temp.path().join("reborn-home");
@@ -1355,6 +1584,69 @@ mod tests {
                 } if field == "api_key" && reason.contains("overridden provider endpoint")
             ),
             "stored operator keys must not be applied to caller-controlled probe endpoints"
+        );
+    }
+
+    /// Reproduction for the "Fetch models" failure on a keyless local provider
+    /// (e.g. Ollama at `http://localhost:11434`). With neither an inline key nor
+    /// a stored key, the probe used to be rejected with an `invalid_request`
+    /// validation error demanding an `api_key`. There is no stored key to
+    /// exfiltrate, so the probe must be allowed to run keyless instead — it then
+    /// just reports the endpoint as unreachable in the test environment.
+    #[tokio::test]
+    async fn probe_keyless_local_provider_is_not_blocked_on_missing_api_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reborn_home = temp.path().join("reborn-home");
+        let boot = boot_for_home(&reborn_home);
+        let service = RebornLlmConfigService::new(boot, key_store());
+
+        // Brand-new custom provider, never persisted, no stored key.
+        let result = service
+            .list_models(
+                caller(),
+                probe_request("local-ollama", "http://127.0.0.1:1", None),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "keyless local provider must pass the probe validation gate, got {result:?}"
+        );
+    }
+
+    /// Testing the connection to a local Ollama that is not running must
+    /// report failure and name the unreachable endpoint — not the prior false
+    /// "provider configured" success that left chat requests to fail later.
+    #[tokio::test]
+    async fn test_connection_reports_unreachable_ollama_endpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reborn_home = temp.path().join("reborn-home");
+        let boot = boot_for_home(&reborn_home);
+        let service = RebornLlmConfigService::new(boot, key_store());
+
+        let request = LlmProbeRequest {
+            provider_id: "ollama".to_string(),
+            adapter: "ollama".to_string(),
+            // Port 1 is never listening, so the `/api/tags` discovery request
+            // fails the same way a stopped Ollama would.
+            base_url: Some("http://127.0.0.1:1".to_string()),
+            model: Some("llama3".to_string()),
+            api_key: None,
+        };
+
+        let result = service
+            .test_connection(caller(), request)
+            .await
+            .expect("probe completes");
+
+        assert!(
+            !result.ok,
+            "an unreachable endpoint must not report success, got {result:?}"
+        );
+        assert!(
+            result.message.contains("127.0.0.1:1"),
+            "failure message must name the unreachable endpoint, got: {}",
+            result.message
         );
     }
 
@@ -1408,26 +1700,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_survives_stored_key_metadata_unavailable() {
+    async fn snapshot_fails_when_stored_key_metadata_unavailable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let reborn_home = temp.path().join("reborn-home");
         let boot = boot_for_home(&reborn_home);
         let keys = LlmKeyStore::new(Arc::new(MetadataUnavailableSecretStore::new()));
         let service = RebornLlmConfigService::new(boot, keys);
 
-        let snapshot = service
-            .upsert_provider(caller(), upsert_request("acme", Some("sk-acme"), false))
+        let error = service
+            .snapshot(caller())
             .await
-            .expect("provider snapshot must remain available");
-        let acme = snapshot
-            .providers
-            .iter()
-            .find(|provider| provider.id == "acme")
-            .expect("custom provider in snapshot");
+            .expect_err("stored-key metadata failures must fail loud");
 
         assert!(
-            !acme.api_key_set,
-            "unavailable stored-key metadata must degrade to api_key_set=false"
+            matches!(error, LlmConfigServiceError::Unavailable),
+            "expected unavailable error, got {error:?}"
         );
     }
 
