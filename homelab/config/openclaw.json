@@ -195,6 +195,15 @@
         url: "http://grafana-mcp.mcp.svc.cluster.local:8000/mcp",
         transport: "streamable-http",
       },
+      // Home Assistant control/read via HA's first-party mcp_server
+      // (Assist LLM API). Fronted by an in-cluster nginx proxy that
+      // injects the HA token, so no client credentials here (token at the
+      // server edge, like the others). See
+      // homelab/argocd/apps/_mcp/50-home-assistant-mcp.yaml.
+      "home-assistant": {
+        url: "http://home-assistant-mcp.mcp.svc.cluster.local:8080/mcp_server/sse",
+        transport: "sse",
+      },
     },
   },
 
