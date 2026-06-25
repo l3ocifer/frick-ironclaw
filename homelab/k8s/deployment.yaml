@@ -43,12 +43,31 @@ spec:
       securityContext:
         runAsNonRoot: false
         fsGroup: 0
+      initContainers:
+        # Ensure the deliverable dir exists and is owned by the agent uid.
+        # IronClaw's write_file tool resolves relative paths (the orchestrator
+        # dispatches workspace-relative `world/<file>.md`) against the process
+        # cwd — set to /data/graphs/frick/pages below — so this dir must exist
+        # at boot or the container's workingDir would be invalid. Runs as uid
+        # 1000 (image USER `ironclaw`) so files the agent writes are owned by it.
+        - name: seed-graph-dir
+          image: busybox:1.37
+          securityContext: { runAsUser: 1000, runAsGroup: 0 }
+          command: ["sh", "-c", "mkdir -p /data/graphs/frick/pages/world"]
+          volumeMounts:
+            - { name: graph-frick, mountPath: /data/graphs/frick }
       containers:
         - name: ironclaw
           image: git.leopaska.xyz/leo/frick-ironclaw:homelab
           imagePullPolicy: Always
           command: ["ironclaw"]
           args: ["--no-onboard", "run"]
+          # Root the process cwd at the Logseq graph's pages dir so the
+          # agent's filesystem write tool persists workspace-relative
+          # deliverables (e.g. `world/cluster-state.md`) into the RWX graph the
+          # mission-orchestrator verifies. Without this, relative writes
+          # landed in the ephemeral /home/ironclaw and missions never closed.
+          workingDir: /data/graphs/frick/pages
           ports:
             - { name: gateway, containerPort: 3000, protocol: TCP }
             - { name: metrics, containerPort: 9100, protocol: TCP }
@@ -76,6 +95,13 @@ spec:
                   name: frick-secrets
                   key: LITELLM_API_KEY
             - { name: IRONCLAW_PERSONA_DIR, value: "/etc/ironclaw/persona" }
+            # Mission deliverables are real files on the RWX graph, not the
+            # Postgres-backed `memory_write` workspace. Enable the local
+            # filesystem/shell tools (write_file, shell) and auto-approve them
+            # so unattended mission turns can persist `world/<file>.md` without
+            # an interactive approver wedging the turn.
+            - { name: ALLOW_LOCAL_TOOLS, value: "true" }
+            - { name: AGENT_AUTO_APPROVE_TOOLS, value: "true" }
           envFrom:
             - secretRef: { name: frick-secrets }
           livenessProbe:
