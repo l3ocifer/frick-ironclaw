@@ -365,6 +365,11 @@ impl Agent {
             crate::workspace::hygiene::HygieneConfig::default(),
             workspace.clone(),
             self.llm().clone(),
+        )
+        .with_tools(
+            self.tools().clone(),
+            self.safety().clone(),
+            self.deps.extension_manager.clone(),
         );
 
         match runner.check_heartbeat().await {

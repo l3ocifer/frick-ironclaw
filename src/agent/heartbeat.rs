@@ -29,12 +29,22 @@ use std::time::Duration;
 use chrono::TimeZone as _;
 use chrono_tz::Tz;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::channels::OutgoingResponse;
+use crate::context::JobContext;
+use crate::extensions::ExtensionManager;
 use crate::tenant::SystemScope;
+use crate::tools::{
+    ToolError, ToolRegistry, autonomous_allowed_tool_names, autonomous_unavailable_message,
+    prepare_tool_params,
+};
 use crate::workspace::Workspace;
 use crate::workspace::hygiene::HygieneConfig;
-use ironclaw_llm::{ChatMessage, CompletionRequest, LlmProvider, Reasoning};
+use ironclaw_llm::{
+    ChatMessage, CompletionRequest, LlmProvider, Reasoning, ToolCall, ToolCompletionRequest,
+};
+use ironclaw_safety::SafetyLayer;
 
 /// Configuration for the heartbeat runner.
 #[derive(Debug, Clone)]
@@ -183,6 +193,15 @@ pub struct HeartbeatRunner {
     llm: Arc<dyn LlmProvider>,
     response_tx: Option<mpsc::Sender<OutgoingResponse>>,
     store: Option<SystemScope>,
+    /// Tool registry for tool-executing heartbeat runs. When present (with
+    /// `safety`), `check_heartbeat` dispatches the model's tool calls through a
+    /// bounded agentic loop instead of emitting a single toolless completion
+    /// the model can only narrate as unexecuted `<tool_call>` text.
+    tools: Option<Arc<ToolRegistry>>,
+    /// Safety layer for tool-output sanitization in tool-executing runs.
+    safety: Option<Arc<SafetyLayer>>,
+    /// Owner-scoped extension activation state for autonomous tool resolution.
+    extension_manager: Option<Arc<ExtensionManager>>,
     consecutive_failures: u32,
 }
 
@@ -201,6 +220,9 @@ impl HeartbeatRunner {
             llm,
             response_tx: None,
             store: None,
+            tools: None,
+            safety: None,
+            extension_manager: None,
             consecutive_failures: 0,
         }
     }
@@ -214,6 +236,22 @@ impl HeartbeatRunner {
     /// Set the system-scoped database store for persistent heartbeat conversations.
     pub fn with_store(mut self, store: SystemScope) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Wire the tool surface so heartbeat runs execute the model's tool calls
+    /// instead of emitting a single toolless completion. Mirrors the routine
+    /// engine's lightweight-with-tools path: when `tools` + `safety` are set,
+    /// `check_heartbeat` drives a bounded agentic loop.
+    pub fn with_tools(
+        mut self,
+        tools: Arc<ToolRegistry>,
+        safety: Arc<SafetyLayer>,
+        extension_manager: Option<Arc<ExtensionManager>>,
+    ) -> Self {
+        self.tools = Some(tools);
+        self.safety = Some(safety);
+        self.extension_manager = extension_manager;
         self
     }
 
@@ -372,15 +410,33 @@ impl HeartbeatRunner {
             }
         };
 
-        let request = CompletionRequest::new(messages)
-            .with_max_tokens(max_tokens)
-            .with_temperature(0.3);
+        // Acquire the heartbeat response. When a tool registry + safety layer
+        // are wired in (production agents), run a bounded tool-executing loop so
+        // the model's tool calls actually run — instead of a single toolless
+        // completion the model can only narrate as unexecuted `<tool_call>`
+        // text. Otherwise fall back to the legacy single-shot text completion.
+        let content = match (self.tools.as_ref(), self.safety.as_ref()) {
+            (Some(tools), Some(safety)) => {
+                match self
+                    .run_with_tools(tools, safety, &system_prompt, &prompt, max_tokens)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => return HeartbeatResult::Failed(format!("LLM call failed: {}", e)),
+                }
+            }
+            _ => {
+                let request = CompletionRequest::new(messages)
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(0.3);
 
-        let reasoning =
-            Reasoning::new(self.llm.clone()).with_model_name(self.llm.active_model_name());
-        let (content, _usage) = match reasoning.complete(request).await {
-            Ok(r) => r,
-            Err(e) => return HeartbeatResult::Failed(format!("LLM call failed: {}", e)),
+                let reasoning =
+                    Reasoning::new(self.llm.clone()).with_model_name(self.llm.active_model_name());
+                match reasoning.complete(request).await {
+                    Ok((c, _usage)) => c,
+                    Err(e) => return HeartbeatResult::Failed(format!("LLM call failed: {}", e)),
+                }
+            }
         };
 
         let content = content.trim();
@@ -391,12 +447,186 @@ impl HeartbeatRunner {
             return HeartbeatResult::Failed("LLM returned empty content.".to_string());
         }
 
-        // Check if nothing needs attention
-        if content == "HEARTBEAT_OK" || content.contains("HEARTBEAT_OK") {
+        // Check if nothing needs attention. Trimmed-equality / prefix match —
+        // NOT a loose `contains`, which would suppress a genuine alert that
+        // merely mentions the sentinel somewhere mid-text.
+        if content == "HEARTBEAT_OK" || content.starts_with("HEARTBEAT_OK") {
             return HeartbeatResult::Ok;
         }
 
         HeartbeatResult::NeedsAttention(content.to_string())
+    }
+
+    /// Run the heartbeat checklist through a bounded, tool-executing agentic
+    /// loop. Mirrors `routine_engine::execute_lightweight_with_tools`: offer the
+    /// owner's autonomous tool surface, dispatch returned tool calls through the
+    /// safety pipeline, feed results back, and force a text-only final turn at
+    /// the iteration cap. Returns the model's final user-facing text.
+    async fn run_with_tools(
+        &self,
+        tools: &Arc<ToolRegistry>,
+        safety: &Arc<SafetyLayer>,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String, String> {
+        // Bounded like the routine lightweight loop (default
+        // `lightweight_max_iterations` = 3). The final round forces a
+        // text-only answer so the heartbeat always resolves to a summary or
+        // the HEARTBEAT_OK sentinel rather than dangling on a tool call.
+        const MAX_TOOL_ROUNDS: u32 = 3;
+        const MAX_TOOL_OUTPUT_CHARS: usize = 8192;
+
+        let user_id = self
+            .config
+            .notify_user_id
+            .as_deref()
+            .unwrap_or_else(|| self.workspace.user_id())
+            .to_string();
+
+        let mut messages = if system_prompt.is_empty() {
+            vec![ChatMessage::user(user_prompt)]
+        } else {
+            vec![
+                ChatMessage::system(system_prompt),
+                ChatMessage::user(user_prompt),
+            ]
+        };
+
+        let allowed_tools =
+            autonomous_allowed_tool_names(tools, self.extension_manager.as_ref(), &user_id).await;
+
+        // Minimal job context for tool execution (mirrors the lightweight
+        // routine path). `source: heartbeat` lets the message tool and audit
+        // trail attribute these dispatches.
+        let job_ctx = JobContext {
+            job_id: Uuid::new_v4(),
+            user_id: user_id.clone(),
+            title: "Heartbeat".to_string(),
+            description: "Heartbeat checklist".to_string(),
+            metadata: serde_json::json!({ "owner_id": user_id, "source": "heartbeat" }),
+            ..Default::default()
+        };
+
+        let mut iteration = 0u32;
+        loop {
+            iteration += 1;
+
+            // Final round: force a text-only response (no tools offered).
+            if iteration >= MAX_TOOL_ROUNDS {
+                // Claude rejects assistant prefill; NEAR AI rejects a non-user-
+                // ending conversation. Ensure the last message is user-role.
+                crate::util::ensure_ends_with_user_message(&mut messages);
+                let request = CompletionRequest::new(messages)
+                    .with_max_tokens(max_tokens)
+                    .with_temperature(0.3);
+                let response = self.llm.complete(request).await.map_err(|e| e.to_string())?;
+                return Ok(response.content);
+            }
+
+            let tool_defs = tools
+                .tool_definitions()
+                .await
+                .into_iter()
+                .filter(|tool| allowed_tools.contains(&tool.name))
+                .collect();
+
+            let request = ToolCompletionRequest::new(messages.clone(), tool_defs)
+                .with_max_tokens(max_tokens)
+                .with_temperature(0.3);
+
+            let response = self
+                .llm
+                .complete_with_tools(request)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // No tool calls → the model produced its final text answer.
+            if response.tool_calls.is_empty() {
+                return Ok(response.content.unwrap_or_default());
+            }
+
+            // Record the assistant turn (carry reasoning so DeepSeek/Gemini
+            // thinking-mode validate the chain), then execute the tools.
+            messages.push(
+                ChatMessage::assistant_with_tool_calls(
+                    response.content.clone(),
+                    response.tool_calls.clone(),
+                )
+                .with_reasoning(response.reasoning.clone()),
+            );
+
+            for tc in response.tool_calls {
+                let result_content = self
+                    .execute_heartbeat_tool(tools, safety, &job_ctx, &allowed_tools, &tc)
+                    .await;
+                let result_content = if result_content.len() > MAX_TOOL_OUTPUT_CHARS {
+                    let truncated = &result_content
+                        [..result_content.floor_char_boundary(MAX_TOOL_OUTPUT_CHARS)];
+                    format!("{truncated}\n... [output truncated to {MAX_TOOL_OUTPUT_CHARS} chars]")
+                } else {
+                    result_content
+                };
+                messages.push(ChatMessage::tool_result(&tc.id, &tc.name, &result_content));
+            }
+        }
+    }
+
+    /// Execute a single heartbeat tool call through the safety pipeline
+    /// (autonomous-scope gate → param prep → validation → timeout → execute →
+    /// sanitize → wrap). Mirrors `routine_engine::execute_routine_tool`; always
+    /// returns an LLM-ready string (tool output or a wrapped error message).
+    async fn execute_heartbeat_tool(
+        &self,
+        tools: &Arc<ToolRegistry>,
+        safety: &Arc<SafetyLayer>,
+        job_ctx: &JobContext,
+        allowed_tools: &std::collections::HashSet<String>,
+        tc: &ToolCall,
+    ) -> String {
+        let outcome: Result<String, String> = async {
+            if !allowed_tools.contains(&tc.name) {
+                return Err(autonomous_unavailable_message(&tc.name, &job_ctx.user_id));
+            }
+
+            let tool = tools
+                .get(&tc.name)
+                .await
+                .ok_or_else(|| format!("Tool '{}' not found", tc.name))?;
+            let normalized_params = prepare_tool_params(tool.as_ref(), &tc.arguments);
+
+            let validation = safety.validator().validate_tool_params(&normalized_params);
+            if !validation.is_valid {
+                let details = validation
+                    .errors
+                    .iter()
+                    .map(|e| format!("{}: {}", e.field, e.message))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!("Invalid tool parameters: {}", details));
+            }
+
+            let timeout = tool.execution_timeout();
+            let executed = tokio::time::timeout(timeout, async {
+                tool.execute(normalized_params.clone(), job_ctx).await
+            })
+            .await
+            .map_err(|_| ToolError::Timeout(timeout).to_string())?
+            .map_err(|e| e.to_string())?;
+
+            Ok(serde_json::to_string(&executed.result)
+                .unwrap_or_else(|_| "<serialize error>".to_string()))
+        }
+        .await;
+
+        // Sanitize + wrap both success and error so the loop always feeds the
+        // model an `<tool_output>`-wrapped, leak-scanned string.
+        let raw = match outcome {
+            Ok(output) => output,
+            Err(e) => format!("Tool '{}' failed: {}", tc.name, e),
+        };
+        let sanitized = safety.sanitize_tool_output(&tc.name, &raw);
+        safety.wrap_for_llm(&tc.name, &sanitized.content)
     }
 
     /// Send a notification about heartbeat findings.
@@ -495,6 +725,7 @@ fn strip_html_comments(content: &str) -> String {
 /// Spawn the heartbeat runner as a background task.
 ///
 /// Returns a handle that can be used to stop the runner.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_heartbeat(
     config: HeartbeatConfig,
     hygiene_config: HygieneConfig,
@@ -502,6 +733,9 @@ pub fn spawn_heartbeat(
     llm: Arc<dyn LlmProvider>,
     response_tx: Option<mpsc::Sender<OutgoingResponse>>,
     store: Option<SystemScope>,
+    tools: Option<Arc<ToolRegistry>>,
+    safety: Option<Arc<SafetyLayer>>,
+    extension_manager: Option<Arc<ExtensionManager>>,
 ) -> tokio::task::JoinHandle<()> {
     let mut runner = HeartbeatRunner::new(config, hygiene_config, workspace, llm);
     if let Some(tx) = response_tx {
@@ -509,6 +743,9 @@ pub fn spawn_heartbeat(
     }
     if let Some(s) = store {
         runner = runner.with_store(s);
+    }
+    if let (Some(tools), Some(safety)) = (tools, safety) {
+        runner = runner.with_tools(tools, safety, extension_manager);
     }
 
     tokio::spawn(async move {
@@ -520,12 +757,16 @@ pub fn spawn_heartbeat(
 /// have routines (enabled or not). Each tick, it queries the DB for distinct
 /// user_ids, creates a per-user workspace, and runs a heartbeat check for
 /// each user concurrently. Per-user failure counts are tracked independently.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_multi_user_heartbeat(
     config: HeartbeatConfig,
     hygiene_config: HygieneConfig,
     llm: Arc<dyn LlmProvider>,
     response_tx: Option<mpsc::Sender<OutgoingResponse>>,
     store: SystemScope,
+    tools: Option<Arc<ToolRegistry>>,
+    safety: Option<Arc<SafetyLayer>>,
+    extension_manager: Option<Arc<ExtensionManager>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !config.enabled {
@@ -612,6 +853,9 @@ pub fn spawn_multi_user_heartbeat(
                 let llm_clone = llm.clone();
                 let tx = response_tx.clone();
                 let system_store = store.clone();
+                let tools_clone = tools.clone();
+                let safety_clone = safety.clone();
+                let ext_clone = extension_manager.clone();
 
                 join_set.spawn(async move {
                     // Run memory hygiene per user (same as single-user heartbeat)
@@ -631,6 +875,9 @@ pub fn spawn_multi_user_heartbeat(
                         runner = runner.with_response_channel(tx);
                     }
                     runner = runner.with_store(system_store);
+                    if let (Some(tools), Some(safety)) = (tools_clone, safety_clone) {
+                        runner = runner.with_tools(tools, safety, ext_clone);
+                    }
 
                     let result = runner.check_heartbeat().await;
                     if let HeartbeatResult::NeedsAttention(msg) = &result {
@@ -910,6 +1157,9 @@ mod tests {
             Arc<dyn ironclaw_llm::LlmProvider>,
             Option<tokio::sync::mpsc::Sender<crate::channels::OutgoingResponse>>,
             Option<SystemScope>,
+            Option<Arc<crate::tools::ToolRegistry>>,
+            Option<Arc<ironclaw_safety::SafetyLayer>>,
+            Option<Arc<crate::extensions::ExtensionManager>>,
         ) -> tokio::task::JoinHandle<()> = spawn_heartbeat;
         let _ = _fn_ptr;
     }
