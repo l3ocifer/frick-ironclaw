@@ -175,6 +175,29 @@
     },
   },
 
+  // Federated MCP servers (homelab `mcp` namespace). Frick is cluster
+  // ops, so it gets edit-capable kubernetes + argocd sync + grafana
+  // read. Capability is scoped at the server/token/RBAC layer:
+  // k8s-mcp-frick runs --disable-destructive on a no-delete ServiceAccount;
+  // the argocd token is sync-scoped (not admin); the grafana SA is Viewer.
+  // See homelab/docs/agent-mcp-integration.md.
+  mcp: {
+    servers: {
+      kubernetes: {
+        url: "http://k8s-mcp-frick.mcp.svc.cluster.local:8080/mcp",
+        transport: "streamable-http",
+      },
+      argocd: {
+        url: "http://argocd-mcp.mcp.svc.cluster.local:3000/mcp",
+        transport: "streamable-http",
+      },
+      grafana: {
+        url: "http://grafana-mcp.mcp.svc.cluster.local:8000/mcp",
+        transport: "streamable-http",
+      },
+    },
+  },
+
   gateway: {
     mode: "local",
     port: 18789,
