@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ironclaw
+
+resources:
+  - ../../base
+  - ingress.yaml
+  - external-postgres.yaml
+  - external-ollama.yaml
+  - external-mcp.yaml
+
+patches:
+  - path: deployment-patch.yaml
+    target:
+      kind: Deployment
+      name: ironclaw
+
+  - path: configmap-patch.yaml
+    target:
+      kind: ConfigMap
+      name: ironclaw-config

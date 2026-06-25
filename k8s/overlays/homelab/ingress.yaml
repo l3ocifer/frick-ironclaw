@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ironclaw-ingress
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure,web
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: ironclaw.leopaska.xyz
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ironclaw
+                port:
+                  number: 3000

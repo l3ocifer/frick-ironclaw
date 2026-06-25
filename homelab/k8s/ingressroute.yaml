@@ -1,0 +1,33 @@
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: frick
+  namespace: agents-shared
+  labels:
+    app.kubernetes.io/name: frick
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: Host(`frick.leopaska.xyz`)
+      kind: Rule
+      services:
+        - { name: frick, port: 3000 }
+      middlewares:
+        - { name: authelia, namespace: authelia }
+  tls:
+    secretName: frick-leopaska-tls
+    domains:
+      - main: frick.leopaska.xyz
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: frick-leopaska-tls
+  namespace: agents-shared
+spec:
+  secretName: frick-leopaska-tls
+  dnsNames: [frick.leopaska.xyz]
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer

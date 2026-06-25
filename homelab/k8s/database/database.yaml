@@ -1,0 +1,26 @@
+---
+# Frick's Postgres database — declarative replacement for the
+# `CREATE DATABASE ironclaw_frick` line that used to live in
+# homelab-pg.yaml's postInitSQL (which only runs once at cluster
+# bootstrap, so it was useless for adding/recreating the agent later).
+#
+# CNPG handles idempotency: re-applying just no-ops if the DB already
+# exists with the right owner.
+#
+# The `frick` role MUST exist before this resource reconciles —
+# bootstrapped by role-bootstrap-job.yaml (sync-wave 0).
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: ironclaw-frick
+  namespace: databases
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  cluster:
+    name: homelab-pg
+  name: ironclaw_frick
+  owner: frick
+  ensure: present
+  encoding: UTF8
+  databaseReclaimPolicy: retain
