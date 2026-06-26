@@ -181,8 +181,18 @@
   // k8s-mcp-frick runs --disable-destructive on a no-delete ServiceAccount;
   // the argocd token is sync-scoped (not admin); the grafana SA is Viewer.
   // See homelab/docs/agent-mcp-integration.md.
+  // Central MCP gateway (ContextForge) merges every shared backend
+  // (k8s read-only, grafana, forgejo, home-assistant, postgres read-only)
+  // into ONE endpoint — add/update a server centrally in
+  // homelab/argocd/apps/_mcp/70-mcp-gateway.yaml and all agents get it.
+  // Frick keeps edit-capable k8s + argocd as ops-only DIRECT extras
+  // (the gateway only carries the read-only/safe variants).
   mcp: {
     servers: {
+      gateway: {
+        url: "http://mcp-gateway.mcp.svc.cluster.local:8080/sse",
+        transport: "sse",
+      },
       kubernetes: {
         url: "http://k8s-mcp-frick.mcp.svc.cluster.local:8080/mcp",
         transport: "streamable-http",
@@ -190,27 +200,6 @@
       argocd: {
         url: "http://argocd-mcp.mcp.svc.cluster.local:3000/mcp",
         transport: "streamable-http",
-      },
-      grafana: {
-        url: "http://grafana-mcp.mcp.svc.cluster.local:8000/mcp",
-        transport: "streamable-http",
-      },
-      // Home Assistant control/read via HA's first-party mcp_server
-      // (Assist LLM API). Fronted by an in-cluster nginx proxy that
-      // injects the HA token, so no client credentials here (token at the
-      // server edge, like the others). See
-      // homelab/argocd/apps/_mcp/50-home-assistant-mcp.yaml.
-      "home-assistant": {
-        url: "http://home-assistant-mcp.mcp.svc.cluster.local:8080/mcp_server/sse",
-        transport: "sse",
-      },
-      // Postgres MCP Pro (read-only) against the homelab-pg CNPG cluster:
-      // schema/SQL exploration, EXPLAIN, index tuning, and DB health
-      // (replication lag, vacuum/cache health). Read-only at the edge via
-      // the mcp_ro role. See homelab/argocd/apps/_mcp/60-postgres-mcp.yaml.
-      postgres: {
-        url: "http://postgres-mcp.mcp.svc.cluster.local:8000/sse",
-        transport: "sse",
       },
     },
   },
