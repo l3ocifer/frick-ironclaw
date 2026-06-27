@@ -11,26 +11,26 @@ repository = "https://github.com/nearai/ironclaw"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
+async-trait = "0.1.89"
 base64 = "0.22.1"
-blake3 = "1"
-futures-util = "0.3"
-glob = "0.3"
+blake3 = "1.8.5"
+futures-util = "0.3.32"
+glob = "0.3.3"
 ironclaw_auth = { path = "../ironclaw_auth" }
 ironclaw_extractors = { path = "../ironclaw_extractors" }
 ironclaw_filesystem = { path = "../ironclaw_filesystem" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_safety = { path = "../ironclaw_safety" }
 ironclaw_skills = { path = "../ironclaw_skills" }
-regex = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-similar = "2"
-thiserror = "2"
-tokio = { version = "1", features = ["rt", "sync"] }
-tracing = "0.1"
-unicode-normalization = "0.1"
+regex = "1.12.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+similar = "2.7.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt", "sync"] }
+tracing = "0.1.44"
+unicode-normalization = "0.1.25"
 
 [dev-dependencies]
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt"] }

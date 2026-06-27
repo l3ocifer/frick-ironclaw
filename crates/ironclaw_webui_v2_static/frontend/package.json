@@ -10,14 +10,14 @@
     "all": "bash build.sh"
   },
   "dependencies": {
-    "@tanstack/react-query": "5.87.4",
+    "@tanstack/react-query": "5.101.1",
     "htm": "3.1.1",
-    "react": "19.1.0",
-    "react-dom": "19.1.0",
-    "react-hook-form": "7.62.0",
-    "react-router": "7.9.1"
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-hook-form": "7.80.0",
+    "react-router": "7.18.0"
   },
   "devDependencies": {
-    "esbuild": "0.25.0"
+    "esbuild": "0.28.1"
   }
 }

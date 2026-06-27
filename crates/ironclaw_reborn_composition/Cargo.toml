@@ -90,11 +90,11 @@ postgres = [
     "ironclaw_triggers/postgres",
 ]
 [dependencies]
-async-trait = "0.1"
-base64 = "0.22"
-chrono = "0.4"
-deadpool-postgres = { version = "0.14", optional = true }
-futures = "0.3"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+chrono = "0.4.45"
+deadpool-postgres = { version = "0.14.1", optional = true }
+futures = "0.3.32"
 ironclaw_auth = { path = "../ironclaw_auth" }
 ironclaw_common = { path = "../ironclaw_common" }
 ironclaw_capabilities = { path = "../ironclaw_capabilities" }
@@ -143,42 +143,42 @@ ironclaw_projects = { path = "../ironclaw_projects" }
 ironclaw_trust = { path = "../ironclaw_trust" }
 ironclaw_turns = { path = "../ironclaw_turns" }
 ironclaw_product_context = { path = "../ironclaw_product_context", version = "0.1.0" }
-nix = { version = "0.29", default-features = false, features = ["process"] }
+nix = { version = "0.31.3", default-features = false, features = ["process"] }
 # WebUI v2 route surface — feature-gated; only used by `webui_serve`.
 ironclaw_webui_v2 = { path = "../ironclaw_webui_v2", optional = true }
 # WebUI v2 static SPA bundle — feature-gated; mounted under `/v2`.
 ironclaw_webui_v2_static = { path = "../ironclaw_webui_v2_static", optional = true }
 ironclaw_wasm_product_adapters = { path = "../ironclaw_wasm_product_adapters", optional = true }
-libsql = { version = "0.6", optional = true, default-features = false, features = ["core", "replication", "remote", "tls"] }
-libc = "0.2"
+libsql = { version = "0.9.30", optional = true, default-features = false, features = ["core", "replication", "remote", "tls"] }
+libc = "0.2.186"
 # axum + tower middleware stack used by the `webui_serve` module. Each
 # entry is feature-gated so non-beta builds carry no HTTP surface code.
-axum = { version = "0.8", optional = true }
-tower = { version = "0.5", optional = true }
-tower-http = { version = "0.6", optional = true, features = ["cors", "set-header", "limit", "catch-panic"] }
-lru = { version = "0.16", optional = true }
-fs4 = "0.6"
-rand = "0.8"
-rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
-secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-tempfile = "3"
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-toml = "0.8"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-url = "2"
-uuid = { version = "1", features = ["v4"] }
+axum = { version = "0.8.9", optional = true }
+tower = { version = "0.5.3", optional = true }
+tower-http = { version = "0.7.0", optional = true, features = ["cors", "set-header", "limit", "catch-panic"] }
+lru = { version = "0.18.0", optional = true }
+fs4 = "0.13.1"
+rand = "0.10.1"
+rust_decimal = { version = "1.42.1", features = ["serde", "serde-with-str"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+toml = "0.9.12"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+url = "2.5.8"
+uuid = { version = "1.23.4", features = ["v4"] }
 
 [dev-dependencies]
-async-trait = "0.1"
-hmac = "0.12"
-http = "1"
-http-body-util = "0.1"
+async-trait = "0.1.89"
+hmac = "0.13.0"
+http = "1.4.2"
+http-body-util = "0.1.3"
 ironclaw_common = { path = "../ironclaw_common" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_host_runtime = { path = "../ironclaw_host_runtime", features = ["test-support"] }
@@ -188,20 +188,20 @@ ironclaw_threads = { path = "../ironclaw_threads" }
 ironclaw_turns = { path = "../ironclaw_turns" }
 ironclaw_product_workflow = { path = "../ironclaw_product_workflow", features = ["test-support"] }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters" }
-rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
-rust_decimal_macros = "1"
-sha2 = "0.10"
-tempfile = "3"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+rust_decimal = { version = "1.42.1", features = ["serde", "serde-with-str"] }
+rust_decimal_macros = "1.40.0"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 # Real WebSocket client for the v2 stream-events-ws caller-level test.
 # Oneshot via `tower::ServiceExt::oneshot` cannot complete a true WS
 # upgrade (no underlying TCP stream → axum's WebSocketUpgrade extractor
 # returns 426), so the happy-path test needs a bound listener and a
 # proper WS client.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
-tower = { version = "0.5", features = ["util"] }
-tracing-test = "0.2"
+tower = { version = "0.5.3", features = ["util"] }
+tracing-test = "0.2.6"
 
 [[test]]
 name = "production_runtime_automations"
@@ -209,7 +209,7 @@ required-features = ["libsql"]
 
 [build-dependencies]
 ironclaw_skills = { path = "../ironclaw_skills" }
-serde_json = "1"
+serde_json = "1.0.150"
 
 [lints]
 workspace = true

@@ -36,20 +36,20 @@ pr3180-ready = []
 contract-tests = []
 
 [dependencies]
-async-trait = "0.1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-chrono-tz = "0.10"
+async-trait = "0.1.89"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+chrono-tz = "0.10.4"
 ironclaw_filesystem = { path = "../ironclaw_filesystem", version = "0.1.0" }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_memory = { path = "../ironclaw_memory", version = "0.1.0" }
 ironclaw_prompt_envelope = { path = "../ironclaw_prompt_envelope" }
 ironclaw_safety = { path = "../ironclaw_safety", version = "0.2.1" }
-jsonschema = { version = "0.45", default-features = false }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+jsonschema = { version = "0.46.6", default-features = false }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+tracing = "0.1.44"
+uuid = { version = "1.23.4", features = ["v4"] }
 
 [dev-dependencies]
 # Self dev-dependency enables `contract-tests` for the crate's
@@ -59,11 +59,11 @@ uuid = { version = "1", features = ["v4"] }
 # gated off in the production-facing build of the library so the
 # no-panics scanner only sees production code.
 ironclaw_memory_native = { path = ".", features = ["contract-tests"] }
-tempfile = "3"
+tempfile = "3.27.0"
 # `rt-multi-thread` is required by the race-safety test's
 # `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` —
 # without it, the macro silently falls back to current-thread and
 # `tokio::join!` polls cooperatively on one thread, hiding real
 # preemptive races against `replace_document_chunks_if_current`
 # (PR #3180 invariant 6).
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }

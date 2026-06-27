@@ -5,16 +5,16 @@ edition = "2024"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
+async-trait = "0.1.89"
 ironclaw_events = { path = "../ironclaw_events" }
 ironclaw_extensions = { path = "../ironclaw_extensions" }
 ironclaw_filesystem = { path = "../ironclaw_filesystem" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_resources = { path = "../ironclaw_resources" }
-serde_json = "1"
-tracing = "0.1"
+serde_json = "1.0.150"
+tracing = "0.1.44"
 
 [dev-dependencies]
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
-tracing-test = { version = "0.2", features = ["no-env-filter"] }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
