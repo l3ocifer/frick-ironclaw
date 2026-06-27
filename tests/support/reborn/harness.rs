@@ -42,8 +42,8 @@ use ironclaw_host_api::{
     CapabilityId, CapabilitySet, CredentialStageError, Decision, EffectKind, ExecutionContext,
     ExtensionId, GrantConstraints, HostPath, InvocationId, MountAlias, MountGrant,
     MountPermissions, MountView, NetworkPolicy, NetworkScheme, NetworkTargetPattern, Obligation,
-    Obligations, PackageId, Principal, ProjectId, ResourceEstimate, ResourceScope,
-    RuntimeCredentialAccountProviderId, RuntimeHttpEgress, RuntimeHttpEgressError,
+    Obligations, PackageId, Principal, ProjectId, ProviderToolName, ResourceEstimate,
+    ResourceScope, RuntimeCredentialAccountProviderId, RuntimeHttpEgress, RuntimeHttpEgressError,
     RuntimeHttpEgressRequest, RuntimeHttpEgressResponse, RuntimeKind, SecretHandle, TenantId,
     ThreadId, TrustClass, UserId, VirtualPath,
 };
@@ -1553,7 +1553,13 @@ impl HostRuntimeCapabilityHarness {
     }
 
     async fn file_tools_requiring_approval() -> HarnessResult<Self> {
-        Self::file_tools_with_runtime_policy(None).await
+        let harness = Self::file_tools_with_runtime_policy(None).await?;
+        // Global auto-approve now defaults ON, so disable it explicitly to keep
+        // this constructor's per-tool approval gate behavior.
+        harness
+            .disable_global_auto_approve_for_product_and_harness_users()
+            .await?;
+        Ok(harness)
     }
 
     async fn file_tools_with_runtime_policy(
@@ -1826,6 +1832,36 @@ impl HostRuntimeCapabilityHarness {
                 updated_by: Principal::User(scope.user_id.clone()),
                 scope,
                 enabled: true,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Global auto-approve now defaults ON. A test that needs to exercise the
+    /// per-tool approval gate must flip it OFF for the product and harness-user
+    /// scopes the run authorizes against, as an explicit precondition.
+    pub async fn disable_global_auto_approve_for_product_and_harness_users(
+        &self,
+    ) -> HarnessResult<()> {
+        let product_scope = product_scope();
+        self.disable_global_auto_approve(product_scope.clone())
+            .await?;
+        let mut harness_user_scope = product_scope;
+        harness_user_scope.user_id = self.user_id.clone();
+        self.disable_global_auto_approve(harness_user_scope).await?;
+        Ok(())
+    }
+
+    async fn disable_global_auto_approve(&self, scope: ResourceScope) -> HarnessResult<()> {
+        let store = self
+            .auto_approve_settings
+            .as_ref()
+            .ok_or("host runtime harness missing local-dev auto-approve settings")?;
+        store
+            .set(AutoApproveSettingInput {
+                updated_by: Principal::User(scope.user_id.clone()),
+                scope,
+                enabled: false,
             })
             .await?;
         Ok(())
@@ -3388,7 +3424,7 @@ impl LoopCapabilityPort for RecordingTestCapabilityPort {
     fn tool_definitions(&self) -> Result<Vec<ProviderToolDefinition>, AgentLoopHostError> {
         let definitions = vec![ProviderToolDefinition {
             capability_id: self.primary_capability_id(),
-            name: self.primary_tool_name().to_string(),
+            name: ProviderToolName::new(self.primary_tool_name()).expect("provider tool name"),
             description: "Echo a test payload".to_string(),
             parameters: json!({
                 "type": "object",
@@ -3720,7 +3756,7 @@ pub fn trace_tool_call_response() -> ironclaw_loop_support::HostManagedModelResp
                 provider_model_id: "trace_replay".to_string(),
                 provider_turn_id: "trace-turn".to_string(),
                 provider_call_id: "call-1".to_string(),
-                provider_tool_name: "test_echo".to_string(),
+                provider_tool_name: ProviderToolName::new("test_echo").expect("provider tool name"),
                 arguments: json!({"message": "hi"}),
                 response_reasoning: None,
                 reasoning: None,
