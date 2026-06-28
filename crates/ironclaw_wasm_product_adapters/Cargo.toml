@@ -11,23 +11,23 @@ repository = "https://github.com/nearai/ironclaw"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
-chrono = "0.4"
-hmac = "0.12"
-hex = "0.4"
-http = "1"
+async-trait = "0.1.89"
+chrono = "0.4.45"
+hmac = "0.13.0"
+hex = "0.4.3"
+http = "1.4.2"
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0", features = ["host-auth-mint"] }
 ironclaw_wasm_sandbox_core = { path = "../ironclaw_wasm_sandbox_core", version = "0.1.0" }
-serde_json = "1"
-sha2 = "0.10"
-subtle = "2"
-thiserror = "2"
-tokio = { version = "1", features = ["rt", "sync", "time"] }
-tracing = "0.1"
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt", "sync", "time"] }
+tracing = "0.1.44"
 wasmtime = { version = "44.0.3", features = ["component-model"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "sync"] }
-wat = "1.245.1"
-wit-component = "0.245.1"
-wit-parser = "0.245.1"
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync"] }
+wat = "1.252.0"
+wit-component = "0.252.0"
+wit-parser = "0.252.0"

@@ -7,17 +7,17 @@ description = "First-class Project entity, membership, and access control for Ir
 publish = false
 
 [dependencies]
-async-trait = "0.1"
-base64 = "0.22"
-chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1.89"
+base64 = "0.22.1"
+chrono = { version = "0.4.45", features = ["serde"] }
 ironclaw_filesystem = { path = "../ironclaw_filesystem" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tracing = "0.1"
-ulid = { version = "1", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+ulid = { version = "1.2.1", features = ["serde"] }
 
 [dev-dependencies]
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["macros", "rt"] }

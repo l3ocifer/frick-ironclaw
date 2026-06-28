@@ -12,15 +12,15 @@ repository = "https://github.com/nearai/ironclaw"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
+async-trait = "0.1.89"
 # Required by `MemoryServiceProfileSetRequest::from_tool_input`, which validates
 # IANA timezone names; the constructor must stay an inherent method on the
 # contract type so the existing consumer call site is unchanged.
-chrono-tz = "0.10"
+chrono-tz = "0.10.4"
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
 # Required only by `DocumentMetadata::from_value`, which logs a diagnostic on
 # deserialize failure; preserved to keep behavior identical to the impl crate.
-tracing = "0.1"
+tracing = "0.1.44"

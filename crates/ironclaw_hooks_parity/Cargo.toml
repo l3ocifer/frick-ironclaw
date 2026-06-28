@@ -52,16 +52,16 @@ ironclaw_hooks_libsql = { path = "../ironclaw_hooks_libsql" }
 ironclaw_hooks_postgres = { path = "../ironclaw_hooks_postgres" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 
-async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
-libsql = { version = "0.6", default-features = false, features = ["core", "replication", "remote", "tls"] }
-rust_decimal = { version = "1", features = ["serde"] }
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+async-trait = "0.1.89"
+chrono = { version = "0.4.45", features = ["serde"] }
+libsql = { version = "0.9.30", default-features = false, features = ["core", "replication", "remote", "tls"] }
+rust_decimal = { version = "1.42.1", features = ["serde"] }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 
 # Postgres driver for the parity matrix's own pool/schema setup. Always
 # compiled (optional dev-deps are not allowed); the code that uses these is
 # `#[cfg(feature = "postgres")]`-gated, so a build without `postgres` simply
 # never references them.
-deadpool-postgres = { version = "0.14" }
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+deadpool-postgres = { version = "0.14.1" }
+tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4"] }

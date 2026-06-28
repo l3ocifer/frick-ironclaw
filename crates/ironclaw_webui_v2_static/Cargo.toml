@@ -21,16 +21,16 @@ webui-v2-beta = ["dep:axum", "dep:tokio", "dep:tracing"]
 # Tiny RNG for per-request CSP nonces. `default-features = false`
 # keeps the dep surface minimal — only the `std` + `std_rng` features
 # are pulled in (no `rand` derive macros, no SmallRng grab-bag).
-rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+rand = { version = "0.10.1", default-features = false, features = ["std", "std_rng"] }
 
 # Optional — only when `webui-v2-beta` is enabled.
-axum = { version = "0.8", optional = true }
-tokio = { version = "1", features = ["sync"], optional = true }
-tracing = { version = "0.1", optional = true }
+axum = { version = "0.8.9", optional = true }
+tokio = { version = "1.52.3", features = ["sync"], optional = true }
+tracing = { version = "0.1.44", optional = true }
 
 [dev-dependencies]
 ironclaw_webui_v2_static = { path = ".", features = ["webui-v2-beta"] }
-http = "1"
-http-body-util = "0.1"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
-tower = { version = "0.5", features = ["util"] }
+http = "1.4.2"
+http-body-util = "0.1.3"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }
+tower = { version = "0.5.3", features = ["util"] }

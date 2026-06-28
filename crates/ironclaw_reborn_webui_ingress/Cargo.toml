@@ -21,40 +21,40 @@ default = []
 dev-in-memory-session = []
 
 [dependencies]
-async-trait = "0.1"
-axum = "0.8"
-base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+async-trait = "0.1.89"
+axum = "0.8.9"
+base64 = "0.22.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
 hex = "0.4.3"
-hmac = "0.12"
+hmac = "0.13.0"
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_reborn_composition = { path = "../ironclaw_reborn_composition", features = ["webui-v2-beta"] }
-jsonwebtoken = "9"
-parking_lot = "0.12"
-rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-subtle = "2"
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
-tower = { version = "0.5", features = ["util"] }
-tracing = "0.1"
-url = "2"
-urlencoding = "2"
+jsonwebtoken = "9.3.1"
+parking_lot = "0.12.5"
+rand = "0.10.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-tls"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5.3", features = ["util"] }
+tracing = "0.1.44"
+url = "2.5.8"
+urlencoding = "2.1.3"
 # `uuid` is consumed by `InMemorySessionStore` (session.rs) and the
 # library's internal tests under `#[cfg(test)]`. The earlier attempt
 # to mark it `optional = true` broke `cargo test` because the
 # `cfg(test)` gate activated the `use uuid::Uuid;` import without
 # pulling in the optional crate.
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1.23.4", features = ["v4"] }
 
 [dev-dependencies]
-axum = { version = "0.8", features = ["macros"] }
-http = "1"
-http-body-util = "0.1"
+axum = { version = "0.8.9", features = ["macros"] }
+http = "1.4.2"
+http-body-util = "0.1.3"
 # End-to-end session test (`tests/session_round_trip.rs`) drives the
 # composed `webui_v2_app` with a minimal `RebornServicesApi` stub so
 # the assertion covers SessionAuthenticator + the v2 route surface
@@ -66,9 +66,9 @@ ironclaw_threads = { path = "../ironclaw_threads" }
 ironclaw_turns = { path = "../ironclaw_turns" }
 # Generate test RSA keypairs at test time so the OIDC e2e test can
 # mint real signed JWTs without relying on a checked-in private key.
-rsa = { version = "0.9", features = ["sha2"] }
-rand = "0.8"
-base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time", "io-util"] }
+rsa = { version = "0.9.10", features = ["sha2"] }
+rand = "0.10.1"
+base64 = "0.22.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "net", "time", "io-util"] }
