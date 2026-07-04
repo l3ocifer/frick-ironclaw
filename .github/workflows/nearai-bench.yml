@@ -217,7 +217,7 @@ jobs:
     # SHA bump here. Both repos are under the same org with the same
     # write-access set, so the supply-chain delta vs. a pinned SHA is
     # small enough to trade for not stalling out every renderer change.
-    uses: nearai/benchmarks/.github/workflows/bench-pr-reusable.yml@main
+    uses: nearai/benchmarks/.github/workflows/bench-pr-reusable.yml@972d014ad7496fb1a21850199087194a89585a1c # main
     with:
       ironclaw-rev: ${{ needs.parse.outputs.head_sha }}
       pr-repo: ${{ github.repository }}
