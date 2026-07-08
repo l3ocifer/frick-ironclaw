@@ -185,7 +185,7 @@ aws-smithy-types = { version = "1", optional = true }
 weave-core = { path = "vendor/weave-core" }
 
 # Sandboxed Python interpreter
-monty = { git = "https://github.com/pydantic/monty", rev = "dcdf702" }
+monty = { git = "https://github.com/pydantic/monty", rev = "31fe1ecf464cf8307f74b87c1abef09342753ea9" }
 
 # ERC-8004 agent identity (on-chain registry, agent cards)
 erc8004 = "0.2"
