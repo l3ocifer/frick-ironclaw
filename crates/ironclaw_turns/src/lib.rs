@@ -7,9 +7,11 @@
 #![warn(unreachable_pub)]
 
 mod admission;
+mod block_persistence;
 mod checkpoint_state;
 mod coordinator;
 pub mod events;
+mod external_tool_catalog;
 mod filesystem_store;
 mod ids;
 mod lifecycle;
@@ -30,6 +32,7 @@ pub use admission::{
     TurnAdmissionCapacityDenial, TurnAdmissionClass, TurnAdmissionLimit,
     TurnAdmissionLimitProvider, TurnAdmissionLimitUnavailable, TurnAdmissionReservationRecord,
 };
+pub use block_persistence::TurnStateBlockPersistence;
 pub use checkpoint_state::{
     CheckpointStateMatchMetadata, CheckpointStateRecord, CheckpointStateStore,
     GetCheckpointStateRequest, GetLoopCheckpointRequest, InMemoryCheckpointStateStore,
@@ -51,7 +54,14 @@ pub use events::{
     TurnEventReducerService, TurnEventReducerSnapshot, TurnEventSink, TurnLifecycleEvent,
     TurnLifecycleProjectionEntry,
 };
-pub use filesystem_store::FilesystemTurnStateStore;
+pub use external_tool_catalog::{
+    ExternalToolCatalog, ExternalToolCatalogError, ExternalToolSpec, ExternalToolSpecError,
+    InMemoryExternalToolCatalog, PendingExternalCall,
+};
+pub use filesystem_store::{
+    FilesystemTurnStateBlockPersistence, FilesystemTurnStateRowStore, FilesystemTurnStateStore,
+    FilesystemTurnStateStoreKind,
+};
 pub use ids::{
     AcceptedMessageRef, CapabilityActivityId, GateRef, IdempotencyKey, LoopDiagnosticRef,
     LoopExitId, LoopGateRef, LoopMessageRef, LoopResultRef, LoopUsageSummaryRef,
@@ -75,9 +85,11 @@ pub use origin::{
 };
 pub use request::{
     CancelRunRequest, GateResumeDisposition, GetRunStateRequest, ResumeTurnPrecondition,
-    ResumeTurnRequest, SubmitChildRunRequest, SubmitTurnRequest, TurnTimestamp,
+    ResumeTurnRequest, RetryTurnRequest, SubmitChildRunRequest, SubmitTurnRequest, TurnTimestamp,
 };
-pub use response::{CancelRunResponse, ResumeTurnResponse, SubmitTurnResponse, ThreadBusy};
+pub use response::{
+    CancelRunResponse, ResumeTurnResponse, RetryTurnResponse, SubmitTurnResponse, ThreadBusy,
+};
 pub use run_profile::{
     AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverResumeRequest,
     AgentLoopDriverRunRequest, CancellationPolicy, CapabilitySurfaceProfileId, CheckpointPolicy,
