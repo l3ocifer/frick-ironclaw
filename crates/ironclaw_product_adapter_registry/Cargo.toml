@@ -14,11 +14,11 @@ publish = false
 ironclaw_extensions = { path = "../ironclaw_extensions", version = "0.1.0" }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0" }
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
-toml = "0.8"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+toml = "0.9.12"
 
 [dev-dependencies]
-chrono = { version = "0.4", features = ["serde"] }
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt", "sync"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync"] }

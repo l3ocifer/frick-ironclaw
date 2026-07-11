@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.6
+# syntax=docker/dockerfile:1.25
 #
 # Per-project sandbox container image for IronClaw engine v2.
 #

@@ -15,11 +15,11 @@ ironclaw_common = { path = "../ironclaw_common", version = "0.4.2" }
 ironclaw_extractors = { path = "../ironclaw_extractors", version = "0.1.0" }
 ironclaw_filesystem = { path = "../ironclaw_filesystem", version = "0.1.0" }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
-thiserror = "2"
-tracing = "0.1"
+thiserror = "2.0.18"
+tracing = "0.1.44"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
