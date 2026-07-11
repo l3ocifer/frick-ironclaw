@@ -11,8 +11,8 @@ repository = "https://github.com/nearai/ironclaw"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1.89"
+chrono = { version = "0.4.45", features = ["serde"] }
 # Production deps only. `tracing` was previously listed here with no call
 # sites in `src/` and has been dropped (Copilot #4). `uuid` moved to
 # dev-deps because its only `src/` references live inside
@@ -21,9 +21,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # contract test crate, not from the adapter library itself.
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0" }
 ironclaw_turns = { path = "../ironclaw_turns", version = "0.1.0" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
 
 [dev-dependencies]
 # `test-support` exposes `FakeProtocolHttpEgress` / `FakeOutboundDeliverySink`
@@ -35,5 +35,5 @@ thiserror = "2"
 # been removed pending the post-#3352 fixture port — re-add those when
 # the contract suite returns.
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0", features = ["test-support", "host-auth-mint"] }
-tokio = { version = "1", features = ["macros", "rt", "sync"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync"] }
+uuid = { version = "1.23.4", features = ["v4", "serde"] }

@@ -16,20 +16,20 @@ libsql = ["ironclaw_filesystem/libsql"]
 postgres = ["ironclaw_filesystem/postgres"]
 
 [dependencies]
-async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
-futures-util = "0.3"
+async-trait = "0.1.89"
+chrono = { version = "0.4.45", features = ["serde"] }
+futures-util = "0.3.32"
 ironclaw_filesystem = { path = "../ironclaw_filesystem", version = "0.1.0" }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_product_workflow = { path = "../ironclaw_product_workflow", version = "0.1.0" }
-serde_json = "1"
-tracing = "0.1"
+serde_json = "1.0.150"
+tracing = "0.1.44"
 
 [dev-dependencies]
-deadpool-postgres = "0.14"
+deadpool-postgres = "0.14.1"
 ironclaw_filesystem = { path = "../ironclaw_filesystem", features = ["libsql", "postgres"] }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters" }
-libsql = { version = "0.6", default-features = false, features = ["core", "replication", "remote", "tls"] }
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-tokio-postgres = "0.7"
+libsql = { version = "0.9.30", default-features = false, features = ["core", "replication", "remote", "tls"] }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
+tokio-postgres = "0.7.18"
