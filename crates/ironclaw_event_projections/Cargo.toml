@@ -5,14 +5,14 @@ edition = "2024"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+async-trait = "0.1.89"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 ironclaw_events = { path = "../ironclaw_events" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_memory = { path = "../ironclaw_memory" }
 ironclaw_turns = { path = "../ironclaw_turns" }
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
 
 [dev-dependencies]
 ironclaw_extensions = { path = "../ironclaw_extensions" }
@@ -20,6 +20,6 @@ ironclaw_filesystem = { path = "../ironclaw_filesystem" }
 ironclaw_memory = { path = "../ironclaw_memory" }
 ironclaw_memory_native = { path = "../ironclaw_memory_native" }
 ironclaw_reborn_event_store = { path = "../ironclaw_reborn_event_store" }
-serde_json = "1"
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
+serde_json = "1.0.150"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt"] }

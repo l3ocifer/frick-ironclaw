@@ -13,9 +13,9 @@ repository = "https://github.com/nearai/ironclaw"
 dist = false
 
 [dependencies]
-async-trait = "0.1"
+async-trait = "0.1.89"
 ironclaw_skills = { path = "../ironclaw_skills", version = "0.3.0" }
-thiserror = "2"
+thiserror = "2.0.18"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
