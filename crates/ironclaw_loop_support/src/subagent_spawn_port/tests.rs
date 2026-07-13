@@ -1,5 +1,5 @@
 use chrono::Utc;
-use ironclaw_host_api::{AgentId, TenantId, UserId};
+use ironclaw_host_api::{AgentId, ProviderToolName, TenantId, UserId};
 use ironclaw_threads::{
     AcceptedInboundMessage, AcceptedInboundMessageReplay, AppendAssistantDraftRequest,
     AppendCapabilityDisplayPreviewRequest, AppendToolResultReferenceRequest, ContextMessages,
@@ -17,7 +17,9 @@ use ironclaw_turns::{
     SubmitTurnRequest, TurnId, TurnRunProfile, TurnRunRecord, TurnRunState, TurnStateStore,
     TurnStatus,
     run_profile::{
-        CapabilityResultMessage, CapabilitySurfaceVersion, RegisterProviderToolCallRequest,
+        CapabilityResultMessage, CapabilitySurfaceVersion, ModelVisibleToolObservation,
+        ObservationTrust, RegisterProviderToolCallRequest, ToolObservationDetail,
+        ToolObservationStatus,
     },
 };
 use serde_json::json;
@@ -78,7 +80,51 @@ struct SuspendedBatchPort {
 
 struct NoopResultWriter;
 
+#[derive(Default)]
+struct RecordingResultWriter {
+    delete_calls: std::sync::atomic::AtomicUsize,
+}
+
 struct NoopGoalStore;
+
+/// Wraps [`InMemoryAwaitEdgeWriter`] but always rejects the lazy-recovery
+/// admission check — drives `finish_spawn`'s `check_scope_recovered` reject
+/// branch (external review finding: this must surface as a retryable
+/// `CapabilityOutcome::Failed`, never `Err(AgentLoopHostError)`).
+#[derive(Default)]
+struct AlwaysRecoveringAwaitEdgeWriter {
+    inner: InMemoryAwaitEdgeWriter,
+}
+
+#[async_trait]
+impl crate::AwaitEdgeWriter for AlwaysRecoveringAwaitEdgeWriter {
+    async fn check_scope_recovered(
+        &self,
+        _scope: &TurnScope,
+    ) -> Result<(), crate::ScopeRecoveryInProgress> {
+        Err(crate::ScopeRecoveryInProgress {
+            retry_after_hint: std::time::Duration::from_millis(50),
+        })
+    }
+
+    async fn record_awaited_child(
+        &self,
+        record: AwaitedChildSetRecord,
+    ) -> Result<(), AgentLoopHostError> {
+        self.inner.record_awaited_child(record).await
+    }
+
+    async fn abandon_awaited_child(
+        &self,
+        child_scope: &TurnScope,
+        parent_run_id: TurnRunId,
+        child_run_id: TurnRunId,
+    ) -> Result<(), AgentLoopHostError> {
+        self.inner
+            .abandon_awaited_child(child_scope, parent_run_id, child_run_id)
+            .await
+    }
+}
 
 struct StaticCoordinator;
 
@@ -224,6 +270,7 @@ impl LoopCapabilityPort for SurfacePrimedSpawnAuthPort {
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
         *self.visible_calls.lock().unwrap() += 1;
         Ok(VisibleCapabilitySurface {
+            callable_capability_ids: None,
             version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
             descriptors: vec![CapabilityDescriptorView {
                 capability_id: CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
@@ -248,6 +295,7 @@ impl LoopCapabilityPort for SurfacePrimedSpawnAuthPort {
             terminate_hint: false,
             byte_len: 0,
             output_digest: None,
+            model_observation: None,
         }))
     }
 
@@ -292,6 +340,7 @@ impl LoopCapabilityPort for StrictSpawnAuthPort {
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
         *self.visible_calls.lock().unwrap() += 1;
         Ok(VisibleCapabilitySurface {
+            callable_capability_ids: None,
             version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
             descriptors: vec![CapabilityDescriptorView {
                 capability_id: CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
@@ -354,6 +403,7 @@ impl LoopCapabilityPort for AuthPassPort {
         _request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
         Ok(VisibleCapabilitySurface {
+            callable_capability_ids: None,
             version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
             descriptors: Vec::new(),
         })
@@ -370,6 +420,7 @@ impl LoopCapabilityPort for AuthPassPort {
             terminate_hint: false,
             byte_len: 0,
             output_digest: None,
+            model_observation: None,
         }))
     }
 
@@ -412,6 +463,7 @@ impl LoopCapabilityPort for FixedToolPort {
         _request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
         Ok(VisibleCapabilitySurface {
+            callable_capability_ids: None,
             version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
             descriptors: Vec::new(),
         })
@@ -446,6 +498,7 @@ impl LoopCapabilityPort for RecordingBatchPort {
         _request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
         Ok(VisibleCapabilitySurface {
+            callable_capability_ids: None,
             version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
             descriptors: Vec::new(),
         })
@@ -481,6 +534,7 @@ impl LoopCapabilityPort for SuspendedBatchPort {
         _request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
         Ok(VisibleCapabilitySurface {
+            callable_capability_ids: None,
             version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
             descriptors: Vec::new(),
         })
@@ -527,12 +581,36 @@ impl LoopCapabilityResultWriter for NoopResultWriter {
 }
 
 #[async_trait]
+impl LoopCapabilityResultWriter for RecordingResultWriter {
+    async fn write_capability_result(
+        &self,
+        _write: CapabilityResultWrite<'_>,
+    ) -> Result<CapabilityWriteResult, AgentLoopHostError> {
+        Ok(CapabilityWriteResult::without_output_digest(
+            LoopResultRef::new("result:spawn").unwrap(),
+            0,
+        ))
+    }
+
+    async fn delete_capability_result(
+        &self,
+        _run_context: &LoopRunContext,
+        _result_ref: &LoopResultRef,
+    ) -> Result<(), AgentLoopHostError> {
+        self.delete_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl LoopCapabilityPort for FailingBatchPort {
     async fn visible_capabilities(
         &self,
         _request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
         Ok(VisibleCapabilitySurface {
+            callable_capability_ids: None,
             version: CapabilitySurfaceVersion::new("surface:test").unwrap(),
             descriptors: Vec::new(),
         })
@@ -619,6 +697,13 @@ impl TurnCoordinator for StaticCoordinator {
         _request: ResumeTurnRequest,
     ) -> Result<ResumeTurnResponse, TurnError> {
         unreachable!("spawn tests do not resume turns")
+    }
+
+    async fn retry_turn(
+        &self,
+        _request: ironclaw_turns::RetryTurnRequest,
+    ) -> Result<ironclaw_turns::RetryTurnResponse, TurnError> {
+        unreachable!("spawn tests do not retry turns")
     }
 
     async fn cancel_run(&self, _request: CancelRunRequest) -> Result<CancelRunResponse, TurnError> {
@@ -846,6 +931,16 @@ impl TurnStateStore for StaticTurnStateStore {
         unreachable!("spawn tests do not resume through state store")
     }
 
+    async fn retry_turn(
+        &self,
+        request: ironclaw_turns::RetryTurnRequest,
+    ) -> Result<ironclaw_turns::RetryTurnResponse, TurnError> {
+        // WS-3 implements this.
+        Err(TurnError::RunNotRetryable {
+            run_id: request.run_id,
+        })
+    }
+
     async fn request_cancel(
         &self,
         request: CancelRunRequest,
@@ -904,6 +999,7 @@ impl TurnSpawnTreeStateStore for StaticTurnStateStore {
             scope: scope.clone(),
             root_run_id,
             descendant_count: u64::from(delta),
+            released_children: std::collections::BTreeSet::new(),
         })
     }
 
@@ -912,11 +1008,21 @@ impl TurnSpawnTreeStateStore for StaticTurnStateStore {
         scope: &TurnScope,
         root_run_id: TurnRunId,
         delta: u32,
+        _idempotency_key: TurnRunId,
     ) -> Result<(), TurnError> {
         self.releases
             .lock()
             .unwrap()
             .push((scope.clone(), root_run_id, delta));
+        Ok(())
+    }
+
+    async fn prune_released_child(
+        &self,
+        _scope: &TurnScope,
+        _root_run_id: TurnRunId,
+        _child_run_id: TurnRunId,
+    ) -> Result<(), TurnError> {
         Ok(())
     }
 }
@@ -931,7 +1037,7 @@ fn provider_tool_call(name: &str) -> ProviderToolCall {
         provider_model_id: "test-model".to_string(),
         turn_id: Some("provider-turn:test".to_string()),
         id: "call-spawn".to_string(),
-        name: name.to_string(),
+        name: ProviderToolName::new(name).expect("provider tool name"),
         arguments: json!({
             "flavor_id": "general",
             "task": "investigate"
@@ -949,7 +1055,7 @@ fn spawn_provider_tool_call() -> ProviderToolCall {
 fn spawn_tool_definition() -> ProviderToolDefinition {
     ProviderToolDefinition {
         capability_id: CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
-        name: SPAWN_SUBAGENT_PROVIDER_TOOL_NAME.to_string(),
+        name: ProviderToolName::new(SPAWN_SUBAGENT_PROVIDER_TOOL_NAME).expect("provider tool name"),
         description: SPAWN_SUBAGENT_DESCRIPTION.to_string(),
         parameters: build_spawn_subagent_parameters_schema(&[]),
     }
@@ -958,7 +1064,7 @@ fn spawn_tool_definition() -> ProviderToolDefinition {
 fn custom_tool_definition() -> ProviderToolDefinition {
     ProviderToolDefinition {
         capability_id: CapabilityId::new("builtin.custom_tool").unwrap(),
-        name: "demo__custom".to_string(),
+        name: ProviderToolName::new("demo__custom").expect("provider tool name"),
         description: "Custom delegated tool".to_string(),
         parameters: json!({"type": "object"}),
     }
@@ -1005,6 +1111,27 @@ async fn test_run_context_with_agent_actor(label: &str) -> LoopRunContext {
         UserId::new(format!("user-{label}")).unwrap(),
     ));
     context.scope.agent_id = Some(AgentId::new(format!("agent-{label}")).unwrap());
+    context
+}
+
+/// Like [`test_run_context_with_agent_actor`], but the parent's own scope
+/// carries an *explicit* thread owner (`TurnScope::new_with_owner`) matching
+/// its actor — the real multi-user/product-turn shape, as opposed to the
+/// `ActorFallback` scope every other helper here builds.
+async fn test_run_context_with_explicit_owner_scope(label: &str) -> LoopRunContext {
+    let mut context = test_run_context_with_agent_actor(label).await;
+    let owner = context
+        .actor
+        .clone()
+        .expect("with_agent_actor sets an actor")
+        .user_id;
+    context.scope = TurnScope::new_with_owner(
+        context.scope.tenant_id.clone(),
+        context.scope.agent_id.clone(),
+        context.scope.project_id.clone(),
+        context.scope.thread_id.clone(),
+        Some(owner),
+    );
     context
 }
 
@@ -1080,7 +1207,7 @@ async fn spawn_test_port(
         turn_state_store: turn_store,
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         goal_store: Arc::new(NoopGoalStore),
-        gate_store: Arc::new(InMemorySubagentGateResolutionStore::default()),
+        await_edge_writer: Arc::new(InMemoryAwaitEdgeWriter::default()),
         definition_resolver: Arc::new(resolver),
         spawn_input_codec: Arc::new(StaticSpawnInputCodec {
             args: default_spawn_args(),
@@ -1113,7 +1240,7 @@ fn spawn_test_port_with_inner(
         )))),
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         goal_store: Arc::new(NoopGoalStore),
-        gate_store: Arc::new(InMemorySubagentGateResolutionStore::default()),
+        await_edge_writer: Arc::new(InMemoryAwaitEdgeWriter::default()),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -1135,7 +1262,7 @@ struct SpawnPortWithRecorders {
     port: SubagentSpawnCapabilityPort,
     child_runs: Arc<RecordingChildRuns>,
     goal_store: Arc<RecordingGoalStore>,
-    gate_store: Arc<InMemorySubagentGateResolutionStore>,
+    await_edge_writer: Arc<InMemoryAwaitEdgeWriter>,
 }
 
 fn spawn_test_port_with_codec_and_recorders(
@@ -1144,7 +1271,7 @@ fn spawn_test_port_with_codec_and_recorders(
 ) -> SpawnPortWithRecorders {
     let child_runs = Arc::new(RecordingChildRuns::default());
     let goal_store = Arc::new(RecordingGoalStore::default());
-    let gate_store = Arc::new(InMemorySubagentGateResolutionStore::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
         child_runs: child_runs.clone(),
@@ -1154,7 +1281,7 @@ fn spawn_test_port_with_codec_and_recorders(
         )))),
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         goal_store: goal_store.clone(),
-        gate_store: gate_store.clone(),
+        await_edge_writer: gate_store.clone(),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -1175,7 +1302,7 @@ fn spawn_test_port_with_codec_and_recorders(
         port,
         child_runs,
         goal_store,
-        gate_store,
+        await_edge_writer: gate_store,
     }
 }
 
@@ -1223,6 +1350,7 @@ fn completed_outcome(label: &str) -> CapabilityOutcome {
         terminate_hint: false,
         byte_len: 0,
         output_digest: None,
+        model_observation: None,
     })
 }
 
@@ -1333,7 +1461,7 @@ async fn spawn_tool_definition_is_present_in_structured_tools() {
         })
         .expect("spawn tool definition");
 
-    assert_eq!(definition.name, SPAWN_SUBAGENT_PROVIDER_TOOL_NAME);
+    assert_eq!(definition.name.as_str(), SPAWN_SUBAGENT_PROVIDER_TOOL_NAME);
     assert_eq!(
         definition.parameters["required"],
         json!(["subagent_type", "task"])
@@ -1656,7 +1784,7 @@ async fn spawn_provider_tool_call_invoke_rejects_changed_activity_id_before_chil
             turn_state_store: Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0)))),
             thread_service: Arc::new(InMemorySessionThreadService::default()),
             goal_store: Arc::new(NoopGoalStore),
-            gate_store: Arc::new(InMemorySubagentGateResolutionStore::default()),
+            await_edge_writer: Arc::new(InMemoryAwaitEdgeWriter::default()),
             definition_resolver: Arc::new(StaticDefinitionResolver {
                 resolved: Some(subagent_definition(false)),
                 parent: None,
@@ -1740,7 +1868,7 @@ async fn spawn_provider_tool_call_registration_does_not_require_inner_spawn_name
             turn_state_store: Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0)))),
             thread_service: Arc::new(InMemorySessionThreadService::default()),
             goal_store: Arc::new(NoopGoalStore),
-            gate_store: Arc::new(InMemorySubagentGateResolutionStore::default()),
+            await_edge_writer: Arc::new(InMemoryAwaitEdgeWriter::default()),
             definition_resolver: Arc::new(StaticDefinitionResolver {
                 resolved: Some(subagent_definition(false)),
                 parent: None,
@@ -1919,7 +2047,7 @@ async fn invoke_spawn_rejects_when_authorization_input_ref_is_missing() {
             turn_state_store: Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0)))),
             thread_service: Arc::new(InMemorySessionThreadService::default()),
             goal_store: Arc::new(NoopGoalStore),
-            gate_store: Arc::new(InMemorySubagentGateResolutionStore::default()),
+            await_edge_writer: Arc::new(InMemoryAwaitEdgeWriter::default()),
             definition_resolver: Arc::new(StaticDefinitionResolver {
                 resolved: Some(subagent_definition(false)),
                 parent: None,
@@ -1944,14 +2072,14 @@ async fn invoke_spawn_submits_child_run_through_spawn_tree_port() {
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
     let goal_store = Arc::new(RecordingGoalStore::default());
-    let gate_store = Arc::new(InMemorySubagentGateResolutionStore::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
         child_runs: child_runs.clone(),
         turn_state_store: turn_store,
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         goal_store: goal_store.clone(),
-        gate_store: gate_store.clone(),
+        await_edge_writer: gate_store.clone(),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -2022,6 +2150,121 @@ async fn invoke_spawn_submits_child_run_through_spawn_tree_port() {
     assert_eq!(awaited[0].mode, SpawnSubagentMode::Blocking);
 }
 
+// A multi-user parent's explicit thread owner must carry onto
+// `child_turn_scope`, not default to `ActorFallback` -- otherwise the
+// await-edge writes under the system mount while evidence reads under the
+// parent's real-owner mount (external review, PR #5819). Mutation: revert to
+// unconditional `TurnScope::new(...)` -> RED (owner is `None`).
+#[tokio::test]
+async fn invoke_spawn_preserves_parents_explicit_owner_on_child_await_edge_scope() {
+    let context = test_run_context_with_explicit_owner_scope("spawn-explicit-owner").await;
+    let expected_owner = context
+        .scope
+        .explicit_owner_user_id()
+        .cloned()
+        .expect("test context has an explicit owner");
+    let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
+    let child_runs = Arc::new(RecordingChildRuns::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
+    let deps = Arc::new(SubagentSpawnDeps {
+        coordinator: Arc::new(StaticCoordinator),
+        child_runs: child_runs.clone(),
+        turn_state_store: turn_store,
+        thread_service: Arc::new(InMemorySessionThreadService::default()),
+        goal_store: Arc::new(NoopGoalStore),
+        await_edge_writer: gate_store.clone(),
+        definition_resolver: Arc::new(StaticDefinitionResolver {
+            resolved: Some(subagent_definition(false)),
+            parent: None,
+        }),
+        spawn_input_codec: Arc::new(StaticSpawnInputCodec {
+            args: default_spawn_args(),
+        }),
+        result_writer: Arc::new(NoopResultWriter),
+    });
+    let port = SubagentSpawnCapabilityPort::new(
+        Arc::new(AuthPassPort),
+        context.clone(),
+        CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
+        SubagentSpawnLimits::default(),
+        deps,
+        Vec::new(),
+    );
+    authorize_spawn_input(&port);
+
+    let outcome = invoke_spawn(&port).await;
+    assert!(
+        matches!(outcome, CapabilityOutcome::AwaitDependentRun { .. }),
+        "expected the spawn to suspend the parent on the child, got {outcome:?}"
+    );
+
+    let awaited = gate_store.records();
+    assert_eq!(awaited.len(), 1);
+    assert_eq!(
+        awaited[0].child_scope.explicit_owner_user_id(),
+        Some(&expected_owner),
+        "await-edge child scope must preserve the parent's real owner, not default to ActorFallback"
+    );
+
+    // The child run actually submitted to `child_runs` must carry the same
+    // owner-preserving scope the await-edge was opened with — the two must
+    // never diverge (that divergence is exactly the class of bug this test
+    // guards against).
+    let requests = child_runs.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].child_scope.explicit_owner_user_id(),
+        Some(&expected_owner)
+    );
+}
+
+// Recovery-in-progress must surface as a retryable `CapabilityOutcome::Failed`,
+// not `Err(Unavailable)` -- that kind maps to a terminal `HostUnavailable`
+// and can end the run instead of letting the model retry (external review,
+// PR #5819). Mutation: revert to `.map_err(...)?` -> RED (panics on unwrap).
+#[tokio::test]
+async fn invoke_spawn_surfaces_scope_recovery_in_progress_as_retryable_capability_failure() {
+    let context = test_run_context_with_agent_actor("spawn-recovery-in-progress").await;
+    let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
+    let deps = Arc::new(SubagentSpawnDeps {
+        coordinator: Arc::new(StaticCoordinator),
+        child_runs: Arc::new(RecordingChildRuns::default()),
+        turn_state_store: turn_store,
+        thread_service: Arc::new(InMemorySessionThreadService::default()),
+        goal_store: Arc::new(NoopGoalStore),
+        await_edge_writer: Arc::new(AlwaysRecoveringAwaitEdgeWriter::default()),
+        definition_resolver: Arc::new(StaticDefinitionResolver {
+            resolved: Some(subagent_definition(false)),
+            parent: None,
+        }),
+        spawn_input_codec: Arc::new(StaticSpawnInputCodec {
+            args: default_spawn_args(),
+        }),
+        result_writer: Arc::new(NoopResultWriter),
+    });
+    let port = SubagentSpawnCapabilityPort::new(
+        Arc::new(AuthPassPort),
+        context,
+        CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
+        SubagentSpawnLimits::default(),
+        deps,
+        Vec::new(),
+    );
+    authorize_spawn_input(&port);
+
+    let outcome = invoke_spawn(&port).await;
+
+    let CapabilityOutcome::Failed(failure) = outcome else {
+        panic!("expected a retryable capability failure, got {outcome:?}");
+    };
+    assert_eq!(failure.error_kind, CapabilityFailureKind::Transient);
+    assert!(
+        failure.safe_summary.contains("scope recovery in progress"),
+        "safe_summary should explain the retryable condition: {}",
+        failure.safe_summary
+    );
+}
+
 #[tokio::test]
 async fn invoke_capability_batch_handles_mixed_spawn_and_non_spawn_invocations() {
     let context = test_run_context_with_agent_actor("spawn-batch-mixed").await;
@@ -2033,7 +2276,7 @@ async fn invoke_capability_batch_handles_mixed_spawn_and_non_spawn_invocations()
         turn_state_store: turn_store,
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         goal_store: Arc::new(NoopGoalStore),
-        gate_store: Arc::new(InMemorySubagentGateResolutionStore::default()),
+        await_edge_writer: Arc::new(InMemoryAwaitEdgeWriter::default()),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -2090,15 +2333,16 @@ async fn invoke_capability_batch_rolls_back_preceding_spawn_on_inner_batch_failu
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
     let goal_store = Arc::new(RecordingGoalStore::default());
-    let gate_store = Arc::new(InMemorySubagentGateResolutionStore::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let thread_service = Arc::new(InMemorySessionThreadService::default());
+    let result_writer = Arc::new(RecordingResultWriter::default());
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
         child_runs: child_runs.clone(),
         turn_state_store: turn_store.clone(),
         thread_service: thread_service.clone(),
         goal_store: goal_store.clone(),
-        gate_store: gate_store.clone(),
+        await_edge_writer: gate_store.clone(),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -2106,7 +2350,7 @@ async fn invoke_capability_batch_rolls_back_preceding_spawn_on_inner_batch_failu
         spawn_input_codec: Arc::new(StaticSpawnInputCodec {
             args: default_spawn_args(),
         }),
-        result_writer: Arc::new(NoopResultWriter),
+        result_writer: result_writer.clone(),
     });
     let port = SubagentSpawnCapabilityPort::new(
         Arc::new(FailingBatchPort),
@@ -2142,6 +2386,13 @@ async fn invoke_capability_batch_rolls_back_preceding_spawn_on_inner_batch_failu
     assert!(gate_store.records().is_empty());
     assert_eq!(goal_store.deletes().len(), 1);
     assert_eq!(turn_store.releases.lock().unwrap().len(), 1);
+    assert_eq!(
+        result_writer
+            .delete_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "rollback must retain durable tool results"
+    );
 
     let child_thread_scope = ThreadScope {
         tenant_id: child_request.child_scope.tenant_id.clone(),
@@ -2178,7 +2429,7 @@ async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested(
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
     let goal_store = Arc::new(RecordingGoalStore::default());
-    let gate_store = Arc::new(InMemorySubagentGateResolutionStore::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let thread_service = Arc::new(InMemorySessionThreadService::default());
     let inner = Arc::new(RecordingBatchPort::default());
     let deps = Arc::new(SubagentSpawnDeps {
@@ -2187,7 +2438,7 @@ async fn invoke_capability_batch_stops_on_first_spawn_suspension_when_requested(
         turn_state_store: turn_store.clone(),
         thread_service: thread_service.clone(),
         goal_store: goal_store.clone(),
-        gate_store: gate_store.clone(),
+        await_edge_writer: gate_store.clone(),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -2255,7 +2506,7 @@ async fn invoke_capability_batch_preserves_spawns_on_inner_batch_suspension() {
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
     let goal_store = Arc::new(RecordingGoalStore::default());
-    let gate_store = Arc::new(InMemorySubagentGateResolutionStore::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let thread_service = Arc::new(InMemorySessionThreadService::default());
     let inner = Arc::new(SuspendedBatchPort::default());
     let deps = Arc::new(SubagentSpawnDeps {
@@ -2264,7 +2515,7 @@ async fn invoke_capability_batch_preserves_spawns_on_inner_batch_suspension() {
         turn_state_store: turn_store.clone(),
         thread_service,
         goal_store: goal_store.clone(),
-        gate_store: gate_store.clone(),
+        await_edge_writer: gate_store.clone(),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -2331,7 +2582,13 @@ async fn invoke_capability_batch_preserves_spawns_on_inner_batch_suspension() {
     assert!(turn_store.releases.lock().unwrap().is_empty());
     assert!(goal_store.deletes().is_empty());
     assert_eq!(goal_store.puts().len(), 2);
-    assert_eq!(gate_store.records().len(), 1);
+    // §3 replacement: `InMemoryAwaitEdgeWriter` keys per-child
+    // `(parent_run_id, child_run_id)`, not per-`gate_ref` — two batch
+    // children sharing one shared gate_ref now record 2 distinct edges
+    // (matching the real `FilesystemAwaitEdgeStore`'s per-child tracking,
+    // D3's group-based settling), not 1 collapsed record as the deleted
+    // `BoundedSubagentGateResolutionStore`'s gate_ref-keyed map did.
+    assert_eq!(gate_store.records().len(), 2);
 }
 
 #[tokio::test]
@@ -2341,7 +2598,7 @@ async fn invoke_spawn_cancels_child_when_post_submit_thread_mark_fails() {
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
     let goal_store = Arc::new(RecordingGoalStore::default());
-    let gate_store = Arc::new(InMemorySubagentGateResolutionStore::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let thread_service = Arc::new(FailingMarkThreadService::default());
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
@@ -2349,7 +2606,7 @@ async fn invoke_spawn_cancels_child_when_post_submit_thread_mark_fails() {
         turn_state_store: turn_store.clone(),
         thread_service: thread_service.clone(),
         goal_store: goal_store.clone(),
-        gate_store: gate_store.clone(),
+        await_edge_writer: gate_store.clone(),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -2618,7 +2875,7 @@ async fn invoke_spawn_propagates_decode_rejection_before_side_effects() {
     );
     assert!(harness.child_runs.requests().is_empty());
     assert!(harness.goal_store.puts().is_empty());
-    assert!(harness.gate_store.records().is_empty());
+    assert!(harness.await_edge_writer.records().is_empty());
 }
 
 #[tokio::test]
@@ -2659,7 +2916,7 @@ async fn invoke_spawn_batch_propagates_decode_rejection_before_side_effects() {
     );
     assert!(harness.child_runs.requests().is_empty());
     assert!(harness.goal_store.puts().is_empty());
-    assert!(harness.gate_store.records().is_empty());
+    assert!(harness.await_edge_writer.records().is_empty());
 }
 
 #[tokio::test]
@@ -2798,14 +3055,14 @@ async fn invoke_batch_coalesces_blocking_spawns_under_single_gate() {
     let context = test_run_context_with_agent_actor("spawn-batch-coalesce").await;
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
-    let gate_store = Arc::new(InMemorySubagentGateResolutionStore::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
         child_runs: child_runs.clone(),
         turn_state_store: turn_store,
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         goal_store: Arc::new(NoopGoalStore),
-        gate_store: gate_store.clone(),
+        await_edge_writer: gate_store.clone(),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -2886,14 +3143,14 @@ async fn invoke_batch_mixed_spawn_and_non_spawn_capabilities() {
     let context = test_run_context_with_agent_actor("spawn-batch-mixed").await;
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
-    let gate_store = Arc::new(InMemorySubagentGateResolutionStore::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
         child_runs: child_runs.clone(),
         turn_state_store: turn_store,
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         goal_store: Arc::new(NoopGoalStore),
-        gate_store: gate_store.clone(),
+        await_edge_writer: gate_store.clone(),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -2982,9 +3239,17 @@ async fn invoke_batch_mixed_spawn_and_non_spawn_capabilities() {
     assert_eq!(first_gate, second_gate);
     assert_eq!(inner_result.result_ref.as_str(), "result:auth");
     assert_eq!(child_runs.requests().len(), 2);
+    // §3 replacement: `InMemoryAwaitEdgeWriter` keys per-child, not
+    // per-`gate_ref` — both batch children sharing this gate_ref get their
+    // own tracked edge now (see the comment on the analogous assertion in
+    // `invoke_batch_mixed_spawn_and_non_spawn_capabilities` above).
     let awaited = gate_store.records();
-    assert_eq!(awaited.len(), 1);
-    assert_eq!(awaited[0].gate_ref.as_str(), first_gate.as_str());
+    assert_eq!(awaited.len(), 2);
+    assert!(
+        awaited
+            .iter()
+            .all(|record| record.gate_ref.as_str() == first_gate.as_str())
+    );
 }
 
 #[tokio::test]
@@ -2992,14 +3257,14 @@ async fn invoke_batch_skips_shared_gate_for_single_blocking_spawn() {
     let context = test_run_context_with_agent_actor("spawn-batch-single").await;
     let turn_store = Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0))));
     let child_runs = Arc::new(RecordingChildRuns::default());
-    let gate_store = Arc::new(InMemorySubagentGateResolutionStore::default());
+    let gate_store = Arc::new(InMemoryAwaitEdgeWriter::default());
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
         child_runs: child_runs.clone(),
         turn_state_store: turn_store,
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         goal_store: Arc::new(NoopGoalStore),
-        gate_store: gate_store.clone(),
+        await_edge_writer: gate_store.clone(),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -3068,9 +3333,10 @@ fn child_submit_bindings_are_unique_per_prepared_child_run() {
     );
 }
 
-/// Stub writer that returns a fixed non-zero byte_len.
+/// Stub writer that returns child-result metadata supplied by the durable writer.
 struct FixedByteResultWriter {
     byte_len: u64,
+    model_observation: Option<ModelVisibleToolObservation>,
 }
 
 #[async_trait]
@@ -3079,28 +3345,45 @@ impl LoopCapabilityResultWriter for FixedByteResultWriter {
         &self,
         _write: CapabilityResultWrite<'_>,
     ) -> Result<CapabilityWriteResult, AgentLoopHostError> {
-        Ok(CapabilityWriteResult::without_output_digest(
-            LoopResultRef::new("result:fixed-bytes").unwrap(),
-            self.byte_len,
-        ))
+        Ok(CapabilityWriteResult {
+            result_ref: LoopResultRef::new("result:fixed-bytes").unwrap(),
+            byte_len: self.byte_len,
+            output_digest: None,
+            model_observation: self.model_observation.clone(),
+        })
     }
 }
 
-/// F5: Verify the CapabilityOutcome::AwaitDependentRun produced by the spawn
-/// port carries the byte_len returned by the result writer. Tests that use
-/// NoopResultWriter (byte_len=0) cannot catch a silent discard of this field.
+/// Verify the spawn port carries child-result metadata from the durable writer
+/// into the AwaitDependentRun outcome. Tests that use NoopResultWriter cannot
+/// catch a silent discard of either field.
 #[tokio::test]
-async fn spawn_subagent_propagates_byte_len_from_result_writer() {
+async fn spawn_subagent_propagates_result_metadata_from_result_writer() {
     let context = test_run_context_with_agent_actor("spawn-byte-len").await;
     let child_runs = Arc::new(RecordingChildRuns::default());
     let fixed_byte_len: u64 = 42_000;
+    let observation = ModelVisibleToolObservation {
+        schema_version: 1,
+        status: ToolObservationStatus::Success,
+        summary: "Use result_read to continue this child result.".to_string(),
+        detail: ToolObservationDetail::ResultReference {
+            result_ref: "result:fixed-bytes".to_string(),
+            byte_len: fixed_byte_len,
+            preview: Some("first bounded chunk".to_string()),
+            total_bytes: Some(fixed_byte_len * 2),
+            next_offset: Some(fixed_byte_len),
+        },
+        artifacts: Vec::new(),
+        recovery: None,
+        trust: ObservationTrust::UntrustedToolOutput,
+    };
     let deps = Arc::new(SubagentSpawnDeps {
         coordinator: Arc::new(StaticCoordinator),
         child_runs: child_runs.clone(),
         turn_state_store: Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0)))),
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         goal_store: Arc::new(NoopGoalStore),
-        gate_store: Arc::new(InMemorySubagentGateResolutionStore::default()),
+        await_edge_writer: Arc::new(InMemoryAwaitEdgeWriter::default()),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,
@@ -3110,6 +3393,7 @@ async fn spawn_subagent_propagates_byte_len_from_result_writer() {
         }),
         result_writer: Arc::new(FixedByteResultWriter {
             byte_len: fixed_byte_len,
+            model_observation: Some(observation.clone()),
         }),
     });
     let port = SubagentSpawnCapabilityPort::new(
@@ -3124,7 +3408,12 @@ async fn spawn_subagent_propagates_byte_len_from_result_writer() {
 
     let outcome = invoke_spawn(&port).await;
 
-    let CapabilityOutcome::AwaitDependentRun { byte_len, .. } = outcome else {
+    let CapabilityOutcome::AwaitDependentRun {
+        byte_len,
+        model_observation,
+        ..
+    } = outcome
+    else {
         panic!("expected AwaitDependentRun outcome from blocking spawn");
     };
     assert_eq!(
@@ -3132,6 +3421,7 @@ async fn spawn_subagent_propagates_byte_len_from_result_writer() {
         "spawn port must propagate the byte_len returned by the result writer \
          (D2 un-discard regression: byte_len must reach CapabilityOutcome)"
     );
+    assert_eq!(model_observation.as_ref(), Some(&observation));
 }
 
 // ── New tests for schema redesign ────────────────────────────────────────────
@@ -3293,7 +3583,7 @@ async fn spawn_provider_tool_call_registration_accepts_subagent_type_wire_key() 
             turn_state_store: Arc::new(StaticTurnStateStore::new(Some(turn_record(&context, 0)))),
             thread_service: Arc::new(InMemorySessionThreadService::default()),
             goal_store: Arc::new(NoopGoalStore),
-            gate_store: Arc::new(InMemorySubagentGateResolutionStore::default()),
+            await_edge_writer: Arc::new(InMemoryAwaitEdgeWriter::default()),
             definition_resolver: Arc::new(StaticDefinitionResolver {
                 resolved: Some(subagent_definition(false)),
                 parent: None,
@@ -3401,7 +3691,7 @@ async fn new_with_schema_propagates_schema_to_spawn_tool_definition() {
         turn_state_store: Arc::new(StaticTurnStateStore::new(None)),
         thread_service: Arc::new(ironclaw_threads::InMemorySessionThreadService::default()),
         goal_store: Arc::new(NoopGoalStore),
-        gate_store: Arc::new(InMemorySubagentGateResolutionStore::default()),
+        await_edge_writer: Arc::new(InMemoryAwaitEdgeWriter::default()),
         definition_resolver: Arc::new(StaticDefinitionResolver {
             resolved: Some(subagent_definition(false)),
             parent: None,

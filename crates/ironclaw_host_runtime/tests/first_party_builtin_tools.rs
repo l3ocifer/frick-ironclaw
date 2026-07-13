@@ -33,7 +33,8 @@ use ironclaw_host_runtime::{
     RuntimeCapabilityOutcome, RuntimeCapabilityRequest, RuntimeFailureKind, RuntimeProcessError,
     RuntimeProcessPort, SHELL_CAPABILITY_ID, SKILL_INSTALL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID,
     SKILL_REMOVE_CAPABILITY_ID, SPAWN_SUBAGENT_CAPABILITY_ID, SandboxCommandTransport, SurfaceKind,
-    TIME_CAPABILITY_ID, TRACE_COMMONS_CREDITS_CAPABILITY_ID, TRACE_COMMONS_ONBOARD_CAPABILITY_ID,
+    TIME_CAPABILITY_ID, TRACE_COMMONS_ACCOUNT_LOGIN_LINK_CAPABILITY_ID,
+    TRACE_COMMONS_CREDITS_CAPABILITY_ID, TRACE_COMMONS_ONBOARD_CAPABILITY_ID,
     TRACE_COMMONS_PROFILE_SET_CAPABILITY_ID, TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID,
     TRACE_COMMONS_STATUS_CAPABILITY_ID, TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID,
     TRIGGER_PAUSE_CAPABILITY_ID, TRIGGER_REMOVE_CAPABILITY_ID, TRIGGER_RESUME_CAPABILITY_ID,
@@ -91,7 +92,8 @@ async fn builtin_first_party_package_declares_expected_capabilities() {
             | TRIGGER_RESUME_CAPABILITY_ID
             | TRACE_COMMONS_ONBOARD_CAPABILITY_ID
             | TRACE_COMMONS_PROFILE_SET_CAPABILITY_ID
-            | TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID => PermissionMode::Ask,
+            | TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID
+            | TRACE_COMMONS_ACCOUNT_LOGIN_LINK_CAPABILITY_ID => PermissionMode::Ask,
             _ => PermissionMode::Allow,
         };
         assert_eq!(descriptor.default_permission, expected_permission);
@@ -321,6 +323,67 @@ async fn builtin_first_party_surface_lists_allowed_tools_in_registry_order() {
 }
 
 #[tokio::test]
+async fn builtin_memory_search_surface_declares_internal_scope_boundary() {
+    let runtime = runtime();
+    let request = VisibleCapabilityRequest::new(
+        execution_context(all_builtin_capability_ids()),
+        SurfaceKind::new("agent_loop").unwrap(),
+    )
+    .with_policy(CapabilitySurfacePolicy::allow_all())
+    .with_provider_trust(provider_trust());
+
+    let surface = runtime.visible_capabilities(request).await.unwrap();
+
+    let memory_search = surface
+        .capabilities
+        .iter()
+        .find(|capability| capability.descriptor.id.as_str() == MEMORY_SEARCH_CAPABILITY_ID)
+        .expect("memory_search must appear in surface");
+    assert!(
+        memory_search
+            .descriptor
+            .description
+            .contains("only Reborn internal persistent memory"),
+        "memory_search description should declare the internal-memory boundary: {}",
+        memory_search.descriptor.description
+    );
+    assert!(
+        memory_search
+            .descriptor
+            .description
+            .contains("does not search connected app or extension data"),
+        "memory_search description should avoid implying it can search external apps: {}",
+        memory_search.descriptor.description
+    );
+
+    let schema = &memory_search.descriptor.parameters_schema;
+    let schema_description = schema
+        .get("description")
+        .and_then(Value::as_str)
+        .expect("memory_search schema should describe its search scope");
+    assert!(
+        schema_description.contains("only Reborn internal persistent memory"),
+        "memory_search schema description should declare scope: {schema_description}"
+    );
+    assert!(
+        schema_description.contains("does not search connected app or extension data"),
+        "memory_search schema description should avoid external-app ambiguity: {schema_description}"
+    );
+
+    let query_description = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("query"))
+        .and_then(|query| query.get("description"))
+        .and_then(Value::as_str)
+        .expect("memory_search query should have a description");
+    assert!(
+        query_description.contains("Reborn internal persistent memory"),
+        "memory_search query description should declare internal memory: {query_description}"
+    );
+}
+
+#[tokio::test]
 async fn builtin_trigger_create_input_schema_declares_schedule_one_of() {
     let runtime = runtime_with_trigger_repository(Arc::new(InMemoryTriggerRepository::default()));
     let request = VisibleCapabilityRequest::new(
@@ -522,6 +585,125 @@ async fn builtin_trigger_create_stamps_caller_scope_and_persists_record() {
     assert_eq!(records[0].creator_user_id, context.resource_scope.user_id);
     assert_eq!(records[0].agent_id, context.resource_scope.agent_id);
     assert_eq!(records[0].project_id, context.resource_scope.project_id);
+}
+
+/// Per-trigger delivery routing: a model-supplied `delivery_target_id` is
+/// shape-validated, host-validated through the create hook, persisted on the
+/// record, and echoed in the model-facing output — so one automation's
+/// routing no longer depends on the mutable user-global preference.
+#[tokio::test]
+async fn builtin_trigger_create_with_delivery_target_persists_it_when_host_validates() {
+    let repository = Arc::new(InMemoryTriggerRepository::default());
+    let hook = Arc::new(DeliveryTargetValidatingTriggerCreateHook::accepting(
+        "slack:personal-dm:T123:user-a",
+    ));
+    let runtime = runtime_with_trigger_repository_and_create_hook(repository.clone(), hook.clone());
+    let context = execution_context([TRIGGER_CREATE_CAPABILITY_ID]);
+
+    let output = invoke_with_context(
+        &runtime,
+        TRIGGER_CREATE_CAPABILITY_ID,
+        json!({
+            "name": "Routed summary",
+            "prompt": "Summarize yesterday",
+            "schedule": { "kind": "cron", "expression": "0 8 * * *", "timezone": "UTC" },
+            "delivery_target_id": "slack:personal-dm:T123:user-a"
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        output["trigger"]["delivery_target_id"],
+        json!("slack:personal-dm:T123:user-a")
+    );
+    assert_eq!(
+        hook.validated(),
+        vec!["slack:personal-dm:T123:user-a".to_string()],
+        "the host validation hook must see the model-supplied target"
+    );
+
+    let records = repository
+        .list_triggers(context.resource_scope.tenant_id)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]
+            .delivery_target
+            .as_ref()
+            .map(|target| target.as_str()),
+        Some("slack:personal-dm:T123:user-a")
+    );
+}
+
+/// Fail closed: without host wiring that can resolve outbound delivery
+/// targets (the default no-op hook), a supplied `delivery_target_id` must be
+/// rejected as invalid input instead of being persisted unvalidated.
+#[tokio::test]
+async fn builtin_trigger_create_rejects_delivery_target_without_host_validation() {
+    let repository = Arc::new(InMemoryTriggerRepository::default());
+    let runtime = runtime_with_trigger_repository(repository.clone());
+    let context = execution_context([TRIGGER_CREATE_CAPABILITY_ID]);
+
+    let error = invoke_with_context(
+        &runtime,
+        TRIGGER_CREATE_CAPABILITY_ID,
+        json!({
+            "name": "Routed summary",
+            "prompt": "Summarize yesterday",
+            "schedule": { "kind": "cron", "expression": "0 8 * * *", "timezone": "UTC" },
+            "delivery_target_id": "slack:personal-dm:T123:user-a"
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, RuntimeFailureKind::InvalidInput);
+    assert!(
+        repository
+            .list_triggers(context.resource_scope.tenant_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A target the host rejects (unknown id, foreign owner, disconnected
+/// product) is invalid input and nothing persists.
+#[tokio::test]
+async fn builtin_trigger_create_rejects_delivery_target_the_host_rejects() {
+    let repository = Arc::new(InMemoryTriggerRepository::default());
+    let hook = Arc::new(DeliveryTargetValidatingTriggerCreateHook::accepting(
+        "slack:personal-dm:T123:user-a",
+    ));
+    let runtime = runtime_with_trigger_repository_and_create_hook(repository.clone(), hook);
+    let context = execution_context([TRIGGER_CREATE_CAPABILITY_ID]);
+
+    let error = invoke_with_context(
+        &runtime,
+        TRIGGER_CREATE_CAPABILITY_ID,
+        json!({
+            "name": "Routed summary",
+            "prompt": "Summarize yesterday",
+            "schedule": { "kind": "cron", "expression": "0 8 * * *", "timezone": "UTC" },
+            "delivery_target_id": "slack:shared-channel:T123:C_SOMEONE_ELSES"
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, RuntimeFailureKind::InvalidInput);
+    assert!(
+        repository
+            .list_triggers(context.resource_scope.tenant_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -2970,6 +3152,43 @@ async fn builtin_time_tolerates_null_string_sentinels_in_optional_fields() {
         output.get("iso").and_then(Value::as_str).is_some(),
         "time `now` should return an iso timestamp, got {output:?}"
     );
+}
+
+#[tokio::test]
+async fn builtin_time_now_accepts_utc_offset_compatibility_input() {
+    let output = invoke(
+        TIME_CAPABILITY_ID,
+        json!({
+            "operation": "now",
+            "utc_offset": "+03:00"
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output["utc_offset"], json!("+03:00"));
+    assert!(
+        output
+            .get("local_iso")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.ends_with("+03:00")),
+        "time `now` should return local_iso with requested offset, got {output:?}"
+    );
+}
+
+#[tokio::test]
+async fn builtin_time_now_rejects_invalid_utc_offset() {
+    let failure = invoke(
+        TIME_CAPABILITY_ID,
+        json!({
+            "operation": "now",
+            "utc_offset": "not-an-offset"
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(failure, RuntimeFailureKind::InvalidInput);
 }
 
 #[tokio::test]
@@ -5699,23 +5918,24 @@ async fn builtin_http_runtime_policy_denial_stops_before_egress() {
 }
 
 #[tokio::test]
-async fn builtin_http_rejects_hosted_allowlist_plan_before_egress() {
+async fn builtin_http_uses_hosted_allowlist_plan_through_configured_egress() {
     let egress = Arc::new(RecordingRuntimeHttpEgress::with_body(
         br#"{"ok":true}"#.to_vec(),
     ));
     let runtime = runtime_with_http_egress_and_policy(Arc::clone(&egress), hosted_dev_policy());
 
-    let error = invoke_with_context(
+    let output = invoke_with_context(
         &runtime,
         HTTP_CAPABILITY_ID,
         json!({"url": "https://api.example.test/v1/items"}),
         execution_context_with_network([HTTP_CAPABILITY_ID], http_test_policy()),
     )
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(error, RuntimeFailureKind::Network);
-    assert!(egress.requests().is_empty());
+    assert_eq!(output["status"], json!(200));
+    assert_eq!(output["body_text"], json!(r#"{"ok":true}"#));
+    assert_eq!(egress.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -6004,6 +6224,30 @@ async fn builtin_http_maps_runtime_egress_errors_by_source() {
 }
 
 #[tokio::test]
+async fn builtin_http_offline_runtime_egress_returns_network_failure_without_panicking() {
+    let egress = Arc::new(RecordingRuntimeHttpEgress::with_error(
+        RuntimeHttpEgressError::Network {
+            reason: "network_unavailable".to_string(),
+            request_bytes: 7,
+            response_bytes: 0,
+        },
+    ));
+    let runtime = runtime_with_http_egress(Arc::clone(&egress));
+
+    let error = invoke_with_context(
+        &runtime,
+        HTTP_CAPABILITY_ID,
+        json!({"url": "https://api.example.test/v1/items"}),
+        execution_context_with_network([HTTP_CAPABILITY_ID], http_test_policy()),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, RuntimeFailureKind::Network);
+    assert_eq!(egress.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn builtin_http_maps_panicking_runtime_egress_to_backend_failure() {
     let runtime = runtime_with_http_egress(Arc::new(PanickingRuntimeHttpEgress));
     let error = invoke_with_context(
@@ -6178,22 +6422,24 @@ async fn builtin_http_awaits_async_egress_without_blocking_tokio_worker() {
 }
 
 #[tokio::test]
-async fn builtin_read_file_rejects_scoped_virtual_filesystem_plan_before_handler_access() {
+async fn builtin_read_file_reads_scoped_virtual_filesystem_through_mount_services() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("README.md"), "must not be read\n").unwrap();
+    std::fs::write(temp.path().join("README.md"), "scoped read\n").unwrap();
     let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
     let runtime = runtime_with_filesystem_and_policy(filesystem, network_denied_policy());
 
-    let error = invoke_with_context(
+    let output = invoke_with_context(
         &runtime,
         READ_FILE_CAPABILITY_ID,
         json!({"path": "/workspace/README.md"}),
         execution_context_with_mounts([READ_FILE_CAPABILITY_ID], mounts),
     )
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(error, RuntimeFailureKind::Authorization);
+    assert_eq!(output["content"], json!("     1│ scoped read"));
+    assert_eq!(output["path"], json!("/workspace/README.md"));
+    assert_eq!(output["total_lines"], json!(1));
 }
 
 #[tokio::test]
@@ -6363,7 +6609,9 @@ async fn read_file_enforces_byte_budget_on_long_lines_and_offers_continuation() 
     );
     let next = read["next_offset"].as_u64().unwrap();
     assert_eq!(next, shown + 1);
-    assert!(content.contains(&format!("Use offset={next} to continue")));
+    assert!(content.contains("run ONE shell command or script"));
+    assert!(content.contains("do NOT page through it"));
+    assert!(content.contains(&format!("offset={next}")));
 
     // Resuming from next_offset advances past the already-shown lines.
     let resumed = invoke_with_context(
@@ -7806,6 +8054,49 @@ impl TriggerCreateHook for FailingTriggerCreateHook {
     }
 }
 
+/// Test hook standing in for host composition's outbound-target resolution:
+/// accepts exactly one target id, records every validation request.
+struct DeliveryTargetValidatingTriggerCreateHook {
+    accepted: String,
+    validated: std::sync::Mutex<Vec<String>>,
+}
+
+impl DeliveryTargetValidatingTriggerCreateHook {
+    fn accepting(target: &str) -> Self {
+        Self {
+            accepted: target.to_string(),
+            validated: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn validated(&self) -> Vec<String> {
+        self.validated.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TriggerCreateHook for DeliveryTargetValidatingTriggerCreateHook {
+    async fn validate_delivery_target(
+        &self,
+        _scope: &ironclaw_host_api::ResourceScope,
+        target: &ironclaw_triggers::TriggerDeliveryTargetId,
+    ) -> Result<(), TriggerError> {
+        self.validated.lock().unwrap().push(target.to_string());
+        if target.as_str() == self.accepted {
+            Ok(())
+        } else {
+            Err(TriggerError::InvalidRecord {
+                kind: ironclaw_triggers::TriggerRecordValidationKind::DeliveryTargetInvalid,
+                reason: "delivery target is not available to this caller".to_string(),
+            })
+        }
+    }
+
+    async fn after_trigger_persisted(&self, _record: &TriggerRecord) -> Result<(), TriggerError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 #[cfg(feature = "test-support")]
 struct FixedTriggerClock(DateTime<Utc>);
@@ -8625,6 +8916,7 @@ fn all_builtin_capability_ids() -> Vec<&'static str> {
         TRACE_COMMONS_CREDITS_CAPABILITY_ID,
         TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID,
         TRACE_COMMONS_PROFILE_SET_CAPABILITY_ID,
+        TRACE_COMMONS_ACCOUNT_LOGIN_LINK_CAPABILITY_ID,
         PROFILE_SET_CAPABILITY_ID,
         MEMORY_SEARCH_CAPABILITY_ID,
         MEMORY_WRITE_CAPABILITY_ID,
@@ -8665,13 +8957,16 @@ fn mounted_filesystem(path: &Path, permissions: MountPermissions) -> (LocalFiles
 }
 
 fn in_memory_mounted_filesystem(permissions: MountPermissions) -> (InMemoryBackend, MountView) {
-    let mounts = MountView::new(vec![MountGrant::new(
+    (InMemoryBackend::new(), workspace_mounts(permissions))
+}
+
+fn workspace_mounts(permissions: MountPermissions) -> MountView {
+    MountView::new(vec![MountGrant::new(
         MountAlias::new("/workspace").unwrap(),
         VirtualPath::new("/projects/coding-pack").unwrap(),
         permissions,
     )])
-    .unwrap();
-    (InMemoryBackend::new(), mounts)
+    .unwrap()
 }
 
 fn memory_mounts(permissions: MountPermissions) -> MountView {

@@ -1,18 +1,24 @@
-use ironclaw_host_api::{ApprovalRequestId, CorrelationId, ResourceEstimate};
+use std::collections::VecDeque;
+
+use ironclaw_host_api::{
+    ApprovalRequestId, CorrelationId, DispatchInputIssueCode, ProviderToolName, ResourceEstimate,
+};
 use ironclaw_turns::{
     CapabilityActivityId, GateResumeDisposition, LoopCancelledReasonKind, LoopCompletionKind,
     LoopDiagnosticRef, LoopExit, LoopFailureKind, LoopGateRef, LoopResultRef, TurnRunId,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, CapabilityApprovalResume, CapabilityAuthResume,
         CapabilityCallCandidate, CapabilityFailureDetail, CapabilityFailureKind,
-        CapabilityInputIssue, CapabilityInputIssueCode, CapabilityInputRef, CapabilityInputRepair,
-        CapabilityOutcome, CapabilityRecoveryHint, CapabilityResultMessage, CapabilityResumeToken,
-        LoopCancelReasonKind, LoopCheckpointKind, LoopCompactionError, LoopCompactionOutcome,
-        LoopCompactionResponse, LoopContextCompactionKind, LoopInput, LoopInputAckToken,
-        LoopInputBatch, LoopInputCursor, LoopInterruptKind, LoopProcessRef, LoopProgressEvent,
-        LoopRunInfoPort, LoopSafeSummary, LoopSummaryArtifactId, ObservationTrust,
-        ParentLoopOutput, ProcessHandleSummary, ProviderToolCallReplay, SameCallRetryConstraint,
-        ToolObservationDetail, ToolObservationStatus, VisibleCapabilityRequest,
+        CapabilityInputIssue, CapabilityInputRef, CapabilityInputRepair, CapabilityOutcome,
+        CapabilityRecoveryHint, CapabilityResultMessage, CapabilityResumeToken,
+        LoopCancelReasonKind, LoopCancellationSignal, LoopCheckpointKind, LoopCompactionError,
+        LoopCompactionOutcome, LoopCompactionResponse, LoopContextCompactionKind, LoopInput,
+        LoopInputAckToken, LoopInputBatch, LoopInputCursor, LoopInterruptKind, LoopProcessRef,
+        LoopProgressEvent, LoopRunInfoPort, LoopSafeSummary, LoopSummaryArtifactId,
+        MODEL_VISIBLE_TOOL_OBSERVATION_SCHEMA_VERSION, ModelVisibleToolObservation,
+        ObservationTrust, ParentLoopOutput, ProcessHandleSummary, PromptMode,
+        ProviderToolCallReplay, SameCallRetryConstraint, ToolObservationDetail,
+        ToolObservationStatus, VisibleCapabilityRequest,
     },
 };
 
@@ -27,6 +33,10 @@ use crate::strategies::{
 };
 use crate::test_support::compaction::{
     active_task_preserving_compaction_index, compaction_metadata,
+};
+use crate::test_support::{
+    MockAgentLoopDriverHost as DriverMockHost, MockHostCall, ScenarioScript,
+    ScriptedCapabilityCall, ScriptedCapabilityOutcome, ScriptedModelResponse,
 };
 
 use super::{
@@ -45,6 +55,28 @@ mod support;
 use support::*;
 
 mod cancellation;
+mod failure_matrix;
+
+fn continuation_observation(
+    result_ref: &LoopResultRef,
+    byte_len: u64,
+) -> ModelVisibleToolObservation {
+    ModelVisibleToolObservation {
+        schema_version: 1,
+        status: ToolObservationStatus::Success,
+        summary: "Use result_read to continue this child result.".to_string(),
+        detail: ToolObservationDetail::ResultReference {
+            result_ref: result_ref.as_str().to_string(),
+            byte_len,
+            preview: Some("first bounded chunk".to_string()),
+            total_bytes: Some(byte_len * 2),
+            next_offset: Some(byte_len),
+        },
+        artifacts: Vec::new(),
+        recovery: None,
+        trust: ObservationTrust::UntrustedToolOutput,
+    }
+}
 
 #[tokio::test]
 async fn reply_only_completes_with_final_checkpoint() {
@@ -222,6 +254,48 @@ async fn budget_stage_exits_at_iteration_limit() {
 }
 
 #[tokio::test]
+async fn explanation_prompt_bundle_error_degrades_to_original_failed_exit() {
+    let host = MockHost::new(Vec::new()).with_failing_prompt_bundle();
+    let family = crate::families::default();
+    let ctx = StageContext {
+        planner: family.planner(),
+        host: &host,
+    };
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+    state.iteration = family.planner().budget().iteration_limit(&state);
+
+    let step = BudgetStage
+        .process(
+            ctx,
+            BudgetInput {
+                state,
+                pending_input_ack: PendingInputAck::default(),
+            },
+        )
+        .await
+        .expect("budget stage");
+
+    match step {
+        BudgetStep::Exit(LoopExit::Failed(failed)) => {
+            assert_eq!(failed.reason_kind, LoopFailureKind::IterationLimit);
+            assert!(failed.explanation_message_refs.is_empty());
+            assert!(failed.checkpoint_id.is_some());
+        }
+        _ => panic!("expected iteration-limit failed exit"),
+    }
+    assert_eq!(
+        host.prompt_requests().len(),
+        1,
+        "failure explanation should attempt one prompt bundle"
+    );
+    assert!(
+        host.model_requests().is_empty(),
+        "prompt-bundle failure should not call the explanation model"
+    );
+    assert_eq!(host.checkpoint_kinds(), vec![LoopCheckpointKind::Final]);
+}
+
+#[tokio::test]
 async fn prompt_stage_compacts_candidate_prompt_then_rebuilds_final_bundle() {
     let host = MockHost::new(Vec::new())
         .with_prompt_compaction_indexes(vec![
@@ -264,7 +338,9 @@ async fn prompt_stage_compacts_candidate_prompt_then_rebuilds_final_bundle() {
     let output = match step {
         PromptStep::Prepared(output) => output,
         PromptStep::Exit(exit) => panic!("expected prepared prompt, got {exit:?}"),
-        PromptStep::ResumeApproval(_) | PromptStep::ResumeAuth(_) => {
+        PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_) => {
             panic!("unexpected resume step")
         }
         PromptStep::SkipModel(_, _) => panic!("unexpected SkipModel"),
@@ -342,7 +418,9 @@ async fn prompt_stage_deferred_compaction_returns_to_normal_prompt_path() {
     let output = match step {
         PromptStep::Prepared(output) => output,
         PromptStep::Exit(exit) => panic!("expected prepared prompt, got {exit:?}"),
-        PromptStep::ResumeApproval(_) | PromptStep::ResumeAuth(_) => {
+        PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_) => {
             panic!("unexpected resume step")
         }
         PromptStep::SkipModel(_, _) => panic!("unexpected SkipModel"),
@@ -427,7 +505,9 @@ async fn prompt_stage_successful_compaction_clears_deferred_watermark() {
     let output = match step {
         PromptStep::Prepared(output) => output,
         PromptStep::Exit(exit) => panic!("expected prepared prompt, got {exit:?}"),
-        PromptStep::ResumeApproval(_) | PromptStep::ResumeAuth(_) => {
+        PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_) => {
             panic!("unexpected resume step")
         }
         PromptStep::SkipModel(_, _) => panic!("unexpected SkipModel"),
@@ -515,7 +595,9 @@ async fn prompt_stage_compaction_index_maps_system_summary_and_other_kinds() {
     let output = match step {
         PromptStep::Prepared(output) => output,
         PromptStep::Exit(exit) => panic!("expected prepared prompt, got {exit:?}"),
-        PromptStep::ResumeApproval(_) | PromptStep::ResumeAuth(_) => {
+        PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_) => {
             panic!("unexpected resume step")
         }
         PromptStep::SkipModel(_, _) => panic!("unexpected SkipModel"),
@@ -569,7 +651,9 @@ async fn prompt_stage_cancellation_after_prompt_bundle_returns_cancelled_exit() 
             assert!(cancelled.checkpoint_id.is_some());
         }
         PromptStep::Prepared(_) => panic!("expected cancelled exit"),
-        PromptStep::ResumeApproval(_) | PromptStep::ResumeAuth(_) => {
+        PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_) => {
             panic!("unexpected resume step")
         }
         PromptStep::Exit(exit) => panic!("expected cancelled exit, got {exit:?}"),
@@ -584,18 +668,20 @@ async fn prompt_stage_cancellation_after_prompt_bundle_returns_cancelled_exit() 
 }
 
 #[tokio::test]
-async fn prompt_stage_compaction_timeout_returns_failed_exit() {
+async fn prompt_stage_compaction_inference_timeout_returns_to_normal_prompt_path() {
+    // Simulates the inner `ModelGatewayBackedSystemInferencePort` deadline
+    // firing: it surfaces as `LoopCompactionError::InferenceFailed`, not as
+    // a separate outer race in the executor (that duplicate timeout was
+    // removed — see `await_compaction_with_cancellation`).
     let host = MockHost::new(Vec::new())
         .with_prompt_compaction_index(vec![compaction_metadata(
             1,
             LoopContextCompactionKind::User,
             10,
         )])
-        .with_compaction_result(Ok(LoopCompactionResponse {
-            summary_artifact_id: LoopSummaryArtifactId::new("summary-1").unwrap(),
-            compression_ratio_ppm: 250_000,
-        }))
-        .with_compaction_delay(std::time::Duration::from_millis(25));
+        .with_compaction_result(Err(LoopCompactionError::InferenceFailed {
+            safe_summary: LoopSafeSummary::new("compaction deadline exceeded").unwrap(),
+        }));
     let family = family_with_compaction_strategy(DefaultCompactionStrategy {
         deadline_ms: 1,
         ..Default::default()
@@ -618,26 +704,43 @@ async fn prompt_stage_compaction_timeout_returns_failed_exit() {
         .await
         .expect("prompt stage");
 
-    match step {
-        PromptStep::Exit(LoopExit::Failed(failed)) => {
-            assert!(failed.checkpoint_id.is_some());
+    let output = match step {
+        PromptStep::Prepared(output) => output,
+        PromptStep::Exit(exit) => panic!("expected prepared prompt, got {exit:?}"),
+        PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_) => {
+            panic!("unexpected resume step")
         }
-        _ => panic!("expected failed exit"),
-    }
-    assert_eq!(host.checkpoint_kinds(), vec![LoopCheckpointKind::Final]);
+        PromptStep::SkipModel(_, _) => panic!("unexpected SkipModel"),
+    };
+    assert_eq!(
+        output.state.compaction_state.last_deferred,
+        Some(DeferredCompactionWatermark {
+            through_seq: 1,
+            prompt_fingerprint: output.state.compaction_prompt.fingerprint(),
+        })
+    );
+    assert!(
+        !output
+            .state
+            .compaction_state
+            .force_compact_on_next_iteration
+    );
+    assert_eq!(host.prompt_requests().len(), 1);
+    assert!(host.checkpoint_kinds().is_empty());
     assert_eq!(
         host.progress_event_names(),
         vec![
             "prompt_bundle_built",
             "compaction_started",
             "compaction_failed",
-            "checkpoint_written",
         ]
     );
 }
 
 #[tokio::test]
-async fn prompt_stage_compaction_security_rejection_returns_failed_exit() {
+async fn prompt_stage_compaction_security_rejection_returns_to_normal_prompt_path() {
     let host = MockHost::new(Vec::new())
         .with_prompt_compaction_index(vec![compaction_metadata(
             1,
@@ -669,27 +772,113 @@ async fn prompt_stage_compaction_security_rejection_returns_failed_exit() {
         .await
         .expect("prompt stage");
 
-    match step {
-        PromptStep::Exit(LoopExit::Failed(failed)) => {
-            assert!(failed.checkpoint_id.is_some());
-        }
-        PromptStep::Prepared(_) => panic!("security rejection should end the run"),
-        PromptStep::ResumeApproval(_) | PromptStep::ResumeAuth(_) => {
+    let output = match step {
+        PromptStep::Prepared(output) => output,
+        PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_) => {
             panic!("unexpected resume step")
         }
-        PromptStep::Exit(exit) => panic!("expected failed exit, got {exit:?}"),
+        PromptStep::Exit(exit) => panic!("expected prepared prompt, got {exit:?}"),
         PromptStep::SkipModel(_, _) => panic!("unexpected SkipModel"),
-    }
-    assert_eq!(host.prompt_requests().len(), 1);
-    assert_eq!(host.checkpoint_kinds(), vec![LoopCheckpointKind::Final]);
+    };
+    assert_eq!(
+        output.state.compaction_state.last_deferred,
+        Some(DeferredCompactionWatermark {
+            through_seq: 1,
+            prompt_fingerprint: output.state.compaction_prompt.fingerprint(),
+        })
+    );
+    assert!(
+        !output
+            .state
+            .compaction_state
+            .force_compact_on_next_iteration
+    );
+    assert_eq!(
+        host.prompt_requests().len(),
+        1,
+        "compaction failure should continue with the existing prompt candidate"
+    );
+    assert!(host.checkpoint_kinds().is_empty());
     assert_eq!(
         host.progress_event_names(),
         vec![
             "prompt_bundle_built",
             "compaction_started",
             "compaction_failed",
-            "checkpoint_written",
         ]
+    );
+}
+
+#[tokio::test]
+async fn compaction_failure_cancellation_skips_explanation_and_returns_cancelled() {
+    let host = MockHost::new(Vec::new())
+        .with_prompt_compaction_index(vec![compaction_metadata(
+            1,
+            LoopContextCompactionKind::User,
+            10,
+        )])
+        .with_compaction_result(Err(LoopCompactionError::SecurityRejected {
+            safe_summary: LoopSafeSummary::new("injection detected").unwrap(),
+        }))
+        .cancel_after_compaction_failure();
+    let family = family_with_compaction_strategy(DefaultCompactionStrategy {
+        deadline_ms: 100,
+        ..Default::default()
+    });
+    let ctx = StageContext {
+        planner: family.planner(),
+        host: &host,
+    };
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+    state.compaction_state.force_compact_on_next_iteration = true;
+
+    let step = PromptStage
+        .process(
+            ctx,
+            PromptInput {
+                state,
+                pending_input_ack: PendingInputAck::default(),
+            },
+        )
+        .await
+        .expect("prompt stage");
+
+    match step {
+        PromptStep::Exit(LoopExit::Cancelled(cancelled)) => {
+            assert_eq!(
+                cancelled.reason_kind,
+                LoopCancelledReasonKind::HostCancellation
+            );
+        }
+        PromptStep::Exit(exit) => panic!("expected cancelled exit, got {exit:?}"),
+        PromptStep::Prepared(_)
+        | PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_)
+        | PromptStep::SkipModel(_, _) => panic!("unexpected prompt step"),
+    }
+    assert_eq!(
+        host.prompt_requests().len(),
+        1,
+        "compaction cancellation should not request a failure explanation prompt"
+    );
+
+    // The Final checkpoint must persist the deferred watermark set by the
+    // failure-fallback path, not just the in-memory Cancelled exit.
+    let final_state = final_staged_state(&host);
+    assert!(
+        !final_state.compaction_state.force_compact_on_next_iteration,
+        "force_compact_on_next_iteration must be cleared before the Final checkpoint"
+    );
+    assert_eq!(
+        final_state.compaction_state.last_deferred,
+        Some(DeferredCompactionWatermark {
+            through_seq: 1,
+            prompt_fingerprint: final_state.compaction_prompt.fingerprint(),
+        }),
+        "deferred watermark must persist through the cancellation checkpoint"
     );
 }
 
@@ -907,6 +1096,79 @@ async fn model_context_overflow_retries_through_canonical_compaction_stage() {
         Some(5)
     );
     assert!(!final_state.compaction_state.force_compact_on_next_iteration);
+}
+
+#[tokio::test]
+async fn model_budget_approval_required_with_gate_ref_blocks_resource_gate() {
+    let gate_ref = LoopGateRef::new("gate:budget-test-approval").expect("gate ref");
+    let host = MockHost::new(vec![reply_response()]).with_model_errors(vec![
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::BudgetApprovalRequired,
+            "budget approval required",
+        )
+        .with_gate_ref(gate_ref.clone()),
+    ]);
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    match exit {
+        LoopExit::Blocked(blocked) => {
+            assert_eq!(blocked.kind, ironclaw_turns::LoopBlockedKind::Resource);
+            assert_eq!(blocked.gate_ref, gate_ref);
+            assert_eq!(blocked.blocked_activity_id, None);
+        }
+        other => panic!("expected budget approval to block, got {other:?}"),
+    }
+    assert_eq!(host.model_requests().len(), 1);
+    assert_eq!(
+        host.checkpoint_kinds(),
+        vec![
+            LoopCheckpointKind::BeforeModel,
+            LoopCheckpointKind::BeforeBlock
+        ]
+    );
+    assert!(host.progress_event_names().contains(&"gate_blocked"));
+    let blocked_state = final_staged_state_for_kind(&host, LoopCheckpointKind::BeforeBlock);
+    assert_eq!(blocked_state.last_gate, Some(gate_ref));
+}
+
+#[tokio::test]
+async fn model_budget_approval_required_without_gate_ref_fails_diagnostics_not_recovery() {
+    let host =
+        MockHost::new(vec![reply_response()]).with_model_errors(vec![AgentLoopHostError::new(
+            AgentLoopHostErrorKind::BudgetApprovalRequired,
+            "budget approval required",
+        )]);
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let error = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect_err("budget approval without gate evidence must fail closed");
+
+    assert_eq!(
+        error,
+        AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+            stage: HostStage::Model,
+            kind: AgentLoopHostErrorKind::BudgetApprovalRequired,
+            safe_summary: LoopSafeSummary::new("budget approval required").expect("safe"),
+            reason_kind: None,
+            diagnostic_ref: None,
+            detail: None,
+        }
+    );
+    assert_eq!(host.model_requests().len(), 1);
+    assert_eq!(
+        host.checkpoint_kinds(),
+        vec![LoopCheckpointKind::BeforeModel]
+    );
+    assert!(!host.progress_event_names().contains(&"gate_blocked"));
 }
 
 #[tokio::test]
@@ -1141,6 +1403,7 @@ async fn reply_admission_rejects_candidate_before_finalizing_and_continues() {
                 terminate_hint: false,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         }]);
@@ -1212,6 +1475,7 @@ async fn reply_admission_rendered_flag_stays_false_when_context_suppresses_contr
                 terminate_hint: false,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         }]);
@@ -1268,7 +1532,11 @@ async fn repeated_reply_rejections_stop_as_invalid_model_output() {
         }
         other => panic!("expected failed invalid-model-output exit, got {other:?}"),
     }
-    assert_eq!(host.model_requests().len(), 3);
+    assert_eq!(
+        host.model_requests().len(),
+        4,
+        "invalid model output should attempt one best-effort explanation call"
+    );
     let final_state = final_staged_state(&host);
     assert!(final_state.assistant_refs.is_empty());
     assert_eq!(
@@ -1281,7 +1549,11 @@ async fn repeated_reply_rejections_stop_as_invalid_model_output() {
 #[tokio::test]
 async fn default_reply_admission_rejects_tool_history_echo_and_continues() {
     let host = MockHost::new(vec![
-        reply_response_with_text("Previous tool event: demo__echo was invoked."),
+        // Multi-line, all provider-transcript-artifact lines: a replayed-history
+        // echo (still rejected under the multi-line artifact rule).
+        reply_response_with_text(
+            "Previous tool event: demo__echo was invoked.\nTool result from demo__echo: hi",
+        ),
         reply_response_with_text("done"),
     ]);
     let executor = CanonicalAgentLoopExecutor;
@@ -1382,6 +1654,7 @@ async fn capability_stage_returns_after_batch_summary() {
                 terminate_hint: false,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -1501,7 +1774,7 @@ fn sanitize_result_ref_suffix_handles_empty_special_chars_and_truncation() {
             provider_model_id: "test-model".to_string(),
             provider_turn_id: oversized,
             provider_call_id: "call/with space".to_string(),
-            provider_tool_name: "demo__echo".to_string(),
+            provider_tool_name: ProviderToolName::new("demo__echo").expect("provider tool name"),
             arguments: serde_json::json!({}),
             response_reasoning: None,
             reasoning: None,
@@ -1704,6 +1977,123 @@ async fn nudge_respects_one_shot_cap() {
 }
 
 #[tokio::test]
+async fn no_progress_nudge_model_failure_falls_back_to_failed_exit() {
+    // Gate ON but the nudge's OWN model call fails (non-cancel host error). The
+    // nudge is best-effort: it must NOT bork the run — the no-progress exit
+    // falls back to the typed failed exit instead of propagating the failure.
+    let host = MockHost::new(Vec::new())
+        .with_driver_nudges_enabled()
+        .with_model_errors(vec![AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "nudge model call failed",
+        )]);
+    let family = crate::families::default();
+    let ctx = StageContext {
+        planner: family.planner(),
+        host: &host,
+    };
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = ExitStage
+        .process(
+            ctx,
+            ExitInput {
+                state,
+                kind: StopKind::NoProgressDetected,
+            },
+        )
+        .await
+        .expect("nudge model failure must not propagate out of the exit stage");
+
+    assert_eq!(
+        host.model_requests().len(),
+        1,
+        "nudge attempted exactly one model call before failing open"
+    );
+    assert!(
+        matches!(exit, LoopExit::Failed(_)),
+        "nudge model failure must fall back to the typed no-progress failure, got {exit:?}"
+    );
+}
+
+#[tokio::test]
+async fn budget_nudge_model_failure_falls_back_to_failed_exit() {
+    // Gate ON at the iteration-limit boundary, but the nudge's model call fails.
+    // The budget stage must fall through to its normal explained-failure exit
+    // (also fail-open) rather than propagating the nudge host error.
+    let host = MockHost::new(Vec::new())
+        .with_driver_nudges_enabled()
+        .with_model_errors(vec![AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "nudge model call failed",
+        )]);
+    let family = family_with_compaction_strategy(DefaultCompactionStrategy {
+        deadline_ms: 1,
+        ..Default::default()
+    });
+    let ctx = StageContext {
+        planner: family.planner(),
+        host: &host,
+    };
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+    state.iteration = family.planner().budget().iteration_limit(&state);
+
+    let step = BudgetStage
+        .process(
+            ctx,
+            BudgetInput {
+                state,
+                pending_input_ack: PendingInputAck::default(),
+            },
+        )
+        .await
+        .expect("nudge model failure must not propagate out of the budget stage");
+
+    assert_eq!(
+        host.model_requests().len(),
+        2,
+        "budget path attempts the failed nudge model call plus its normal failure explanation"
+    );
+    assert!(
+        matches!(step, BudgetStep::Exit(LoopExit::Failed(_))),
+        "budget nudge model failure must fall back to the failed exit"
+    );
+}
+
+#[tokio::test]
+async fn nudge_model_cancellation_propagates() {
+    // A cancellation surfaced during the nudge model call MUST propagate (the
+    // run is being cancelled), unlike other host failures which fall open.
+    let host = MockHost::new(Vec::new())
+        .with_driver_nudges_enabled()
+        .with_model_errors(vec![AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Cancelled,
+            "cancelled during nudge",
+        )]);
+    let family = crate::families::default();
+    let ctx = StageContext {
+        planner: family.planner(),
+        host: &host,
+    };
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let result = ExitStage
+        .process(
+            ctx,
+            ExitInput {
+                state,
+                kind: StopKind::NoProgressDetected,
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(AgentLoopExecutorError::Cancelled)),
+        "nudge cancellation must propagate, got {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn exit_stage_aborted_exits_with_requested_failure_kind() {
     let host = MockHost::new(Vec::new());
     let family = crate::families::default();
@@ -1731,6 +2121,25 @@ async fn exit_stage_aborted_exits_with_requested_failure_kind() {
         }
         other => panic!("expected failed exit, got {other:?}"),
     }
+    let final_state = host
+        .staged_payloads()
+        .into_iter()
+        .find(|request| request.kind == LoopCheckpointKind::Final)
+        .map(|request| {
+            LoopExecutionState::from_checkpoint_payload(
+                &request.payload,
+                checkpoint_kind_from_host(request.kind),
+            )
+            .expect("final checkpoint payload")
+        })
+        .expect("final checkpoint");
+    assert!(
+        final_state
+            .recent_failure_kinds
+            .iter()
+            .any(|kind| *kind == LoopFailureKind::CapabilityProtocolError),
+        "final failed checkpoint must carry the terminal failure kind for evidence validation"
+    );
 }
 
 #[tokio::test]
@@ -1745,6 +2154,7 @@ async fn stopped_on_suspension_completed_outcome_still_appends_result() {
                 terminate_hint: true,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: true,
         },
@@ -1836,6 +2246,7 @@ async fn terminate_hint_after_batch_completes_without_extra_model_call() {
                 terminate_hint: true,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -1974,6 +2385,7 @@ async fn approval_resume_metadata_is_replayed_after_before_block_checkpoint() {
                 terminate_hint: true,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -2205,6 +2617,7 @@ async fn parallel_batch_records_completed_results_before_blocking_on_suspension(
                     terminate_hint: false,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 }),
             ],
             stopped_on_suspension: false,
@@ -2265,6 +2678,7 @@ async fn capability_batch_rejects_outcome_count_exceeding_invocation_count() {
                     terminate_hint: false,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 }),
                 CapabilityOutcome::Completed(CapabilityResultMessage {
                     result_ref: LoopResultRef::new("result:second").expect("valid"),
@@ -2273,6 +2687,7 @@ async fn capability_batch_rejects_outcome_count_exceeding_invocation_count() {
                     terminate_hint: false,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 }),
             ],
             stopped_on_suspension: true,
@@ -2369,6 +2784,26 @@ async fn model_request_uses_current_visible_surface_not_prompt_bundle_version() 
 }
 
 #[tokio::test]
+async fn prompt_reuses_current_visible_surface_without_refetching() {
+    let host = MockHost::new(vec![reply_response()])
+        .with_current_default_visible_surface()
+        .with_failing_visible_capabilities();
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    assert!(matches!(exit, LoopExit::Completed(_)));
+    assert_eq!(host.visible_capability_request_count(), 0);
+    let requests = host.model_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].surface_version, Some(surface_version()));
+}
+
+#[tokio::test]
 async fn model_retry_success_clears_recovery_state() {
     let host = MockHost::new(vec![reply_response()])
         .with_model_errors(vec![AgentLoopHostError::new(
@@ -2447,8 +2882,302 @@ async fn model_unrecoverable_host_error_preserves_sanitized_diagnostics() {
             safe_summary: LoopSafeSummary::new("model credentials are unavailable").expect("safe"),
             reason_kind: None,
             diagnostic_ref: Some(LoopDiagnosticRef::new("diag:model-credentials").expect("valid")),
+            detail: None,
         }
     );
+}
+
+#[tokio::test]
+async fn model_unrecoverable_host_error_carries_detail_to_executor_error() {
+    let host = MockHost::new(Vec::new()).with_model_errors(vec![
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::CredentialUnavailable,
+            "model credentials are unavailable",
+        )
+        .with_detail("HTTP 404 model not found"),
+    ]);
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let error = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect_err("unrecoverable model errors stop before a loop exit");
+
+    match error {
+        AgentLoopExecutorError::HostUnavailableWithDiagnostics { detail, .. } => {
+            assert_eq!(detail.as_deref(), Some("HTTP 404 model not found"));
+        }
+        other => panic!("expected HostUnavailableWithDiagnostics, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn capability_abort_finalizes_explanation_and_failed_exit_refs_partial_first() {
+    let script = ScenarioScript {
+        model_responses: VecDeque::from([
+            ScriptedModelResponse::Calls(vec![ScriptedCapabilityCall::new("demo.echo")]),
+            ScriptedModelResponse::Reply {
+                text: "The run stopped after a capability failure.".to_string(),
+            },
+        ]),
+        capability_outcomes: VecDeque::from([vec![ScriptedCapabilityOutcome::failed("permanent")]]),
+        single_call_retry_outcomes: VecDeque::new(),
+        pending_inputs: VecDeque::new(),
+    };
+    let (host, _) = DriverMockHost::builder().script(script).build();
+    let executor = CanonicalAgentLoopExecutor;
+    let partial_ref = message_ref("msg:partial-work");
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+    state.assistant_refs.push(partial_ref.clone());
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    match exit {
+        LoopExit::Failed(failed) => {
+            assert_eq!(failed.reason_kind, LoopFailureKind::CapabilityProtocolError);
+            assert_eq!(
+                failed.explanation_message_refs,
+                vec![partial_ref, message_ref("msg:assistant")]
+            );
+        }
+        other => panic!("expected failed exit, got {other:?}"),
+    }
+    assert_eq!(host.model_call_count(), 2);
+    assert_eq!(
+        host.finalized_assistant_messages(),
+        vec!["The run stopped after a capability failure.".to_string()]
+    );
+    let requests = host.model_requests();
+    assert_eq!(requests.len(), 2);
+    let explanation_capability_view = requests[1]
+        .capability_view
+        .as_ref()
+        .expect("failure explanation model request must suppress tools");
+    assert!(
+        explanation_capability_view
+            .visible_capability_ids
+            .is_empty()
+    );
+    assert!(requests[1].surface_version.is_none());
+    assert!(requests[1].model_preference.is_none());
+}
+
+#[tokio::test]
+async fn failure_explanation_prompt_is_inline_only_and_context_free() {
+    let script = ScenarioScript {
+        model_responses: VecDeque::from([
+            ScriptedModelResponse::Calls(vec![ScriptedCapabilityCall::new("demo.echo")]),
+            ScriptedModelResponse::Reply {
+                text: "The run stopped after a capability failure.".to_string(),
+            },
+        ]),
+        capability_outcomes: VecDeque::from([vec![ScriptedCapabilityOutcome::failed("permanent")]]),
+        single_call_retry_outcomes: VecDeque::new(),
+        pending_inputs: VecDeque::new(),
+    };
+    let (host, _) = DriverMockHost::builder().script(script).build();
+    let executor = CanonicalAgentLoopExecutor;
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+    state.assistant_refs.push(message_ref("msg:partial-work"));
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    assert!(matches!(exit, LoopExit::Failed(_)));
+    let requests = host.prompt_requests();
+    assert_eq!(requests.len(), 2);
+    let explanation = &requests[1];
+    assert_eq!(explanation.mode, PromptMode::TextOnly);
+    assert_eq!(explanation.max_messages, Some(0));
+    assert!(explanation.context_cursor.is_none());
+    assert!(explanation.surface_version.is_none());
+    assert!(explanation.capability_view.is_none());
+    assert!(explanation.checkpoint_state_ref.is_none());
+    assert_eq!(explanation.inline_messages.len(), 2);
+}
+
+#[tokio::test]
+async fn explanation_model_error_degrades_to_original_failed_exit() {
+    let script = ScenarioScript {
+        model_responses: VecDeque::from([
+            ScriptedModelResponse::Calls(vec![ScriptedCapabilityCall::new("demo.echo")]),
+            ScriptedModelResponse::Error {
+                kind: AgentLoopHostErrorKind::Internal,
+            },
+        ]),
+        capability_outcomes: VecDeque::from([vec![ScriptedCapabilityOutcome::failed("permanent")]]),
+        single_call_retry_outcomes: VecDeque::new(),
+        pending_inputs: VecDeque::new(),
+    };
+    let (host, _) = DriverMockHost::builder().script(script).build();
+    let executor = CanonicalAgentLoopExecutor;
+    let partial_ref = message_ref("msg:partial-before-error");
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+    state.assistant_refs.push(partial_ref.clone());
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    match exit {
+        LoopExit::Failed(failed) => {
+            assert_eq!(failed.reason_kind, LoopFailureKind::CapabilityProtocolError);
+            assert_eq!(failed.explanation_message_refs, vec![partial_ref]);
+        }
+        other => panic!("expected failed exit, got {other:?}"),
+    }
+    assert_eq!(host.model_call_count(), 2);
+    assert!(host.finalized_assistant_messages().is_empty());
+}
+
+#[tokio::test]
+async fn model_error_abort_skips_explanation_and_carries_partial_refs() {
+    let script = ScenarioScript {
+        model_responses: VecDeque::from([
+            ScriptedModelResponse::Error {
+                kind: AgentLoopHostErrorKind::Internal,
+            },
+            ScriptedModelResponse::Error {
+                kind: AgentLoopHostErrorKind::Internal,
+            },
+            ScriptedModelResponse::Error {
+                kind: AgentLoopHostErrorKind::Internal,
+            },
+        ]),
+        capability_outcomes: VecDeque::new(),
+        single_call_retry_outcomes: VecDeque::new(),
+        pending_inputs: VecDeque::new(),
+    };
+    let (host, _) = DriverMockHost::builder().script(script).build();
+    let executor = CanonicalAgentLoopExecutor;
+    let partial_ref = message_ref("msg:model-partial");
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+    state.assistant_refs.push(partial_ref.clone());
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    match exit {
+        LoopExit::Failed(failed) => {
+            assert_eq!(failed.reason_kind, LoopFailureKind::ModelError);
+            assert_eq!(failed.explanation_message_refs, vec![partial_ref]);
+        }
+        other => panic!("expected failed exit, got {other:?}"),
+    }
+    assert_eq!(
+        host.call_log()
+            .iter()
+            .filter(|call| matches!(call, MockHostCall::StreamModel))
+            .count(),
+        3
+    );
+    assert!(host.finalized_assistant_messages().is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_before_explanation_skips_explanation_model_call() {
+    let script = ScenarioScript {
+        model_responses: VecDeque::from([
+            ScriptedModelResponse::Calls(vec![ScriptedCapabilityCall::new("demo.echo")]),
+            ScriptedModelResponse::Reply {
+                text: "This explanation should not be requested.".to_string(),
+            },
+        ]),
+        capability_outcomes: VecDeque::from([vec![ScriptedCapabilityOutcome::failed("permanent")]]),
+        single_call_retry_outcomes: VecDeque::new(),
+        pending_inputs: VecDeque::new(),
+    };
+    let (host, _) = DriverMockHost::builder()
+        .script(script)
+        .cancel_after_capability_batch(LoopCancellationSignal {
+            reason_kind: LoopCancelReasonKind::UserRequested,
+            requested_at: chrono::Utc::now(),
+        })
+        .build();
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    assert!(matches!(exit, LoopExit::Cancelled(_)));
+    assert_eq!(host.model_call_count(), 1);
+    assert!(host.finalized_assistant_messages().is_empty());
+}
+
+#[tokio::test]
+async fn exit_stage_aborted_cancellation_skips_explanation_and_returns_cancelled() {
+    let host = MockHost::new(vec![reply_response()]);
+    host.request_cancellation(LoopCancelReasonKind::UserRequested);
+    let family = crate::families::default();
+    let ctx = StageContext {
+        planner: family.planner(),
+        host: &host,
+    };
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = ExitStage
+        .process(
+            ctx,
+            ExitInput {
+                state,
+                kind: StopKind::Aborted(LoopFailureKind::InvalidModelOutput),
+            },
+        )
+        .await
+        .expect("exit stage");
+
+    match exit {
+        LoopExit::Cancelled(cancelled) => {
+            assert_eq!(
+                cancelled.reason_kind,
+                LoopCancelledReasonKind::HostCancellation
+            );
+        }
+        other => panic!("expected cancelled exit, got {other:?}"),
+    }
+    assert!(host.prompt_requests().is_empty());
+    assert!(host.model_requests().is_empty());
+    assert_eq!(host.checkpoint_kinds(), vec![LoopCheckpointKind::Final]);
+}
+
+#[tokio::test]
+async fn cancellation_during_explanation_model_call_propagates_cancelled() {
+    let script = ScenarioScript {
+        model_responses: VecDeque::from([
+            ScriptedModelResponse::Calls(vec![ScriptedCapabilityCall::new("demo.echo")]),
+            ScriptedModelResponse::Error {
+                kind: AgentLoopHostErrorKind::Cancelled,
+            },
+        ]),
+        capability_outcomes: VecDeque::from([vec![ScriptedCapabilityOutcome::failed("permanent")]]),
+        single_call_retry_outcomes: VecDeque::new(),
+        pending_inputs: VecDeque::new(),
+    };
+    let (host, _) = DriverMockHost::builder().script(script).build();
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let result = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await;
+
+    assert!(
+        matches!(result, Err(AgentLoopExecutorError::Cancelled)),
+        "in-flight cancellation during the explanation call must propagate as Cancelled, not produce a Failed exit: {result:?}"
+    );
+    assert!(host.finalized_assistant_messages().is_empty());
 }
 
 #[tokio::test]
@@ -2496,6 +3225,7 @@ async fn terminate_hint_counts_only_visible_invoked_calls() {
                 terminate_hint: true,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -2587,6 +3317,7 @@ async fn retry_uses_single_call_invocation() {
                     terminate_hint: true,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 },
             )]);
         let executor = CanonicalAgentLoopExecutor;
@@ -2623,6 +3354,7 @@ async fn policy_denied_capability_error_honors_retry_recovery() {
                 terminate_hint: true,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             },
         )]);
     let executor = CanonicalAgentLoopExecutor;
@@ -2684,6 +3416,7 @@ async fn spawned_child_run_result_append_failure_propagates_without_completed_re
                 result_ref,
                 safe_summary: "spawned child completed".to_string(),
                 byte_len: 0,
+                model_observation: None,
             }],
             stopped_on_suspension: false,
         }])
@@ -2715,6 +3448,7 @@ async fn spawned_child_run_rejects_unsafe_safe_summary_without_appending_result(
                 result_ref,
                 safe_summary: "/Users/alice/.ssh/id_rsa".to_string(),
                 byte_len: 0,
+                model_observation: None,
             }],
             stopped_on_suspension: false,
         },
@@ -2739,15 +3473,17 @@ async fn spawned_child_run_rejects_unsafe_safe_summary_without_appending_result(
 #[tokio::test]
 async fn completed_provider_call_appends_provider_replay_metadata() {
     let result_ref = LoopResultRef::new("result:provider-call").expect("valid");
+    let safe_summary = "a".repeat(300);
     let host = MockHost::new(vec![provider_calls_response()]).with_batch_outcomes(vec![
         ironclaw_turns::run_profile::CapabilityBatchOutcome {
             outcomes: vec![CapabilityOutcome::Completed(CapabilityResultMessage {
                 result_ref: result_ref.clone(),
-                safe_summary: "provider call completed".to_string(),
+                safe_summary: safe_summary.clone(),
                 progress: ironclaw_turns::run_profile::CapabilityProgress::MadeProgress,
                 terminate_hint: true,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -2768,7 +3504,7 @@ async fn completed_provider_call_appends_provider_replay_metadata() {
         .expect("provider replay metadata");
     assert_eq!(provider_call.provider_turn_id, "turn_1");
     assert_eq!(provider_call.provider_call_id, "call_1");
-    assert_eq!(provider_call.provider_tool_name, "demo__echo");
+    assert_eq!(provider_call.provider_tool_name.as_str(), "demo__echo");
     assert_eq!(provider_call.capability_id, capability_id());
     assert_eq!(
         provider_call.arguments,
@@ -2780,6 +3516,29 @@ async fn completed_provider_call_appends_provider_replay_metadata() {
     );
     assert_eq!(provider_call.reasoning.as_deref(), Some("call reasoning"));
     assert_eq!(provider_call.signature.as_deref(), Some("sig-1"));
+    let model_observation = appended[0]
+        .model_observation
+        .as_ref()
+        .expect("model-visible observation");
+    assert_eq!(
+        model_observation.schema_version,
+        MODEL_VISIBLE_TOOL_OBSERVATION_SCHEMA_VERSION
+    );
+    assert_eq!(model_observation.status, ToolObservationStatus::Success);
+    assert_eq!(model_observation.summary, safe_summary);
+    assert!(matches!(
+        &model_observation.detail,
+        ToolObservationDetail::GenericFailure {
+            failure_kind,
+            detail: None,
+        } if failure_kind.as_str() == "none"
+    ));
+    assert!(model_observation.artifacts.is_empty());
+    assert!(model_observation.recovery.is_none());
+    assert_eq!(
+        model_observation.trust,
+        ObservationTrust::UntrustedToolOutput
+    );
 }
 
 #[tokio::test]
@@ -2795,6 +3554,7 @@ async fn denied_provider_call_appends_failure_tool_result_for_replay() {
                     terminate_hint: true,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 }),
                 CapabilityOutcome::Denied(ironclaw_turns::run_profile::CapabilityDenied {
                     reason_kind:
@@ -2832,7 +3592,10 @@ async fn denied_provider_call_appends_failure_tool_result_for_replay() {
         .expect("provider replay metadata");
     assert_eq!(denied_provider_call.provider_turn_id, "turn_1");
     assert_eq!(denied_provider_call.provider_call_id, "call_2");
-    assert_eq!(denied_provider_call.provider_tool_name, "demo__echo");
+    assert_eq!(
+        denied_provider_call.provider_tool_name.as_str(),
+        "demo__echo"
+    );
     match exit {
         LoopExit::Completed(completed) => {
             assert_eq!(
@@ -2859,7 +3622,7 @@ async fn invalid_provider_tool_failure_appends_structured_model_observation() {
                     detail: Some(CapabilityFailureDetail::InvalidInput {
                         issues: vec![CapabilityInputIssue {
                             path: "file_path".to_string(),
-                            code: CapabilityInputIssueCode::MissingRequired,
+                            code: DispatchInputIssueCode::MissingRequired,
                             expected: Some("required field".to_string()),
                             received: None,
                             schema_path: Some("required".to_string()),
@@ -2890,7 +3653,7 @@ async fn invalid_provider_tool_failure_appends_structured_model_observation() {
         ToolObservationDetail::InvalidInput { issues } => {
             assert_eq!(issues.len(), 1);
             assert_eq!(issues[0].path, "file_path");
-            assert_eq!(issues[0].code, CapabilityInputIssueCode::MissingRequired);
+            assert_eq!(issues[0].code, DispatchInputIssueCode::MissingRequired);
         }
         detail => panic!("expected invalid input detail, got {detail:?}"),
     }
@@ -2946,9 +3709,20 @@ async fn repeated_capability_failures_do_not_trip_no_progress_and_run_can_recove
         .await
         .expect("execute");
 
-    assert!(
-        matches!(exit, LoopExit::Completed(_)),
-        "blocked failures must not fire no-progress; the recovered reply completes the run, got {exit:?}"
+    match exit {
+        LoopExit::Completed(completed) => {
+            assert_eq!(
+                completed.reply_message_refs,
+                vec![message_ref("msg:assistant")]
+            );
+            assert_eq!(completed.result_refs.len(), 3);
+        }
+        other => panic!("expected recovered completion after blocked failures, got {other:?}"),
+    }
+    assert_eq!(
+        host.model_requests().len(),
+        4,
+        "blocked failures must not fire no-progress or an explanation failure call before recovered reply"
     );
     assert_eq!(host.batch_invocations().len(), 3);
     assert_eq!(host.appended_result_refs().len(), 3);
@@ -2998,9 +3772,22 @@ async fn repeated_multi_call_failures_do_not_trip_no_progress_and_run_can_recove
         .await
         .expect("execute");
 
-    assert!(
-        matches!(exit, LoopExit::Completed(_)),
-        "multi-call blocked failures must not fire no-progress; got {exit:?}"
+    match exit {
+        LoopExit::Completed(completed) => {
+            assert_eq!(
+                completed.reply_message_refs,
+                vec![message_ref("msg:assistant")]
+            );
+            assert_eq!(completed.result_refs.len(), 6);
+        }
+        other => {
+            panic!("expected recovered completion after multi-call blocked failures, got {other:?}")
+        }
+    }
+    assert_eq!(
+        host.model_requests().len(),
+        4,
+        "multi-call blocked failures must not fire no-progress or an explanation failure call before recovered reply"
     );
     assert_eq!(host.batch_invocations().len(), 3);
     assert_eq!(host.appended_result_refs().len(), 6);
@@ -3032,6 +3819,7 @@ async fn completed_output_digest_is_recorded_into_seen_capability_output_digests
                 terminate_hint: true,
                 byte_len: 0,
                 output_digest: Some(digest),
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -3087,7 +3875,11 @@ async fn repeated_non_provider_replayable_failures_do_not_trigger_no_progress_st
         }
         other => panic!("expected iteration-limit failure, got {other:?}"),
     }
-    assert_eq!(host.model_requests().len(), 3);
+    assert_eq!(
+        host.model_requests().len(),
+        4,
+        "iteration limit should attempt one best-effort explanation call"
+    );
     assert_eq!(host.batch_invocations().len(), 3);
     assert_eq!(
         final_staged_state(&host)
@@ -3160,7 +3952,7 @@ async fn model_visible_provider_tool_failures_append_failure_tool_result_for_rep
             .expect("provider replay metadata");
         assert_eq!(provider_call.provider_turn_id, "turn_1");
         assert_eq!(provider_call.provider_call_id, "call_1");
-        assert_eq!(provider_call.provider_tool_name, "demo__echo");
+        assert_eq!(provider_call.provider_tool_name.as_str(), "demo__echo");
         match exit {
             LoopExit::Completed(completed) => {
                 assert_eq!(completed.result_refs, vec![appended[0].result_ref.clone()]);
@@ -3229,7 +4021,9 @@ async fn prompt_stage_returns_skip_model_when_flag_set() {
     let returned_state = match step {
         PromptStep::SkipModel(state, _ack) => *state,
         PromptStep::Prepared(_) => panic!("expected SkipModel, got Prepared"),
-        PromptStep::ResumeApproval(_) | PromptStep::ResumeAuth(_) => {
+        PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_) => {
             panic!("expected SkipModel, got resume step")
         }
         PromptStep::Exit(exit) => panic!("expected SkipModel, got Exit({exit:?})"),
@@ -3291,7 +4085,9 @@ async fn prompt_stage_skip_model_carries_pending_input_ack() {
     let mut carried_ack = match step {
         PromptStep::SkipModel(_state, ack) => ack,
         PromptStep::Prepared(_) => panic!("expected SkipModel, got Prepared"),
-        PromptStep::ResumeApproval(_) | PromptStep::ResumeAuth(_) => {
+        PromptStep::ResumeApproval(_)
+        | PromptStep::ResumeAuth(_)
+        | PromptStep::ResumeExternalTool(_) => {
             panic!("expected SkipModel, got resume step")
         }
         PromptStep::Exit(exit) => panic!("expected SkipModel, got Exit({exit:?})"),
@@ -3334,6 +4130,7 @@ async fn executor_post_capability_trips_policy_and_sets_flags_in_final_state() {
                 // Exceeds the default 32 000-byte cap for unknown capability ids.
                 byte_len: 33_001,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -3397,6 +4194,7 @@ async fn executor_post_capability_does_not_trip_under_threshold() {
                 terminate_hint: true,
                 byte_len: 100, // well under the 32 000-byte default cap
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -3444,6 +4242,7 @@ async fn executor_skip_model_turn_bypasses_model_stage() {
                 terminate_hint: false, // loop must continue so SkipModel fires
                 byte_len: 33_001,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -3556,6 +4355,7 @@ async fn executor_batch_accumulates_per_capability_bytes_and_trips() {
                     terminate_hint: true, // exit after batch so we can inspect state
                     byte_len: 20_000,
                     output_digest: None,
+                    model_observation: None,
                 }),
                 CapabilityOutcome::Completed(CapabilityResultMessage {
                     result_ref: LoopResultRef::new("result:second").expect("valid"),
@@ -3564,6 +4364,7 @@ async fn executor_batch_accumulates_per_capability_bytes_and_trips() {
                     terminate_hint: true,
                     byte_len: 20_000,
                     output_digest: None,
+                    model_observation: None,
                 }),
             ],
             stopped_on_suspension: false,
@@ -3614,6 +4415,42 @@ async fn executor_batch_accumulates_per_capability_bytes_and_trips() {
     );
 }
 
+#[tokio::test]
+async fn await_dependent_run_preserves_model_observation_for_replay() {
+    let result_ref =
+        LoopResultRef::new("result:await-dependent-preserved-observation").expect("valid");
+    let observation = continuation_observation(&result_ref, 4_096);
+    let host = MockHost::new(vec![provider_calls_response()]).with_batch_outcomes(vec![
+        ironclaw_turns::run_profile::CapabilityBatchOutcome {
+            outcomes: vec![CapabilityOutcome::AwaitDependentRun {
+                gate_ref: LoopGateRef::new("gate:await-dependent-preserved-observation")
+                    .expect("valid"),
+                result_ref,
+                safe_summary: "awaited child completed".to_string(),
+                byte_len: 4_096,
+                model_observation: Some(observation.clone()),
+            }],
+            stopped_on_suspension: true,
+        },
+    ]);
+
+    let exit = CanonicalAgentLoopExecutor
+        .execute_family(
+            &crate::families::default(),
+            &host,
+            LoopExecutionState::initial_for_run(host.run_context()),
+        )
+        .await
+        .expect("execute");
+
+    assert!(matches!(exit, LoopExit::Blocked(_)));
+    assert_eq!(host.appended_result_refs().len(), 1);
+    assert_eq!(
+        host.appended_result_refs()[0].model_observation.as_ref(),
+        Some(&observation)
+    );
+}
+
 /// D2 regression: byte_len was hardcoded to 0 for SpawnedChildRun outcomes.
 /// ByteCapStrategy (WU-A) never tripped for builtin.spawn_subagent — the
 /// capability with the largest configured cap (48 KB) — even when the spawned
@@ -3636,6 +4473,7 @@ async fn spawned_child_run_byte_len_accumulates_and_trips_policy() {
                 // If byte_len were still hardcoded to 0 in append_spawned_child_result,
                 // the policy would never trip and both flag assertions below would fail.
                 byte_len: 49_001,
+                model_observation: None,
             }],
             stopped_on_suspension: false,
         },
@@ -3700,6 +4538,7 @@ async fn await_dependent_run_byte_len_accumulates_and_trips_policy() {
                 // still propagated as 0 in the AwaitDependentRunGateStage path,
                 // the pending_capability_bytes assertion below would fail.
                 byte_len: 33_001,
+                model_observation: None,
             }],
             stopped_on_suspension: true,
         },
@@ -3786,6 +4625,7 @@ async fn executor_emits_compaction_started_with_capability_result_overflow_initi
                 terminate_hint: false, // loop must continue so SkipModel iteration fires
                 byte_len: 33_001,      // exceeds the 32 000-byte default cap
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         }])
@@ -3877,6 +4717,59 @@ async fn executor_emits_compaction_started_with_capability_result_overflow_initi
         final_state.stop_state.turns_completed, 3,
         "turns_completed must be 3 (D-A: CompactionOnly turns count per \
          observe_completed_turn's unconditional increment)"
+    );
+}
+
+#[tokio::test]
+async fn executor_continues_after_forced_compaction_rejection_from_tool_result_overflow() {
+    let host = MockHost::new(vec![
+        calls_response(),
+        reply_response_with_text("final answer"),
+    ])
+    .with_batch_outcomes(vec![ironclaw_turns::run_profile::CapabilityBatchOutcome {
+        outcomes: vec![CapabilityOutcome::Completed(CapabilityResultMessage {
+            result_ref: LoopResultRef::new("result:big-compaction-rejected").expect("valid"),
+            safe_summary: "large search result".to_string(),
+            progress: ironclaw_turns::run_profile::CapabilityProgress::MadeProgress,
+            terminate_hint: false,
+            byte_len: 33_001,
+            output_digest: None,
+            model_observation: None,
+        })],
+        stopped_on_suspension: false,
+    }])
+    .with_prompt_compaction_indexes(vec![active_task_preserving_compaction_index(), vec![]])
+    .with_compaction_outcome(Err(LoopCompactionError::SecurityRejected {
+        safe_summary: LoopSafeSummary::new("injection detected").unwrap(),
+    }));
+
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    assert!(
+        matches!(exit, LoopExit::Completed(_)),
+        "compaction rejection after successful tool execution must not fail the run: {exit:?}"
+    );
+    assert_eq!(
+        host.model_requests().len(),
+        2,
+        "the loop should continue to the post-tool reply model turn"
+    );
+    let progress_events = host.progress_event_names();
+    assert!(
+        progress_events.contains(&"compaction_failed"),
+        "the failed compaction should still be reported: {progress_events:?}"
+    );
+    assert!(
+        host.finalized_assistant_messages()
+            .iter()
+            .any(|message| message.contains("final answer")),
+        "the post-tool assistant reply should still finalize"
     );
 }
 
@@ -3996,6 +4889,7 @@ async fn await_dependent_run_gate_skip_and_continue_accumulates_byte_len() {
                 result_ref: LoopResultRef::new(result_ref_str).expect("valid"),
                 safe_summary: "dependent run skip and continue".to_string(),
                 byte_len,
+                model_observation: None,
             }],
             stopped_on_suspension: false,
         },
@@ -4181,6 +5075,168 @@ async fn non_auth_gate_block_preserves_pending_auth_resume() {
 }
 
 #[tokio::test]
+async fn external_tool_gate_block_stores_pending_external_tool_resume() {
+    // Driving the full loop, an ExternalToolPending outcome must block the run
+    // and checkpoint a pending_external_tool_resume record (so resume can
+    // re-dispatch the parked client-tool call).
+    let gate_ref = LoopGateRef::new("gate:external_tool-block").expect("valid");
+    let host = MockHost::new(vec![calls_response()]).with_batch_outcomes(vec![
+        ironclaw_turns::run_profile::CapabilityBatchOutcome {
+            outcomes: vec![CapabilityOutcome::ExternalToolPending {
+                gate_ref: gate_ref.clone(),
+                safe_summary: "awaiting client tool output".to_string(),
+            }],
+            stopped_on_suspension: true,
+        },
+    ]);
+    let executor = CanonicalAgentLoopExecutor;
+    let initial_state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, initial_state)
+        .await
+        .expect("execute blocks on external tool gate");
+    assert!(
+        matches!(exit, LoopExit::Blocked(_)),
+        "expected Blocked exit for external tool gate, got {exit:?}"
+    );
+
+    let before_block_state = final_staged_state_for_kind(&host, LoopCheckpointKind::BeforeBlock);
+    let pending = before_block_state
+        .pending_external_tool_resume
+        .as_ref()
+        .expect("BeforeBlock checkpoint must carry pending_external_tool_resume");
+    assert_eq!(pending.gate_ref, gate_ref);
+    assert_eq!(pending.capability_id, capability_id());
+    // External-tool blocks must not touch the auth/approval slots.
+    assert!(before_block_state.pending_auth_resume.is_none());
+    assert!(before_block_state.pending_approval_resume.is_none());
+}
+
+#[tokio::test]
+async fn parallel_batch_records_completed_results_before_external_tool_block() {
+    let completed_ref = LoopResultRef::new("result:parallel-external-completed").expect("valid");
+    let external_gate_ref = LoopGateRef::new("gate:external-tool-parallel").expect("valid");
+    let host = MockHost::new(vec![two_calls_response()]).with_batch_outcomes(vec![
+        ironclaw_turns::run_profile::CapabilityBatchOutcome {
+            outcomes: vec![
+                CapabilityOutcome::Completed(CapabilityResultMessage {
+                    result_ref: completed_ref.clone(),
+                    safe_summary: "parallel call completed".to_string(),
+                    progress: ironclaw_turns::run_profile::CapabilityProgress::MadeProgress,
+                    terminate_hint: false,
+                    byte_len: 0,
+                    output_digest: None,
+                    model_observation: None,
+                }),
+                CapabilityOutcome::ExternalToolPending {
+                    gate_ref: external_gate_ref.clone(),
+                    safe_summary: "awaiting client tool output".to_string(),
+                },
+            ],
+            stopped_on_suspension: false,
+        },
+    ]);
+    let executor = CanonicalAgentLoopExecutor;
+    let initial_state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = executor
+        .execute_family(&crate::families::default(), &host, initial_state)
+        .await
+        .expect("execute blocks on external tool gate");
+
+    assert!(
+        matches!(exit, LoopExit::Blocked(_)),
+        "expected Blocked exit for external tool gate, got {exit:?}"
+    );
+    let appended = host.appended_result_refs();
+    assert_eq!(appended.len(), 1);
+    assert_eq!(appended[0].result_ref, completed_ref);
+    let before_block_state = final_staged_state_for_kind(&host, LoopCheckpointKind::BeforeBlock);
+    assert_eq!(before_block_state.result_refs, vec![completed_ref]);
+    let pending = before_block_state
+        .pending_external_tool_resume
+        .as_ref()
+        .expect("BeforeBlock checkpoint must carry pending_external_tool_resume");
+    assert_eq!(pending.gate_ref, external_gate_ref);
+}
+
+#[tokio::test]
+async fn resume_after_external_tool_gate_redispatches_without_model_turn() {
+    // Phase 1: the client tool call parks (ExternalToolPending). Phase 2: resume
+    // re-dispatches the parked call WITHOUT a model turn, restaging the provider
+    // tool call so the host decorator can complete it from the catalog output.
+    let gate_ref = LoopGateRef::new("gate:external_tool-resume").expect("valid");
+    let completed_ref = LoopResultRef::new("result:external-tool-resumed").expect("valid");
+    let host = MockHost::new(vec![provider_calls_response()]).with_batch_outcomes(vec![
+        ironclaw_turns::run_profile::CapabilityBatchOutcome {
+            outcomes: vec![CapabilityOutcome::ExternalToolPending {
+                gate_ref: gate_ref.clone(),
+                safe_summary: "awaiting client tool output".to_string(),
+            }],
+            stopped_on_suspension: true,
+        },
+        ironclaw_turns::run_profile::CapabilityBatchOutcome {
+            outcomes: vec![CapabilityOutcome::Completed(
+                ironclaw_turns::run_profile::CapabilityResultMessage {
+                    result_ref: completed_ref.clone(),
+                    safe_summary: "external tool output".to_string(),
+                    progress: ironclaw_turns::run_profile::CapabilityProgress::MadeProgress,
+                    terminate_hint: true,
+                    byte_len: 0,
+                    output_digest: None,
+                    model_observation: None,
+                },
+            )],
+            stopped_on_suspension: false,
+        },
+    ]);
+    let executor = CanonicalAgentLoopExecutor;
+    let initial_state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let first_exit = executor
+        .execute_family(&crate::families::default(), &host, initial_state)
+        .await
+        .expect("first execute blocks on external tool gate");
+    assert!(
+        matches!(first_exit, LoopExit::Blocked(_)),
+        "expected Blocked exit, got {first_exit:?}"
+    );
+    assert_eq!(host.model_requests().len(), 1);
+
+    let before_block_state = final_staged_state_for_kind(&host, LoopCheckpointKind::BeforeBlock);
+    assert!(
+        before_block_state.pending_external_tool_resume.is_some(),
+        "BeforeBlock checkpoint must carry pending_external_tool_resume"
+    );
+
+    let second_exit = executor
+        .execute_family(&crate::families::default(), &host, before_block_state)
+        .await
+        .expect("second execute resumes from external tool gate");
+    assert!(
+        matches!(second_exit, LoopExit::Completed(_)),
+        "expected Completed exit after external tool resume, got {second_exit:?}"
+    );
+
+    // No additional model call: the parked call is re-dispatched before the model.
+    assert_eq!(
+        host.model_requests().len(),
+        1,
+        "external tool resume must re-dispatch without a model call"
+    );
+    // Two batch invocations: phase 1 (park) + phase 2 (complete).
+    assert_eq!(host.batch_invocations().len(), 2);
+    // Resume re-registered the provider tool call so the decorator re-binds and
+    // completes from the catalog.
+    assert_eq!(
+        host.registered_provider_calls().len(),
+        1,
+        "external tool resume must restage exactly one provider tool call"
+    );
+}
+
+#[tokio::test]
 async fn resume_after_auth_gate_redispatches_original_call_without_model_turn() {
     // Phase 1: executor blocks on an auth gate and writes a BeforeBlock checkpoint
     // that carries a pending_auth_resume record with the original input_ref.
@@ -4206,6 +5262,7 @@ async fn resume_after_auth_gate_redispatches_original_call_without_model_turn() 
                     terminate_hint: true,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 },
             )],
             stopped_on_suspension: false,
@@ -4317,7 +5374,8 @@ async fn resume_after_auth_gate_redispatches_original_call_without_model_turn() 
         "auth resume must restage exactly one provider tool call"
     );
     assert_eq!(
-        registered_provider_calls[0].name, "demo__echo",
+        registered_provider_calls[0].name.as_str(),
+        "demo__echo",
         "auth resume must restage the checkpointed provider tool name"
     );
     assert_eq!(
@@ -4376,6 +5434,7 @@ async fn auth_resume_provider_registration_failure_fails_before_invocation() {
                         terminate_hint: true,
                         byte_len: 0,
                         output_digest: None,
+                        model_observation: None,
                     },
                 )],
                 stopped_on_suspension: false,
@@ -4446,6 +5505,7 @@ async fn auth_resume_provider_activity_remap_fails_before_invocation() {
                     terminate_hint: true,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 },
             )],
             stopped_on_suspension: false,
@@ -4938,6 +5998,7 @@ async fn auth_resume_after_approval_carries_resume_token_and_approval_request_id
                     terminate_hint: true,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 },
             )],
             stopped_on_suspension: false,
@@ -5180,6 +6241,7 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
                     terminate_hint: true,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 },
             )],
             stopped_on_suspension: false,
@@ -5315,6 +6377,7 @@ async fn auth_resume_slot_consumed_on_first_batch_match_not_reused_for_second_ca
                         terminate_hint: false,
                         byte_len: 0,
                         output_digest: None,
+                        model_observation: None,
                     },
                 ),
                 CapabilityOutcome::Completed(
@@ -5325,6 +6388,7 @@ async fn auth_resume_slot_consumed_on_first_batch_match_not_reused_for_second_ca
                         terminate_hint: false,
                         byte_len: 0,
                         output_digest: None,
+                        model_observation: None,
                     },
                 ),
             ],
@@ -5868,6 +6932,7 @@ async fn capability_stage_denied_approval_resume_surfaces_gate_declined_failure_
                 activity_id,
                 capability_id: emitted_capability_id,
                 reason_kind: CapabilityFailureKind::GateDeclined,
+                ..
             } if *activity_id == denied_activity_id && *emitted_capability_id == capability_id()
         )),
         "denied approval resume must emit a persistent failed capability activity"
@@ -5978,6 +7043,7 @@ async fn capability_stage_denied_auth_resume_surfaces_gate_declined_failure_and_
                 activity_id,
                 capability_id: emitted_capability_id,
                 reason_kind: CapabilityFailureKind::GateDeclined,
+                ..
             } if *activity_id == denied_activity_id && *emitted_capability_id == capability_id()
         )),
         "denied auth resume must emit a persistent failed capability activity"
@@ -6119,6 +7185,7 @@ async fn auth_gate_without_resume_token_records_activity_id_for_denial_failure()
                 activity_id,
                 capability_id: emitted_capability_id,
                 reason_kind: CapabilityFailureKind::GateDeclined,
+                ..
             } if *activity_id == blocked_activity_id && *emitted_capability_id == capability_id()
         )),
         "denied tokenless auth gate must emit CapabilityActivityFailed for the original activity"
@@ -6160,6 +7227,7 @@ async fn capability_stage_denied_auth_resume_only_fails_matching_call_remaining_
                 terminate_hint: false,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         }]);
@@ -6208,7 +7276,8 @@ async fn capability_stage_denied_auth_resume_only_fails_matching_call_remaining_
                 provider_model_id: "test-model".to_string(),
                 provider_turn_id: "turn_1".to_string(),
                 provider_call_id: "call_x".to_string(),
-                provider_tool_name: "demo__echo".to_string(),
+                provider_tool_name: ProviderToolName::new("demo__echo")
+                    .expect("provider tool name"),
                 arguments: serde_json::json!({"message": "x"}),
                 response_reasoning: None,
                 reasoning: None,
@@ -6357,6 +7426,7 @@ async fn capability_stage_denied_auth_resume_only_fails_matching_activity_when_c
                 terminate_hint: false,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         },
@@ -6396,7 +7466,8 @@ async fn capability_stage_denied_auth_resume_only_fails_matching_activity_when_c
                 provider_model_id: "test-model".to_string(),
                 provider_turn_id: "turn_1".to_string(),
                 provider_call_id: "call_x_same_cap".to_string(),
-                provider_tool_name: "demo__echo".to_string(),
+                provider_tool_name: ProviderToolName::new("demo__echo")
+                    .expect("provider tool name"),
                 arguments: serde_json::json!({"message": "x"}),
                 response_reasoning: None,
                 reasoning: None,
@@ -6453,6 +7524,7 @@ async fn capability_stage_denied_auth_resume_only_fails_matching_activity_when_c
                 activity_id,
                 capability_id: emitted_capability_id,
                 reason_kind: CapabilityFailureKind::GateDeclined,
+                ..
             } if *activity_id == denied_activity_id && *emitted_capability_id == capability_id()
         )),
         "only the parked activity should receive the gate-declined failure"
@@ -6509,6 +7581,7 @@ async fn capability_stage_denied_auth_resume_one_denied_two_remaining_all_dispat
                     terminate_hint: false,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 }),
                 CapabilityOutcome::Completed(CapabilityResultMessage {
                     result_ref: z_result_ref.clone(),
@@ -6517,6 +7590,7 @@ async fn capability_stage_denied_auth_resume_one_denied_two_remaining_all_dispat
                     terminate_hint: false,
                     byte_len: 0,
                     output_digest: None,
+                    model_observation: None,
                 }),
             ],
             stopped_on_suspension: false,
@@ -6564,7 +7638,8 @@ async fn capability_stage_denied_auth_resume_one_denied_two_remaining_all_dispat
                 provider_model_id: "test-model".to_string(),
                 provider_turn_id: "turn_1".to_string(),
                 provider_call_id: "call_x".to_string(),
-                provider_tool_name: "demo__echo".to_string(),
+                provider_tool_name: ProviderToolName::new("demo__echo")
+                    .expect("provider tool name"),
                 arguments: serde_json::json!({"message": "x"}),
                 response_reasoning: None,
                 reasoning: None,
@@ -6751,6 +7826,7 @@ async fn capability_stage_denied_approval_resume_only_fails_matching_call_remain
                 terminate_hint: false,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         }]);
@@ -6797,7 +7873,8 @@ async fn capability_stage_denied_approval_resume_only_fails_matching_call_remain
                 provider_model_id: "test-model".to_string(),
                 provider_turn_id: "turn_1".to_string(),
                 provider_call_id: "call_x".to_string(),
-                provider_tool_name: "demo__echo".to_string(),
+                provider_tool_name: ProviderToolName::new("demo__echo")
+                    .expect("provider tool name"),
                 arguments: serde_json::json!({"message": "x"}),
                 response_reasoning: None,
                 reasoning: None,
@@ -6966,6 +8043,7 @@ async fn capability_stage_denied_approval_resume_no_matching_call_dispatches_unr
                 terminate_hint: false,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             })],
             stopped_on_suspension: false,
         }]);
