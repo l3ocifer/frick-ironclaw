@@ -186,6 +186,7 @@ async fn host_managed_model_port_routes_gateway_and_emits_model_milestones() {
 
     let response = port
         .stream_model(LoopModelRequest {
+            inline_messages: Vec::new(),
             messages: vec![LoopModelMessage {
                 role: "user".to_string(),
                 content_ref: LoopMessageRef::new("msg:user-message").unwrap(),
@@ -211,9 +212,15 @@ async fn host_managed_model_port_routes_gateway_and_emits_model_milestones() {
             .iter()
             .map(|milestone| milestone.kind.kind_name())
             .collect::<Vec<_>>(),
-        vec!["model_started", "model_reasoning_delta", "model_completed"]
+        vec![
+            "model_started",
+            "model_reasoning_delta",
+            "model_text_delta",
+            "model_completed",
+        ]
     );
     let serialized_milestones = serde_json::to_string(&milestone_sink.milestones()).unwrap();
+    assert!(serialized_milestones.contains("safe delta"));
     assert!(!serialized_milestones.contains("RAW_ASSISTANT_CONTENT_SENTINEL"));
     assert!(!serialized_milestones.contains("sk-proj-abcdefghijklmnopqrstuvwxyz123456"));
     assert!(serialized_milestones.contains("[redacted]"));
@@ -240,6 +247,7 @@ async fn host_managed_model_port_returns_response_when_model_started_milestone_f
 
     let response = port
         .stream_model(LoopModelRequest {
+            inline_messages: Vec::new(),
             messages: Vec::new(),
             surface_version: None,
             model_preference: None,
@@ -256,7 +264,10 @@ async fn host_managed_model_port_returns_response_when_model_started_milestone_f
         "model response survived start milestone failure"
     );
     assert_eq!(gateway.requests().len(), 1);
-    assert_eq!(milestone_sink.kind_names(), vec!["model_completed"]);
+    assert_eq!(
+        milestone_sink.kind_names(),
+        vec!["model_text_delta", "model_completed"]
+    );
 }
 
 #[tokio::test]
@@ -280,6 +291,7 @@ async fn host_managed_model_port_returns_response_when_model_completed_milestone
 
     let response = port
         .stream_model(LoopModelRequest {
+            inline_messages: Vec::new(),
             messages: Vec::new(),
             surface_version: None,
             model_preference: None,
@@ -293,7 +305,10 @@ async fn host_managed_model_port_returns_response_when_model_completed_milestone
     };
     assert_eq!(reply.content, "model response survived milestone failure");
     assert_eq!(gateway.requests().len(), 1);
-    assert_eq!(milestone_sink.kind_names(), vec!["model_started"]);
+    assert_eq!(
+        milestone_sink.kind_names(),
+        vec!["model_started", "model_text_delta"]
+    );
 }
 
 #[tokio::test]
@@ -317,6 +332,7 @@ async fn host_managed_model_port_sanitizes_gateway_errors() {
 
     let error = port
         .stream_model(LoopModelRequest {
+            inline_messages: Vec::new(),
             messages: Vec::new(),
             surface_version: None,
             model_preference: None,
@@ -343,6 +359,7 @@ async fn host_managed_model_port_sanitizes_gateway_errors() {
 async fn instruction_bundle_builder_orders_sections_and_rebuilds_deterministically() {
     let context = claimed_run_context().await;
     let surface = VisibleCapabilitySurface {
+        callable_capability_ids: None,
         version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
         descriptors: vec![CapabilityDescriptorView {
             capability_id: CapabilityId::new("demo.echo").unwrap(),
@@ -1425,6 +1442,7 @@ async fn loop_prompt_port_builds_text_only_bundle_from_context_refs() {
 async fn loop_prompt_port_filters_visible_surface_by_capability_view() {
     let host = Arc::new(RecordingAgentLoopHost::new(claimed_run_context().await));
     let surface = VisibleCapabilitySurface {
+        callable_capability_ids: None,
         version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
         descriptors: vec![
             CapabilityDescriptorView {
@@ -2018,6 +2036,7 @@ async fn loop_prompt_port_materializes_memory_surface_and_safety_as_host_owned_r
             .with_context_memory_snippet("memory:project", "project memory available"),
     );
     let surface = VisibleCapabilitySurface {
+        callable_capability_ids: None,
         version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
         descriptors: vec![CapabilityDescriptorView {
             capability_id: CapabilityId::new("demo.echo").unwrap(),
@@ -2029,14 +2048,13 @@ async fn loop_prompt_port_materializes_memory_surface_and_safety_as_host_owned_r
             parameters_schema: serde_json::json!({"type":"object","properties":{"input":{"type":"string"}}}),
         }],
     };
+    let materialization_store = Arc::new(InMemoryInstructionMaterializationStore::default());
     let port = HostManagedLoopPromptPort::new(
         host.context.clone(),
         host.clone(),
         host.milestone_sink.clone(),
     )
-    .with_instruction_materialization_store(Arc::new(
-        InMemoryInstructionMaterializationStore::default(),
-    ))
+    .with_instruction_materialization_store(materialization_store.clone())
     .with_current_surface(surface.clone())
     .with_safety_context(
         InstructionSafetyContext::new("safety:prompt-write", "prompt write safety enforced")
@@ -2074,6 +2092,62 @@ async fn loop_prompt_port_materializes_memory_surface_and_safety_as_host_owned_r
             .as_str()
             .starts_with("msg:surface.surface-v1.")
     }));
+    let surface_message = bundle
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .content_ref
+                .as_str()
+                .starts_with("msg:surface.surface-v1.")
+        })
+        .expect("surface message should be present");
+    let surface_materialized = materialization_store
+        .get_materialized_message(&host.context, &surface_message.content_ref)
+        .expect("surface message ref lookup should succeed")
+        .expect("surface message should be materialized");
+    assert!(
+        surface_materialized
+            .model_content
+            .contains("\nPolicy:\nUse only visible capabilities."),
+        "surface prompt must render the capability policy separately: {:?}",
+        surface_materialized.model_content
+    );
+    assert!(
+        surface_materialized
+            .model_content
+            .contains("not listed under Capabilities"),
+        "surface prompt must tell the model to refuse unavailable named capabilities: {:?}",
+        surface_materialized.model_content
+    );
+    assert!(
+        surface_materialized
+            .model_content
+            .contains("do not call another capability as a substitute or workaround"),
+        "surface prompt must tell the model not to route unavailable tools through alternatives: {:?}",
+        surface_materialized.model_content
+    );
+    assert!(
+        surface_materialized
+            .model_content
+            .contains("\nCapabilities:\n- id: demo.echo"),
+        "surface prompt must render capability descriptors under a stable header: {:?}",
+        surface_materialized.model_content
+    );
+    assert!(
+        surface_materialized
+            .model_content
+            .contains("\n  name: Echo"),
+        "surface prompt must render capability names as labeled fields: {:?}",
+        surface_materialized.model_content
+    );
+    assert!(
+        surface_materialized
+            .model_content
+            .contains("\n  description: Echo safe input"),
+        "surface prompt must render capability descriptions as labeled fields: {:?}",
+        surface_materialized.model_content
+    );
     assert!(bundle.instruction_fingerprint.is_some());
     assert_eq!(host.effects(), vec!["context"]);
     assert_eq!(host.milestone_kind_names(), vec!["prompt_bundle_built"]);
@@ -2221,6 +2295,7 @@ async fn loop_prompt_bundle_public_serialization_hides_raw_content() {
         resolved_run_profile_id: host.context.resolved_run_profile.profile_id.clone(),
         resolved_run_profile_version: host.context.resolved_run_profile.profile_version,
         resolved_model_route: None,
+        model_usage: None,
         received_at: Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap(),
         checkpoint_id: None,
         gate_ref: None,
@@ -2530,6 +2605,7 @@ impl AgentLoopDriver for ReplyDriver {
         assert_eq!(prompt.messages.len(), 1);
         let response = host
             .stream_model(LoopModelRequest {
+                inline_messages: Vec::new(),
                 messages: prompt.messages,
                 surface_version: prompt.surface_version,
                 model_preference: Some(
@@ -2545,6 +2621,7 @@ impl AgentLoopDriver for ReplyDriver {
         let ParentLoopOutput::AssistantReply(reply) = response.output else {
             return Err(AgentLoopDriverError::Failed {
                 reason_kind: "unexpected_model_output".to_string(),
+                detail: None,
             });
         };
         let message_ref = host
@@ -2565,7 +2642,7 @@ impl AgentLoopDriver for ReplyDriver {
             reply_message_refs: vec![message_ref],
             result_refs: Vec::new(),
             final_checkpoint_id: None,
-            usage_summary_ref: None,
+            model_usage: None,
             exit_id: LoopExitId::new("exit:reply-driver").unwrap(),
         }))
     }
@@ -2618,6 +2695,7 @@ impl AgentLoopDriver for CapabilityDriver {
         let CapabilityOutcome::ApprovalRequired { gate_ref, .. } = outcome else {
             return Err(AgentLoopDriverError::Failed {
                 reason_kind: "expected_approval".to_string(),
+                detail: None,
             });
         };
         let state_ref = LoopCheckpointStateRef::new("checkpoint:approval-state").unwrap();
@@ -2787,6 +2865,7 @@ async fn host_managed_model_port_times_out_a_hung_gateway() {
 
     let error = port
         .stream_model(LoopModelRequest {
+            inline_messages: Vec::new(),
             messages: vec![LoopModelMessage {
                 role: "user".to_string(),
                 content_ref: LoopMessageRef::new("msg:user-message").unwrap(),
@@ -2836,6 +2915,7 @@ impl RecordingAgentLoopHost {
             capability_outcomes: Mutex::new(Vec::new()),
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
             visible_surface: VisibleCapabilitySurface {
+                callable_capability_ids: None,
                 version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
                 descriptors: vec![CapabilityDescriptorView {
                     capability_id: CapabilityId::new("demo.echo").unwrap(),
@@ -3226,6 +3306,7 @@ async fn claimed_run_context() -> LoopRunContext {
     let coordinator = DefaultTurnCoordinator::new(store.clone());
     let response = coordinator
         .submit_turn(SubmitTurnRequest {
+            requested_model: None,
             scope: scope.clone(),
             actor: TurnActor::new(UserId::new("user-loop").unwrap()),
             accepted_message_ref: AcceptedMessageRef::new("message-loop-host").unwrap(),
@@ -3272,6 +3353,7 @@ fn driver_run_request(host: &RecordingAgentLoopHost) -> ironclaw_turns::AgentLoo
 fn driver_error(error: AgentLoopHostError) -> AgentLoopDriverError {
     AgentLoopDriverError::Failed {
         reason_kind: error.kind.as_str().to_string(),
+        detail: error.detail,
     }
 }
 
@@ -3384,6 +3466,7 @@ impl LoopModelBudgetAccountant for RecordingBudgetAccountant {
 
 fn simple_model_request(context: &LoopRunContext) -> LoopModelRequest {
     LoopModelRequest {
+        inline_messages: Vec::new(),
         messages: vec![LoopModelMessage {
             role: "user".to_string(),
             content_ref: LoopMessageRef::new("msg:user-message").unwrap(),
@@ -3702,7 +3785,10 @@ async fn model_started_failure_still_accounts_provider_outcome() {
     assert!(accountant.was_post_called());
     assert!(!accountant.post_saw_failure());
     assert_eq!(gateway.requests().len(), 1);
-    assert_eq!(milestone_sink.kind_names(), vec!["model_completed"]);
+    assert_eq!(
+        milestone_sink.kind_names(),
+        vec!["model_text_delta", "model_completed"]
+    );
 }
 
 /// Budget accounting on failure: post hook still fires.
@@ -3945,6 +4031,7 @@ async fn turn_run_state_product_context_defaults_to_none_when_missing_from_json(
         resolved_run_profile_id: context.resolved_run_profile.profile_id.clone(),
         resolved_run_profile_version: context.resolved_run_profile.profile_version,
         resolved_model_route: None,
+        model_usage: None,
         received_at: Utc.with_ymd_and_hms(2026, 6, 11, 21, 32, 0).unwrap(),
         checkpoint_id: None,
         gate_ref: None,
@@ -4006,6 +4093,7 @@ async fn turn_run_state_resume_disposition_defaults_to_none_when_missing_from_js
         resolved_run_profile_id: context.resolved_run_profile.profile_id.clone(),
         resolved_run_profile_version: context.resolved_run_profile.profile_version,
         resolved_model_route: None,
+        model_usage: None,
         received_at: Utc.with_ymd_and_hms(2026, 6, 11, 21, 32, 0).unwrap(),
         checkpoint_id: None,
         gate_ref: None,
@@ -4217,7 +4305,7 @@ async fn instruction_bundle_runtime_scheduled_trigger_with_no_delivery_emits_war
         .expect("runtime section must exist");
     let content = &runtime_msg.model_content;
     assert!(
-        content.contains("Warning: no delivery target is set"),
+        content.contains("Warning: no default delivery target is set"),
         "{content}"
     );
     assert!(

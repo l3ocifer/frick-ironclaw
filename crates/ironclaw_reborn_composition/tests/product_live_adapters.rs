@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use ironclaw_filesystem::{InMemoryBackend, ScopedFilesystem};
+
 use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_host_api::{
@@ -14,8 +16,8 @@ use ironclaw_host_runtime::{
     SKILL_INSTALL_CAPABILITY_ID, SurfaceKind,
     VisibleCapabilityRequest as HostVisibleCapabilityRequest,
 };
-use ironclaw_loop_support::{
-    CapabilityResultWrite, CapabilityWriteResult, EmptyUserProfileSource,
+use ironclaw_loop_host::{
+    CapabilityResultWrite, CapabilityWriteResult, DurablePersistence, EmptyUserProfileSource,
     HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
     HostInputBatch, HostInputEnvelope, HostInputQueue, HostInputQueueError, HostManagedModelError,
     HostManagedModelErrorKind, HostManagedModelGateway, HostManagedModelRequest,
@@ -24,7 +26,14 @@ use ironclaw_loop_support::{
     RunCancellationHandle, loop_driver_execution_extension_id,
     verify_product_live_cancellation_probe,
 };
-use ironclaw_reborn::{
+use ironclaw_reborn_composition::{
+    ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
+    ProductLivePlannedRuntimeAdapterConfig, ProductLivePlannedRuntimeAdapterError,
+    ProductLivePlannedRuntimeAdapters, ProductLiveVisibleCapabilityRequestConfig, RebornBuildInput,
+    RebornServices, build_reborn_services, capability_allowlist,
+    visible_capability_request_for_run,
+};
+use ironclaw_runner::{
     loop_exit_applier::ThreadCheckpointLoopExitEvidencePort,
     model_routes::{ModelSelectionMode, ModelSlot},
     planned_driver_factory::default_planned_run_profile_resolver,
@@ -32,17 +41,13 @@ use ironclaw_reborn::{
         DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, build_product_live_planned_runtime,
     },
     subagent::{
+        await_edge::{
+            boot_recovery::ScopeRecoveryDriver, resolver::AwaitEdgeResolver,
+            store::FilesystemAwaitEdgeStore,
+        },
         flavors::StaticSubagentDefinitionResolver,
-        gate_resolution::BoundedSubagentGateResolutionStore,
         goal_store::InMemoryBoundedSubagentGoalStore,
     },
-};
-use ironclaw_reborn_composition::{
-    ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
-    ProductLivePlannedRuntimeAdapterConfig, ProductLivePlannedRuntimeAdapterError,
-    ProductLivePlannedRuntimeAdapters, ProductLiveVisibleCapabilityRequestConfig, RebornBuildInput,
-    RebornServices, build_reborn_services, capability_allowlist,
-    visible_capability_request_for_run,
 };
 use ironclaw_threads::{InMemorySessionThreadService, SessionThreadService, ThreadScope};
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
@@ -75,6 +80,7 @@ async fn write_capability_result_for_test(
             capability_id: &capability_id,
             output,
             display_preview: None,
+            durable_persistence: DurablePersistence::Persist,
         })
         .await?;
     Ok(result_ref)
@@ -159,6 +165,7 @@ async fn capability_io_write_capability_result_returns_serialized_payload_byte_l
             capability_id: &capability_id,
             output: output.clone(),
             display_preview: None,
+            durable_persistence: DurablePersistence::Persist,
         })
         .await
         .expect("write capability result");
@@ -413,6 +420,12 @@ async fn local_dev_adapter_gates_builtin_echo_when_global_auto_approve_is_off() 
     .await
     .unwrap();
     let run_context = loop_run_context("builtin-echo").await;
+    disable_global_auto_approve_for_run(
+        &services,
+        &run_context,
+        UserId::new("user-builtin-echo").unwrap(),
+    )
+    .await;
     let io = Arc::new(ProductLiveCapabilityIo::default());
     let input_ref = io
         .stage_input(
@@ -500,6 +513,12 @@ async fn local_dev_adapter_invokes_builtin_shell_through_product_live_surface() 
     .await
     .unwrap();
     let run_context = loop_run_context("builtin-shell").await;
+    disable_global_auto_approve_for_run(
+        &services,
+        &run_context,
+        UserId::new("user-builtin-shell").unwrap(),
+    )
+    .await;
     let io = Arc::new(ProductLiveCapabilityIo::default());
     let input_ref = io
         .stage_input(
@@ -1181,7 +1200,7 @@ async fn adapter_bundle_wires_required_product_live_components() {
         .expect("turn-state cancellation factory should expose a live probe");
     assert_eq!(
         readiness,
-        ironclaw_loop_support::ProductLiveCancellationReadiness::ExternallyControllable
+        ironclaw_loop_host::ProductLiveCancellationReadiness::ExternallyControllable
     );
 
     let capability_port = adapters
@@ -1303,6 +1322,27 @@ async fn adapter_bundle_satisfies_product_live_runtime_readiness_gate() {
 
     let turn_state_for_evidence: Arc<dyn TurnStateStore> = turn_state.clone();
     let loop_checkpoint_for_evidence: Arc<dyn LoopCheckpointStore> = loop_checkpoint_store.clone();
+    let await_edge_mounts = MountView::new(vec![MountGrant::new(
+        MountAlias::new("/turns").unwrap(),
+        VirtualPath::new("/turns").unwrap(),
+        MountPermissions::read_write_list_delete(),
+    )])
+    .unwrap();
+    let await_edge_store = Arc::new(FilesystemAwaitEdgeStore::new(Arc::new(
+        ScopedFilesystem::with_fixed_view(Arc::new(InMemoryBackend::new()), await_edge_mounts),
+    )));
+    let subagent_goal_store = Arc::new(InMemoryBoundedSubagentGoalStore::new());
+    let await_edge_resolver = Arc::new(AwaitEdgeResolver::new_unbound(
+        Arc::clone(&await_edge_store),
+        subagent_goal_store.clone() as Arc<dyn ironclaw_loop_host::SubagentSpawnGoalStore>,
+        turn_state.clone() as Arc<dyn ironclaw_turns::TurnSpawnTreeStateStore>,
+        adapters.capability_result_writer.clone(),
+        Arc::clone(&thread_service),
+    ));
+    let await_edge_driver = Arc::new(ScopeRecoveryDriver::new(
+        Arc::clone(&await_edge_resolver),
+        Arc::clone(&await_edge_store),
+    ));
     let composition = build_product_live_planned_runtime(DefaultPlannedRuntimeParts {
         attachment_read_port: None,
         turn_state,
@@ -1315,17 +1355,24 @@ async fn adapter_bundle_satisfies_product_live_runtime_readiness_gate() {
         capability_factory: adapters.capability_factory,
         capability_surface_resolver: adapters.capability_surface_resolver,
         capability_result_writer: adapters.capability_result_writer,
-        subagent_goal_store: Arc::new(InMemoryBoundedSubagentGoalStore::new()),
-        subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+        subagent_goal_store,
+        subagent_await_edge_writer: await_edge_driver
+            as Arc<dyn ironclaw_loop_host::AwaitEdgeWriter>,
+        subagent_await_edge_settler: await_edge_resolver
+            as Arc<dyn ironclaw_loop_host::AwaitEdgeSettler>,
+        subagent_await_edge_evidence: Arc::clone(&await_edge_store)
+            as Arc<dyn ironclaw_runner::loop_exit_applier::AwaitDependentRunEvidenceStore>,
         subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
         subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
             adapters.capability_input_resolver,
         )),
-        subagent_spawn_limits: ironclaw_loop_support::SubagentSpawnLimits::default(),
+        subagent_spawn_limits: ironclaw_loop_host::SubagentSpawnLimits::default(),
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
             thread_service,
             turn_state_for_evidence,
             loop_checkpoint_for_evidence,
+            await_edge_store
+                as Arc<dyn ironclaw_runner::loop_exit_applier::AwaitDependentRunEvidenceStore>,
             thread_scope,
         )),
         config: DefaultPlannedRuntimeConfig::default(),
@@ -1541,6 +1588,28 @@ async fn enable_global_auto_approve_for_run(
         })
         .await
         .expect("enable global auto-approve for product-live dispatch");
+}
+
+// Global auto-approve now defaults ON, so a test that needs to exercise the
+// per-tool approval gate must flip it OFF for the dispatch scope explicitly.
+async fn disable_global_auto_approve_for_run(
+    services: &RebornServices,
+    run_context: &LoopRunContext,
+    user_id: UserId,
+) {
+    let store = services
+        .local_dev_auto_approve_settings_for_test()
+        .expect("local-dev exposes auto-approve settings for test");
+    let mut scope = run_context.scope.to_resource_scope();
+    scope.user_id = user_id;
+    store
+        .set(ironclaw_approvals::AutoApproveSettingInput {
+            updated_by: Principal::User(scope.user_id.clone()),
+            scope,
+            enabled: false,
+        })
+        .await
+        .expect("disable global auto-approve for product-live dispatch");
 }
 
 async fn loop_run_context(label: &str) -> LoopRunContext {

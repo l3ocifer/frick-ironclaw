@@ -19,6 +19,7 @@ mod in_memory;
 mod service;
 mod summary_artifacts;
 mod title;
+mod tool_result_records;
 mod tool_result_reference;
 
 pub use filesystem_service::FilesystemSessionThreadService;
@@ -35,16 +36,18 @@ pub use capability_display_preview::{
 pub use contract::{
     AcceptInboundMessageRequest, AcceptedInboundMessage, AcceptedInboundMessageReplay,
     AppendAssistantDraftRequest, AppendCapabilityDisplayPreviewRequest,
-    AppendToolResultReferenceRequest, ContextImageAttachment, ContextMessage, ContextMessages,
-    ContextWindow, CreateSummaryArtifactRequest, EnsureThreadRequest,
+    AppendFinalizedAssistantMessageRequest, AppendToolResultReferenceRequest,
+    ContextImageAttachment, ContextMessage, ContextMessages, ContextWindow,
+    CreateSummaryArtifactRequest, DeleteToolResultRecordRequest, EnsureThreadRequest,
     FinalizedAssistantMessageByRunRequest, GOAL_STATEMENT_MAX_CHARS, GoalStatement,
     LatestThreadMessageRequest, ListThreadsForScopeRequest, ListThreadsForScopeResponse,
     LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, MessageKind,
-    MessageStatus, RedactMessageRequest, ReplayAcceptedInboundMessageRequest, SessionThreadRecord,
-    SummaryArtifact, SummaryKind, SummaryModelContextPolicy, ThreadGoal, ThreadHistory,
+    MessageStatus, PutToolResultRecordRequest, ReadToolResultRecordRequest, RedactMessageRequest,
+    ReplayAcceptedInboundMessageRequest, SessionThreadRecord, SummaryArtifact, SummaryKind,
+    SummaryModelContextPolicy, TOOL_RESULT_RECORD_READ_MAX_BYTES, ThreadGoal, ThreadHistory,
     ThreadHistoryRequest, ThreadMessageRange, ThreadMessageRangeRequest, ThreadMessageRecord,
-    ThreadScope, UpdateAssistantDraftRequest, UpdateThreadGoalRequest,
-    UpdateToolResultReferenceRequest,
+    ThreadScope, ToolResultRecordChunk, UpdateAssistantDraftRequest, UpdateThreadGoalRequest,
+    UpdateToolResultRecordRequest, UpdateToolResultReferenceRequest,
 };
 pub use error::SessionThreadError;
 pub use identifiers::{SummaryArtifactId, ThreadMessageId};
