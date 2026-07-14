@@ -1,4 +1,4 @@
-use ironclaw_host_api::CapabilityId;
+use ironclaw_host_api::{CapabilityId, INPUT_ENCODE_HUMAN_SUMMARY, ProviderToolName};
 use ironclaw_safety::{
     validate_optional_provider_metadata_text, validate_provider_arguments,
     validate_provider_identity, validate_provider_token, validate_provider_tool_name,
@@ -18,25 +18,20 @@ const MODEL_OBSERVATION_REPAIRS_MAX: usize = 16;
 const MODEL_OBSERVATION_INPUT_ISSUES_MAX: usize = 16;
 const MODEL_OBSERVATION_TEXT_MAX_BYTES: usize = 512;
 const RAW_PAYLOAD_OR_PATH_DELIMITERS: [char; 9] = ['{', '}', '[', ']', '`', '<', '>', '/', '\\'];
-const SENSITIVE_SUMMARY_MARKERS: [&str; 18] = [
+// Only credential markers are banned. Descriptive error vocabulary
+// ("provider error", "stack trace", "tool input", "traceback", "host path",
+// "raw runtime") is allowed — the raw cause rides the model-visible detail
+// channel, which redacts secret VALUES rather than banning ordinary words.
+const SENSITIVE_SUMMARY_MARKERS: [&str; 9] = [
     "access token",
     "api key",
     "api_key",
     "apikey",
     "authorization:",
     "bearer ",
-    "host path",
-    "invalid api key",
-    "invalid_api_key",
     "password",
     "passwd",
-    "provider error",
-    "raw runtime",
     "secret",
-    "stack trace",
-    "tool input",
-    "tool_input",
-    "traceback",
 ];
 const SENSITIVE_OBSERVATION_MARKERS: [&str; 20] = [
     "access token",
@@ -113,7 +108,7 @@ pub struct ProviderToolCallReferenceEnvelope {
     pub provider_model_id: String,
     pub provider_turn_id: String,
     pub provider_call_id: String,
-    pub provider_tool_name: String,
+    pub provider_tool_name: ProviderToolName,
     pub capability_id: CapabilityId,
     pub arguments: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,7 +129,8 @@ impl ProviderToolCallReferenceEnvelope {
             .map_err(|error| error.to_string())?;
         validate_provider_token(&self.provider_call_id, "provider call id", 512)
             .map_err(|error| error.to_string())?;
-        validate_provider_tool_name(&self.provider_tool_name).map_err(|error| error.to_string())?;
+        validate_provider_tool_name(self.provider_tool_name.as_str())
+            .map_err(|error| error.to_string())?;
         validate_provider_arguments(&self.arguments).map_err(|error| error.to_string())?;
         validate_optional_provider_text(
             &self.response_reasoning,
@@ -148,6 +144,11 @@ impl ProviderToolCallReferenceEnvelope {
 }
 
 impl ToolResultReferenceEnvelope {
+    /// Validate an opaque result reference before it is used as a storage key.
+    pub fn validate_result_ref(value: &str) -> Result<(), String> {
+        validate_tool_result_ref(value)
+    }
+
     pub fn new(
         result_ref: impl Into<String>,
         safe_summary: ToolResultSafeSummary,
@@ -187,25 +188,13 @@ impl ToolResultReferenceEnvelope {
             return Ok(envelope);
         };
 
-        match validate_model_observation(&model_observation) {
-            Ok(()) => {
-                let model_observation_content =
-                    serde_json::to_string(&model_observation).unwrap_or_default();
-                log_model_observation_constructed(&envelope.result_ref, &model_observation_content);
-                envelope.model_observation = Some(model_observation);
-            }
-            Err(error) => {
-                tracing::debug!(
-                    reason = %error,
-                    result_ref = %envelope.result_ref,
-                    "model-visible tool observation validation failed; preserving safe summary"
-                );
-                tracing::warn!(
-                    reason = %error,
-                    result_ref = %envelope.result_ref,
-                    "dropping invalid model-visible tool observation and preserving safe summary"
-                );
-            }
+        if let Some(model_observation) =
+            normalized_model_observation(&envelope.result_ref, model_observation)
+        {
+            let model_observation_content =
+                serde_json::to_string(&model_observation).unwrap_or_default();
+            log_model_observation_constructed(&envelope.result_ref, &model_observation_content);
+            envelope.model_observation = Some(model_observation);
         }
         Ok(envelope)
     }
@@ -243,6 +232,32 @@ impl ToolResultReferenceEnvelope {
                 self.safe_summary.as_str().to_string()
             }
         }
+    }
+
+    /// Fingerprint for an *error* observation, used to detect identical repeated
+    /// failures across the replayed transcript. Returns `None` for success
+    /// observations or references with no model-visible observation, so only
+    /// genuine errors are ever considered for collapsing.
+    pub fn error_observation_fingerprint(&self) -> Option<String> {
+        let observation = self.model_observation.as_ref()?;
+        if observation
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("error")
+        {
+            return None;
+        }
+        Some(observation.to_string())
+    }
+
+    /// Replace this reference's model-visible observation with a compact,
+    /// schema-valid marker noting that an identical error was elided to save
+    /// context. Used to collapse the *interior* duplicates of a repeated failing
+    /// call while its first and latest occurrences keep full detail. The marker
+    /// still validates and round-trips, and the reference (and its provider
+    /// tool-call pairing) is otherwise untouched.
+    pub fn collapse_to_repeated_error_marker(&mut self) {
+        self.model_observation = Some(repeated_error_elided_observation());
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -291,6 +306,101 @@ impl ToolResultReferenceEnvelope {
             .map(Some)
             .map_err(|error| error.to_string())
     }
+}
+
+fn normalized_model_observation(
+    result_ref: &str,
+    mut model_observation: serde_json::Value,
+) -> Option<serde_json::Value> {
+    match validate_model_observation(&model_observation) {
+        Ok(()) => Some(model_observation),
+        Err(error) => {
+            let repaired = strip_unsafe_result_reference_preview(&mut model_observation)
+                || strip_unsafe_invalid_input_issue_text(&mut model_observation);
+            if repaired && validate_model_observation(&model_observation).is_ok() {
+                tracing::debug!(
+                    reason = %error,
+                    result_ref = %result_ref,
+                    "scrubbed unsafe model-observation fields while preserving the observation"
+                );
+                Some(model_observation)
+            } else {
+                tracing::debug!(
+                    reason = %error,
+                    "model-visible tool observation validation failed; preserving safe summary"
+                );
+                tracing::warn!(
+                    reason = %error,
+                    result_ref = %result_ref,
+                    "dropping invalid model-visible tool observation and preserving safe summary"
+                );
+                None
+            }
+        }
+    }
+}
+
+fn observation_detail_of_kind<'a>(
+    observation: &'a mut serde_json::Value,
+    kind: &str,
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    observation
+        .as_object_mut()
+        .and_then(|observation| observation.get_mut("detail"))
+        .and_then(serde_json::Value::as_object_mut)
+        .filter(|detail| detail.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
+}
+
+fn strip_unsafe_result_reference_preview(observation: &mut serde_json::Value) -> bool {
+    observation_detail_of_kind(observation, "result_reference")
+        .and_then(|detail| detail.remove("preview"))
+        .is_some()
+}
+
+/// Whether an issue-text field needs repair: either the content scan rejects
+/// it, or it's too long for the retry's own length check to accept even once
+/// content-clean.
+fn observation_text_needs_repair(text: &str) -> bool {
+    text.len() > MODEL_OBSERVATION_TEXT_MAX_BYTES || validate_model_observation_text(text).is_err()
+}
+
+/// Scrubs untrusted echoed text out of `invalid_input` issues: an unsafe
+/// `received` is dropped (it is optional), an unsafe `path` is replaced with
+/// a fixed placeholder (it is required), so the structured repair guidance
+/// survives instead of the whole observation being dropped.
+fn strip_unsafe_invalid_input_issue_text(observation: &mut serde_json::Value) -> bool {
+    let Some(issues) = observation_detail_of_kind(observation, "invalid_input")
+        .and_then(|detail| detail.get_mut("issues"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for issue in issues {
+        let Some(issue) = issue.as_object_mut() else {
+            continue;
+        };
+        let received_needs_repair = issue
+            .get("received")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(observation_text_needs_repair);
+        if received_needs_repair {
+            issue.remove("received");
+            changed = true;
+        }
+        let path_needs_repair = issue
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(observation_text_needs_repair);
+        if path_needs_repair {
+            issue.insert(
+                "path".to_string(),
+                serde_json::Value::String("unexpected_field".to_string()),
+            );
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn validate_tool_result_ref(value: &str) -> Result<(), String> {
@@ -349,6 +459,9 @@ fn validate_tool_result_safe_summary(value: String) -> Result<String, String> {
             "tool result summary must not contain raw payload or path delimiters".to_string(),
         );
     }
+    if value == INPUT_ENCODE_HUMAN_SUMMARY {
+        return Ok(value);
+    }
 
     let lower = value.to_ascii_lowercase();
     for forbidden in SENSITIVE_SUMMARY_MARKERS {
@@ -367,6 +480,19 @@ fn validate_tool_result_safe_summary(value: String) -> Result<String, String> {
         return Err("tool result summary must not contain API-key-like tokens".to_string());
     }
     Ok(value)
+}
+
+/// A schema-valid error observation used to replace the interior duplicates of a
+/// repeated failing tool call. Compact by design: the model only needs to know
+/// the same error happened again, not a full re-copy of its detail.
+fn repeated_error_elided_observation() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": MODEL_VISIBLE_TOOL_OBSERVATION_SCHEMA_VERSION,
+        "status": "error",
+        "summary": "(Earlier identical tool error elided to save context; the same failure occurred several times \u{2014} see its first and latest occurrences.)",
+        "detail": {"kind": "generic_failure", "failure_kind": "repeated_error_elided"},
+        "trust": "untrusted_tool_output",
+    })
 }
 
 fn validate_model_observation(value: &serde_json::Value) -> Result<(), String> {
@@ -495,14 +621,60 @@ fn validate_model_observation_detail(value: &serde_json::Value) -> Result<(), St
         "generic_failure" => {
             validate_object_keys(
                 object,
-                &["kind", "failure_kind"],
+                &["kind", "failure_kind", "detail"],
                 "model observation detail",
             )?;
             validate_model_observation_identifier(
                 required_string(object, "failure_kind", "model observation detail")?,
                 "model observation failure kind",
                 128,
+            )?;
+            validate_optional_observation_text_len(
+                optional_string(object, "detail", "model observation detail")?,
+                "model observation failure detail",
+                MAX_MODEL_OBSERVATION_BYTES,
             )
+        }
+        "result_reference" => {
+            validate_object_keys(
+                object,
+                &[
+                    "kind",
+                    "result_ref",
+                    "byte_len",
+                    "preview",
+                    "total_bytes",
+                    "next_offset",
+                    "item_count",
+                ],
+                "model observation detail",
+            )?;
+            validate_required_observation_text(
+                required_string(object, "result_ref", "model observation detail")?,
+                "model observation result ref",
+                MODEL_OBSERVATION_TEXT_MAX_BYTES,
+            )?;
+            required_u64(object, "byte_len", "model observation detail")?;
+            for field in ["total_bytes", "next_offset", "item_count"] {
+                if let Some(value) = object.get(field)
+                    && value.as_u64().is_none()
+                {
+                    return Err(format!(
+                        "model observation detail field `{field}` must be a u64"
+                    ));
+                }
+            }
+            if let Some(preview) = optional_string(object, "preview", "model observation detail")? {
+                validate_model_observation_text(preview)?;
+            }
+            if object.contains_key("item_count")
+                && (!object.contains_key("preview") || !object.contains_key("next_offset"))
+            {
+                return Err(
+                    "model observation item_count requires preview and next_offset".to_string(),
+                );
+            }
+            Ok(())
         }
         other => Err(format!(
             "model observation detail kind `{other}` is unsupported"
@@ -761,8 +933,16 @@ fn validate_optional_observation_text(
     value: Option<&str>,
     label: &'static str,
 ) -> Result<(), String> {
+    validate_optional_observation_text_len(value, label, MODEL_OBSERVATION_TEXT_MAX_BYTES)
+}
+
+fn validate_optional_observation_text_len(
+    value: Option<&str>,
+    label: &'static str,
+    max_bytes: usize,
+) -> Result<(), String> {
     if let Some(value) = value {
-        validate_observation_text_len(value, label, MODEL_OBSERVATION_TEXT_MAX_BYTES)?;
+        validate_observation_text_len(value, label, max_bytes)?;
     }
     Ok(())
 }
@@ -824,11 +1004,110 @@ fn is_disallowed_control_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ironclaw_host_api::CapabilityId;
+    use ironclaw_host_api::{CapabilityId, ProviderToolName};
 
     use super::{
-        ProviderToolCallReferenceEnvelope, ToolResultReferenceEnvelope, ToolResultSafeSummary,
+        INPUT_ENCODE_HUMAN_SUMMARY, ProviderToolCallReferenceEnvelope, ToolResultReferenceEnvelope,
+        ToolResultSafeSummary,
     };
+
+    #[test]
+    fn collapse_to_repeated_error_marker_produces_valid_observation() {
+        let error_obs = serde_json::json!({
+            "schema_version": 1,
+            "status": "error",
+            "summary": "Capability failed with invalid_input.",
+            "detail": {"kind": "generic_failure", "failure_kind": "invalid_input"},
+            "trust": "untrusted_tool_output",
+        });
+        let mut envelope = ToolResultReferenceEnvelope::with_model_observation(
+            "result:tool-output_1.2",
+            ToolResultSafeSummary::new("tool failed").expect("summary"),
+            error_obs,
+        )
+        .expect("error observation envelope");
+        assert!(envelope.error_observation_fingerprint().is_some());
+
+        envelope.collapse_to_repeated_error_marker();
+
+        // The collapsed marker is itself a valid error observation that round-trips.
+        envelope
+            .validate()
+            .expect("collapsed observation validates");
+        let observation = envelope.model_observation.as_ref().expect("observation");
+        assert_eq!(
+            observation
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            observation
+                .get("detail")
+                .and_then(|detail| detail.get("failure_kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("repeated_error_elided")
+        );
+    }
+
+    #[test]
+    fn generic_failure_observation_accepts_diagnostic_detail() {
+        let diagnostic = "missing input_schema_ref at /system/extensions/google-calendar/schemas/google-calendar/list_calendars.input.v1.json";
+        let error_obs = serde_json::json!({
+            "schema_version": 1,
+            "status": "error",
+            "summary": "Capability failed with missing_runtime.",
+            "detail": {
+                "kind": "generic_failure",
+                "failure_kind": "missing_runtime",
+                "detail": diagnostic,
+            },
+            "recovery": {
+                "same_call_retry": "not_useful",
+                "repairs": [],
+                "recovery_hint": "respect_failure_constraint",
+            },
+            "trust": "untrusted_tool_output",
+        });
+
+        let envelope = ToolResultReferenceEnvelope::with_model_observation(
+            "result:tool-output_1.4",
+            ToolResultSafeSummary::new("tool failed").expect("summary"),
+            error_obs,
+        )
+        .expect("diagnostic observation envelope");
+
+        envelope
+            .validate()
+            .expect("diagnostic observation validates");
+        assert_eq!(
+            envelope
+                .model_observation
+                .as_ref()
+                .and_then(|observation| observation.get("detail"))
+                .and_then(|detail| detail.get("detail"))
+                .and_then(serde_json::Value::as_str),
+            Some(diagnostic)
+        );
+    }
+
+    #[test]
+    fn error_observation_fingerprint_is_none_for_success() {
+        let success_obs = serde_json::json!({
+            "schema_version": 1,
+            "status": "success",
+            "summary": "ok",
+            "detail": {"kind": "generic_failure", "failure_kind": "none"},
+            "trust": "untrusted_tool_output",
+        });
+        let success = ToolResultReferenceEnvelope::with_model_observation(
+            "result:tool-output_1.3",
+            ToolResultSafeSummary::new("tool ok").expect("summary"),
+            success_obs,
+        )
+        .expect("success observation envelope");
+        assert!(success.error_observation_fingerprint().is_none());
+    }
 
     #[test]
     fn safe_summary_rejects_control_characters() {
@@ -847,6 +1126,45 @@ mod tests {
     fn safe_summary_api_key_check_is_token_based() {
         assert!(ToolResultSafeSummary::new("sky-high confidence").is_ok());
         assert!(ToolResultSafeSummary::new("completed with sk-live-token").is_err());
+    }
+
+    #[test]
+    fn safe_summary_accepts_fixed_input_encode_summary() {
+        let summary = ToolResultSafeSummary::new(INPUT_ENCODE_HUMAN_SUMMARY)
+            .expect("fixed host-authored input encode summary is safe");
+        assert_eq!(summary.as_str(), INPUT_ENCODE_HUMAN_SUMMARY);
+    }
+
+    #[test]
+    fn safe_summary_accepts_ordinary_error_vocabulary() {
+        for accepted in [
+            "provider error occurred during the call",
+            "stack trace was captured for diagnosis",
+            "the tool input was malformed",
+            "a traceback is available for review",
+            "host path resolution did not complete",
+            "raw runtime returned an unexpected status",
+        ] {
+            ToolResultSafeSummary::new(accepted)
+                .unwrap_or_else(|error| panic!("`{accepted}` should be accepted: {error}"));
+        }
+    }
+
+    #[test]
+    fn safe_summary_still_rejects_credentials_and_delimiters() {
+        for rejected in [
+            "leaked sk-LIVEsecretvalue token",
+            "authorization header bearer abc123",
+            "the api key was exposed",
+            "user password was logged",
+            "a secret slipped into the message",
+            "missing schema at /system/extensions",
+        ] {
+            assert!(
+                ToolResultSafeSummary::new(rejected).is_err(),
+                "`{rejected}` must still be rejected"
+            );
+        }
     }
 
     #[test]
@@ -994,6 +1312,206 @@ mod tests {
         );
     }
 
+    /// `item_count` is allowlisted on `result_reference` details, but only as
+    /// a u64 — a malformed value must drop the observation through the
+    /// best-effort constructor and fall back to the safe summary.
+    #[test]
+    fn best_effort_observation_drops_non_u64_item_count() {
+        let envelope = ToolResultReferenceEnvelope::new_best_effort_model_observation(
+            "result:malformed-item-count",
+            ToolResultSafeSummary::new("tool completed").expect("summary"),
+            Some(serde_json::json!({
+                "schema_version": 1,
+                "status": "success",
+                "summary": "Tool completed; preview truncated.",
+                "detail": {
+                    "kind": "result_reference",
+                    "result_ref": "result:malformed-item-count",
+                    "byte_len": 4096,
+                    "total_bytes": 4096,
+                    "next_offset": 2048,
+                    "item_count": "lots"
+                },
+                "trust": "untrusted_tool_output"
+            })),
+        )
+        .expect("envelope construction is fail-open");
+
+        assert!(
+            envelope.model_observation.is_none(),
+            "a non-u64 item_count must drop the observation, not persist it"
+        );
+        assert_eq!(
+            envelope.model_visible_content_or_safe_summary(),
+            "tool completed"
+        );
+    }
+
+    /// `item_count` is only meaningful alongside a truncated preview -- an
+    /// observation carrying `item_count` without `preview`/`next_offset`
+    /// must drop through the best-effort constructor and fall back to the
+    /// safe summary, mirroring the malformed-type case above.
+    #[test]
+    fn best_effort_observation_drops_item_count_without_preview() {
+        let envelope = ToolResultReferenceEnvelope::new_best_effort_model_observation(
+            "result:item-count-without-preview",
+            ToolResultSafeSummary::new("tool completed").expect("summary"),
+            Some(serde_json::json!({
+                "schema_version": 1,
+                "status": "success",
+                "summary": "Tool completed.",
+                "detail": {
+                    "kind": "result_reference",
+                    "result_ref": "result:item-count-without-preview",
+                    "byte_len": 4096,
+                    "item_count": 600
+                },
+                "trust": "untrusted_tool_output"
+            })),
+        )
+        .expect("envelope construction is fail-open");
+
+        assert!(
+            envelope.model_observation.is_none(),
+            "item_count without preview/next_offset must drop the observation, not persist it"
+        );
+        assert_eq!(
+            envelope.model_visible_content_or_safe_summary(),
+            "tool completed"
+        );
+    }
+
+    fn invalid_input_observation_with_issue(issue: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "status": "error",
+            "summary": "Tool input failed schema validation.",
+            "detail": {
+                "kind": "invalid_input",
+                "issues": [issue]
+            },
+            "trust": "untrusted_tool_output"
+        })
+    }
+
+    /// A control character in an issue's `received` echo must be repaired by
+    /// dropping just that field — the structured repair guidance
+    /// (path/code/expected) survives instead of the whole observation
+    /// falling back to the safe summary.
+    #[test]
+    fn best_effort_observation_repairs_control_char_issue_received() {
+        let envelope = ToolResultReferenceEnvelope::new_best_effort_model_observation(
+            "result:control-char-received",
+            ToolResultSafeSummary::new("tool failed").expect("summary"),
+            Some(invalid_input_observation_with_issue(serde_json::json!({
+                "path": "result_ref",
+                "code": "invalid_value",
+                "expected": "valid result reference format",
+                "received": "bad\u{0}ref",
+                "schema_path": "properties/result_ref"
+            }))),
+        )
+        .expect("envelope construction is fail-open");
+
+        let observation = envelope
+            .model_observation
+            .expect("repaired observation is retained, not dropped whole");
+        let issue = &observation["detail"]["issues"][0];
+        assert!(
+            issue.get("received").is_none(),
+            "unsafe received is dropped"
+        );
+        assert_eq!(issue["path"], "result_ref");
+        assert_eq!(issue["code"], "invalid_value");
+        assert_eq!(issue["expected"], "valid result reference format");
+    }
+
+    /// An oversized-but-content-clean `received` passes the content scan but
+    /// still fails the retry's length check, so it must also count as
+    /// needing repair — otherwise the whole observation still drops.
+    #[test]
+    fn best_effort_observation_repairs_oversized_issue_received() {
+        let envelope = ToolResultReferenceEnvelope::new_best_effort_model_observation(
+            "result:oversized-received",
+            ToolResultSafeSummary::new("tool failed").expect("summary"),
+            Some(invalid_input_observation_with_issue(serde_json::json!({
+                "path": "result_ref",
+                "code": "invalid_value",
+                "expected": "valid result reference format",
+                "received": "a".repeat(600),
+                "schema_path": "properties/result_ref"
+            }))),
+        )
+        .expect("envelope construction is fail-open");
+
+        let observation = envelope
+            .model_observation
+            .expect("repaired observation is retained, not dropped whole");
+        let issue = &observation["detail"]["issues"][0];
+        assert!(
+            issue.get("received").is_none(),
+            "oversized received is dropped"
+        );
+        assert_eq!(issue["path"], "result_ref");
+        assert_eq!(issue["code"], "invalid_value");
+        assert_eq!(issue["expected"], "valid result reference format");
+    }
+
+    /// Same repair for sensitive marker phrases the token-based producer
+    /// sanitizer cannot redact (e.g. "api key" across two tokens).
+    #[test]
+    fn best_effort_observation_repairs_marker_phrase_issue_received() {
+        let envelope = ToolResultReferenceEnvelope::new_best_effort_model_observation(
+            "result:marker-received",
+            ToolResultSafeSummary::new("tool failed").expect("summary"),
+            Some(invalid_input_observation_with_issue(serde_json::json!({
+                "path": "result_ref",
+                "code": "invalid_value",
+                "expected": "valid result reference format",
+                "received": "please share the api key",
+                "schema_path": "properties/result_ref"
+            }))),
+        )
+        .expect("envelope construction is fail-open");
+
+        let observation = envelope
+            .model_observation
+            .expect("repaired observation is retained, not dropped whole");
+        let issue = &observation["detail"]["issues"][0];
+        assert!(
+            issue.get("received").is_none(),
+            "unsafe received is dropped"
+        );
+        assert_eq!(issue["code"], "invalid_value");
+        assert_eq!(issue["expected"], "valid result reference format");
+    }
+
+    /// An unsafe `path` (a model-authored field name) is replaced with a
+    /// fixed placeholder rather than dropped — `path` is required.
+    #[test]
+    fn best_effort_observation_replaces_unsafe_issue_path() {
+        let envelope = ToolResultReferenceEnvelope::new_best_effort_model_observation(
+            "result:unsafe-path",
+            ToolResultSafeSummary::new("tool failed").expect("summary"),
+            Some(invalid_input_observation_with_issue(serde_json::json!({
+                "path": "system prompt",
+                "code": "unexpected_field",
+                "expected": "declared field",
+                "received": "unexpected field",
+                "schema_path": "additionalProperties"
+            }))),
+        )
+        .expect("envelope construction is fail-open");
+
+        let observation = envelope
+            .model_observation
+            .expect("repaired observation is retained, not dropped whole");
+        let issue = &observation["detail"]["issues"][0];
+        assert_eq!(issue["path"], "unexpected_field");
+        assert_eq!(issue["code"], "unexpected_field");
+        assert_eq!(issue["received"], "unexpected field");
+    }
+
     #[test]
     fn provider_reference_validation_accepts_safe_zero_arg_metadata() {
         let mut envelope = provider_reference();
@@ -1007,7 +1525,7 @@ mod tests {
             provider_model_id: "model".to_string(),
             provider_turn_id: "turn_1".to_string(),
             provider_call_id: "call_1".to_string(),
-            provider_tool_name: "demo__echo".to_string(),
+            provider_tool_name: ProviderToolName::new("demo__echo").expect("provider tool name"),
             capability_id: CapabilityId::new("demo.echo").expect("capability id"),
             arguments: serde_json::json!({"message":"hello"}),
             response_reasoning: None,

@@ -681,6 +681,7 @@ mod tests {
             _request: VisibleCapabilityRequest,
         ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
             Ok(VisibleCapabilitySurface {
+                callable_capability_ids: None,
                 version: CapabilitySurfaceVersion::new("v1").expect("ok"),
                 descriptors: vec![CapabilityDescriptorView {
                     capability_id: CapabilityId::new("cap.x").expect("ok"),
@@ -710,6 +711,7 @@ mod tests {
                 terminate_hint: false,
                 byte_len: 0,
                 output_digest: None,
+                model_observation: None,
             }))
         }
 
