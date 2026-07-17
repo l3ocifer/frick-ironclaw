@@ -11,7 +11,10 @@
 # syntax=docker/dockerfile:1
 
 # ─── Stage 1: build ──────────────────────────────────────────────────
-FROM rust:1.92-slim-bookworm AS builder
+# Floating 1.x tag (same convention as vetinari-openfang): upstream
+# ironclaw bumps rust-version regularly (1.96 as of 2026-07), so a
+# pinned minor tag keeps breaking the image build.
+FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
