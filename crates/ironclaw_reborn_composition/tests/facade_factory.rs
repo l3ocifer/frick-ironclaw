@@ -1,3 +1,7 @@
+#[cfg(feature = "postgres")]
+#[path = "support/postgres.rs"]
+mod postgres_support;
+
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -27,11 +31,6 @@ use ironclaw_host_runtime::{
     VisibleCapabilityRequest,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_host_runtime::{
-    SchedulerTurnRunWakeNotifier, TurnRunExecutor, TurnRunExecutorError, TurnRunScheduler,
-    TurnRunSchedulerConfig, TurnRunSchedulerHandle,
-};
-#[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_reborn_composition::RebornRuntimeProcessBinding;
 #[cfg(all(feature = "postgres", feature = "webui-v2-beta"))]
 use ironclaw_reborn_composition::{
@@ -51,6 +50,11 @@ use ironclaw_reborn_composition::{
 #[cfg(all(feature = "postgres", feature = "webui-v2-beta"))]
 use ironclaw_reborn_config::{RebornConfigFile, StorageBackend, StorageSection};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
+use ironclaw_runner::turn_scheduler::{
+    SchedulerTurnRunWakeNotifier, TurnRunExecutor, TurnRunExecutorError, TurnRunScheduler,
+    TurnRunSchedulerConfig, TurnRunSchedulerHandle,
+};
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_secrets::SecretMaterial;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_trust::{AdminConfig, AdminEntry, HostTrustAssignment, HostTrustPolicy};
@@ -61,6 +65,8 @@ use ironclaw_turns::{
     InMemoryTurnStateStore,
     runner::{ClaimedTurnRun, TurnRunTransitionPort},
 };
+#[cfg(feature = "postgres")]
+use postgres_support::assert_postgres_accepts_connections;
 use secrecy::SecretString;
 #[cfg(feature = "libsql")]
 use serde_json::Value;
@@ -403,6 +409,8 @@ fn assert_failed_capability(
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 async fn assert_process_capabilities_unavailable_for_processless_runtime(
     services: &RebornServices,
+    expected_shell_failure_kind: RuntimeFailureKind,
+    expected_shell_failure_message: &str,
 ) {
     let runtime = services
         .host_runtime
@@ -439,8 +447,8 @@ async fn assert_process_capabilities_unavailable_for_processless_runtime(
     assert_failed_capability(
         shell_outcome,
         SHELL_CAPABILITY_ID,
-        RuntimeFailureKind::MissingRuntime,
-        "unknown capability",
+        expected_shell_failure_kind,
+        expected_shell_failure_message,
     );
 
     let spawn_outcome = runtime
@@ -616,6 +624,7 @@ async fn postgres_pool_or_skip() -> Option<(
     String,
 )> {
     let (container, database_url) = start_postgres_container().await?;
+    assert_postgres_accepts_connections(&database_url).await;
     let config: tokio_postgres::Config = database_url
         .parse()
         .expect("testcontainer database URL must parse");
@@ -624,10 +633,6 @@ async fn postgres_pool_or_skip() -> Option<(
         .max_size(4)
         .build()
         .expect("Postgres pool must build");
-    let _connection = pool
-        .get()
-        .await
-        .expect("Postgres testcontainer must accept connections");
     Some((container, pool, database_url))
 }
 
@@ -711,6 +716,35 @@ async fn local_dev_builds_facades_without_production_claim() {
     assert!(services.readiness.facades.turn_coordinator);
     assert!(services.readiness.facades.product_auth);
     assert!(services.product_auth.is_some());
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn hosted_single_tenant_volume_hides_process_capabilities() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = ironclaw_reborn_composition::local_runtime_build_input_with_options(
+        RebornCompositionProfile::HostedSingleTenantVolume,
+        "hosted-volume-owner",
+        dir.path().to_path_buf(),
+        Default::default(),
+    )
+    .unwrap();
+    let services = build_reborn_services(input).await.unwrap();
+
+    assert_eq!(
+        services.readiness.profile,
+        RebornCompositionProfile::HostedSingleTenantVolume
+    );
+    assert_eq!(
+        services.readiness.state,
+        RebornReadinessState::HostedSingleTenantVolumePreviewValidated
+    );
+    assert_process_capabilities_unavailable_for_processless_runtime(
+        &services,
+        RuntimeFailureKind::Authorization,
+        "ProcessBackendKind::None",
+    )
+    .await;
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -1463,6 +1497,10 @@ async fn hosted_single_tenant_trigger_access_store_persists_across_reopen() {
         "01234567890123456789012345678901",
     );
     let _pool_max_size = PostgresEnvVarGuard::set("IRONCLAW_REBORN_POSTGRES_POOL_MAX_SIZE", "1");
+    let _resource_governor_singleton = PostgresEnvVarGuard::set(
+        "IRONCLAW_REBORN_POSTGRES_RESOURCE_GOVERNOR_SINGLETON",
+        "true",
+    );
     let _allow_cleartext =
         PostgresEnvVarGuard::set("IRONCLAW_REBORN_ALLOW_REMOTE_POSTGRES_CLEAR_TEXT", "true");
     let _ssl_mode = PostgresEnvVarGuard::clear("DATABASE_SSLMODE");
@@ -1583,7 +1621,12 @@ async fn production_postgres_secure_default_builds_without_process_port() {
     handle.shutdown().await;
 
     assert_production_services_ready_with_first_party_runtime(&services).await;
-    assert_process_capabilities_unavailable_for_processless_runtime(&services).await;
+    assert_process_capabilities_unavailable_for_processless_runtime(
+        &services,
+        RuntimeFailureKind::MissingRuntime,
+        "unknown capability",
+    )
+    .await;
 }
 
 #[cfg(feature = "libsql")]
@@ -1612,7 +1655,12 @@ async fn production_libsql_secure_default_builds_without_process_port() {
     handle.shutdown().await;
 
     assert_production_services_ready_with_first_party_runtime(&services).await;
-    assert_process_capabilities_unavailable_for_processless_runtime(&services).await;
+    assert_process_capabilities_unavailable_for_processless_runtime(
+        &services,
+        RuntimeFailureKind::MissingRuntime,
+        "unknown capability",
+    )
+    .await;
 }
 
 #[cfg(feature = "libsql")]

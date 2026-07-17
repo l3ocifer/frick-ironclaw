@@ -57,14 +57,15 @@ secrets, never speaks to Google, never reads a `SessionStore` row.
 Routes mounted by `webui_v2_auth_router`:
 
 - `GET  /auth/providers` — list configured provider names.
-- `GET  /auth/login/{provider}` — mint a pending flow (CSRF state +
+- `GET  /auth/login/{provider}` — redirect non-canonical hosts to
+  the configured `base_url`, then mint a pending flow (CSRF state +
   PKCE verifier + sanitized `redirect_after`) and redirect the
   browser to the provider's authorization URL.
 - `GET  /auth/callback/{provider}` — single-use state lookup,
   cross-provider replay guard, code exchange via the matching
   `OAuthProvider`, user resolution via `UserDirectory`, session
   mint via `SessionStore`, and redirect to
-  `{redirect_after}?login_ticket=<ticket>` (default `/v2`). The
+  `{redirect_after}?login_ticket=<ticket>` (default `/`). The
   ticket is short-lived and single-use; the SPA redeems it over
   same-origin JSON so the bearer never appears in a redirect
   `Location` header.
@@ -115,6 +116,11 @@ pub trait OAuthProvider: Send + Sync + 'static {
   5-min TTL), and single-use on `take`. A replayed callback cannot
   re-use a state token; cross-provider replay (state minted for
   Google arriving on the GitHub callback) fails closed.
+- **Canonical login host** is the configured `base_url`. Login
+  requests received on any other `Host` redirect to that base URL
+  before a pending-flow entry is created, so preview/custom domains
+  cannot mint state that the registered provider callback host will
+  never see.
 - **Session exchange tickets** are process-local, bounded (1024
   entries + 60-sec TTL), and single-use on `take`. The OAuth
   callback puts only the ticket in the redirect `Location`; the SPA
@@ -130,7 +136,7 @@ pub trait OAuthProvider: Send + Sync + 'static {
 - **Hosted-domain restriction** is enforced server-side from the
   ID token's `hd` claim, not from the `hd=` URL hint.
 - **Error mapping**: every failure path redirects to
-  `/v2?login_error=<code>` where `<code>` is an opaque enum
+  `/?login_error=<code>` where `<code>` is an opaque enum
   (`invalid_state`, `provider_mismatch`, `denied`,
   `unauthorized`, `exchange_failed`, `server_error`,
   `invalid_request`). Provider error bodies, JWT decode messages,

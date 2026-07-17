@@ -239,7 +239,14 @@ impl HostWasmRuntimeCredentials {
             if let Some(restager) = restager {
                 restager
                     .stage_for_request(request.clone(), credential.clone())
-                    .map_err(|_| {
+                    .map_err(|error| {
+                        tracing::warn!(
+                            capability_id = %credential.capability_id,
+                            requester_extension = %credential.requester_extension,
+                            handle = %credential.handle,
+                            ?error,
+                            "failed to restage WASM runtime credential"
+                        );
                         WasmHostError::Unavailable("credential_unavailable".to_string())
                     })?;
             }
@@ -317,6 +324,8 @@ where
     let restage = runtime.spawn(future);
     runtime.spawn(async move {
         let result = restage.await.unwrap_or(Err(CredentialStageError::Backend));
+        #[allow(clippy::let_underscore_must_use)]
+        // receiver may have dropped after recv timeout; nothing to signal
         let _ = sender.send(result);
     });
     receiver.recv().map_err(|_| CredentialStageError::Backend)?

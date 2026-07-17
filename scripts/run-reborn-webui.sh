@@ -39,7 +39,7 @@ REBORN_PORT="${REBORN_PORT:-3000}"
 
 # This launcher prints a login URL for a browser, so a fixed port is required.
 # `serve --port 0` (kernel-picks-a-free-port) is for test harnesses only and
-# would print an unusable http://REBORN_HOST:0/v2 here.
+# would print an unusable http://REBORN_HOST:0/ here.
 if [ "$REBORN_PORT" = "0" ]; then
   echo "error: REBORN_PORT=0 (kernel-assigned port) isn't usable for browser onboarding." >&2
   echo "       Set a fixed REBORN_PORT, or run the test-harness form directly:" >&2
@@ -51,6 +51,24 @@ fi
 # Run cargo from the workspace root regardless of where the script is invoked.
 REPO_ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
+
+FRONTEND_DIR="$REPO_ROOT/crates/ironclaw_webui_v2/frontend"
+if ! command -v pnpm >/dev/null 2>&1; then
+  if command -v corepack >/dev/null 2>&1; then
+    corepack enable pnpm
+  fi
+fi
+if ! command -v pnpm >/dev/null 2>&1; then
+  echo "error: pnpm is required to build WebUI v2 assets." >&2
+  echo "       Install Node 22 from .nvmrc and enable pnpm with: corepack enable pnpm" >&2
+  exit 1
+fi
+echo "==> Building WebUI v2 frontend assets"
+(
+  cd "$FRONTEND_DIR"
+  pnpm install --frozen-lockfile
+  pnpm build
+)
 
 export IRONCLAW_REBORN_HOME="${IRONCLAW_REBORN_HOME:-$HOME/.ironclaw-reborn-demo}"
 
@@ -114,7 +132,7 @@ fi
 
 cat <<EOF
 
-==> Starting WebChat v2 on http://$REBORN_HOST:$REBORN_PORT/v2
+==> Starting WebChat v2 on http://$REBORN_HOST:$REBORN_PORT/
     login token : $IRONCLAW_REBORN_WEBUI_TOKEN
     login user  : $IRONCLAW_REBORN_WEBUI_USER_ID
     reborn home : $IRONCLAW_REBORN_HOME

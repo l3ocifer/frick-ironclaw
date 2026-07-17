@@ -12,12 +12,12 @@ pub use signature::{
     ArgsHash, CapabilityCallSignature, CapabilityCallSignatureError, CapabilityOutputObservation,
 };
 pub use slots::{
-    CapabilityStrategyState, CompactionPromptSnapshot, CompactionStrategyState,
-    ContextStrategyState, DeferredCompactionWatermark, GateStrategyState, GoalRefreshStrategyState,
-    IndexedMessageKind, MessageIndexEntry, ModelStrategyState, PostCapabilityStageState,
-    RecoveryAttemptClass, RecoveryStrategyState, RepeatedCallWarningPhase,
-    RepeatedCallWarningState, ReplyAdmissionRejection, ReplyAdmissionRejectionReason,
-    ReplyAdmissionStrategyState, StopStrategyState,
+    CapabilityStrategyState, CompactionEffectivenessBaseline, CompactionPromptSnapshot,
+    CompactionStrategyState, ContextStrategyState, DeferredCompactionWatermark, GateStrategyState,
+    GoalRefreshStrategyState, IndexedMessageKind, MessageIndexEntry, ModelStrategyState,
+    PostCapabilityStageState, RecoveryAttemptClass, RecoveryStrategyState,
+    RepeatedCallWarningPhase, RepeatedCallWarningState, ReplyAdmissionRejection,
+    ReplyAdmissionRejectionReason, ReplyAdmissionStrategyState, StopStrategyState,
 };
 
 use ironclaw_host_api::{ApprovalRequestId, CapabilityId, CorrelationId, ResourceEstimate};
@@ -70,12 +70,45 @@ pub struct LoopExecutionState {
     /// (#3841 follow-up F1).
     pub recent_output_token_counts: BoundedRing<u32, 8>,
 
+    /// Cumulative provider-reported token usage across this run's model calls,
+    /// summed from `LoopModelResponse::usage`. Carried into the terminal
+    /// `LoopExit` so the run record persists per-run usage for the
+    /// OpenAI-compatible surfaces. `None` until the first call that reports
+    /// usage (replay stubs and usage-less providers leave it `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_model_usage: Option<ironclaw_turns::run_profile::LoopModelUsage>,
+
     /// Count of final-answer nudges issued this run (driver-specific nudge,
     /// gated by `SteeringPolicy.allow_driver_specific_nudges`). Capped so the
     /// loop can't issue unbounded extra model calls. `#[serde(default)]` keeps
     /// older checkpoints decodable.
     #[serde(default)]
     pub final_answer_nudges_used: u32,
+
+    /// Count of tools-capable completion nudges issued this run (driver-specific
+    /// nudge, gated by `SteeringPolicy.allow_driver_specific_nudges`). Unlike the
+    /// tool-free `final_answer_nudges_used` rescue, this one re-enters the loop
+    /// with the full tool surface so the model can finish the task (e.g. write a
+    /// required output file) before answering. Capped so the loop can't issue
+    /// unbounded extra iterations. `#[serde(default)]` keeps older checkpoints
+    /// decodable.
+    #[serde(default)]
+    pub completion_nudges_used: u32,
+
+    /// Set when the executor decided to issue a tools-capable completion nudge
+    /// on the previous turn; consumed by the next prompt build, which injects the
+    /// completion-nudge control message and clears this flag. `#[serde(default)]`
+    /// keeps older checkpoints decodable.
+    #[serde(default)]
+    pub completion_nudge_pending: bool,
+
+    /// Whether the most recent admitted assistant reply "trailed off" without a
+    /// real closing answer (empty after trim, or ends with a colon — a narrated
+    /// next step with no follow-through). Populated by `AssistantReplyStage`; read
+    /// by the stop handling to decide whether a graceful stop warrants a
+    /// completion nudge. `#[serde(default)]` keeps older checkpoints decodable.
+    #[serde(default)]
+    pub last_reply_trailed_off: bool,
 
     // strategy slots — one per strategy that mutates state.
     pub context_state: ContextStrategyState,
@@ -98,6 +131,8 @@ pub struct LoopExecutionState {
     pub pending_approval_resume: Option<PendingApprovalResume>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_auth_resume: Option<PendingAuthResume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_external_tool_resume: Option<PendingExternalToolResume>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -208,7 +243,53 @@ impl PendingAuthResume {
     }
 }
 
+/// Client-supplied ("external") tool call parked at a `BlockedExternalTool`
+/// checkpoint. Unlike auth/approval, external-tool resume carries no resume
+/// token: the run is re-dispatched as a plain invocation and the host's
+/// external-tool decorator completes it from the run-scoped catalog (which holds
+/// the client-submitted output keyed by provider call id). The `provider_replay`
+/// is re-registered on resume so the decorator re-binds `input_ref -> call_id`
+/// and the model's tool arguments are re-staged.
+///
+/// When `disposition` is `Some(Denied)`, the executor surfaces a model-visible
+/// failure for the parked call and SKIPS re-dispatch (so a cancelled external
+/// tool cannot re-block forever).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingExternalToolResume {
+    pub gate_ref: LoopGateRef,
+    pub capability_id: CapabilityId,
+    pub activity_id: CapabilityActivityId,
+    pub surface_version: CapabilitySurfaceVersion,
+    pub input_ref: CapabilityInputRef,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_capability_ids: Vec<CapabilityId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replay: Option<ProviderToolCallReplay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<ironclaw_turns::GateResumeDisposition>,
+}
+
+impl PendingExternalToolResume {
+    pub(crate) fn activity_id_for_resume(&self) -> CapabilityActivityId {
+        self.activity_id
+    }
+}
+
 impl LoopExecutionState {
+    /// Accumulate one model call's reported usage into the run's cumulative
+    /// total. No-op when the call reported no usage (replay stubs, usage-less
+    /// providers), leaving any prior total intact.
+    pub(crate) fn accumulate_model_usage(
+        &mut self,
+        usage: Option<ironclaw_turns::run_profile::LoopModelUsage>,
+    ) {
+        if let Some(usage) = usage {
+            self.cumulative_model_usage
+                .get_or_insert_with(Default::default)
+                .add_assign(&usage);
+        }
+    }
+
     /// Builds the initial state at the start of a fresh run.
     ///
     /// The `input_cursor` field is populated via
@@ -229,7 +310,11 @@ impl LoopExecutionState {
             seen_capability_output_digests: BoundedRing::new(),
             recent_failure_kinds: BoundedRing::new(),
             recent_output_token_counts: BoundedRing::new(),
+            cumulative_model_usage: None,
             final_answer_nudges_used: 0,
+            completion_nudges_used: 0,
+            completion_nudge_pending: false,
+            last_reply_trailed_off: false,
             context_state: ContextStrategyState::default(),
             capability_state: CapabilityStrategyState::default(),
             model_state: ModelStrategyState::default(),
@@ -243,6 +328,7 @@ impl LoopExecutionState {
             gate_state: GateStrategyState::default(),
             pending_approval_resume: None,
             pending_auth_resume: None,
+            pending_external_tool_resume: None,
         }
     }
 
@@ -264,6 +350,40 @@ impl LoopExecutionState {
             field: "payload",
             reason: error.to_string(),
         })
+    }
+
+    /// Rebinds run-owned host state after loading a checkpoint into a new retry
+    /// run.
+    ///
+    /// Retryable failed runs intentionally reuse the source run's checkpoint
+    /// payload. The input cursor inside that payload is scoped to the source
+    /// `(scope, run_id)`, so it cannot be submitted to the retry host. Durable
+    /// transcript/result refs in the payload are also owned by the source run;
+    /// carrying them into the retry would make the retry's terminal exit claim
+    /// foreign-run evidence. Reset these run-owned fields and let the retry host
+    /// produce its own refs.
+    ///
+    /// Gate-bound resume state (`last_gate`, `pending_approval_resume`,
+    /// `pending_auth_resume`) is deliberately NOT cleared here: this same path
+    /// (`PlannedDriver::resume` -> `from_checkpoint_payload().rebase_for_run()`)
+    /// is what resumes a run after an approval/auth gate is resolved, and the
+    /// pending-resume record is exactly the evidence that tells the loop to
+    /// re-dispatch the gated capability. Clearing it drops the resumed
+    /// invocation (regression: only the pre-gate call runs). The resume host
+    /// re-validates the gate before honoring the record, so this is not a
+    /// trust-boundary leak.
+    pub fn rebase_for_run(mut self, context: &LoopRunContext) -> Self {
+        if self.input_cursor.is_for_run(context) {
+            return self;
+        }
+        self.input_cursor = LoopInputCursor::origin_for_run(context);
+        self.assistant_refs.clear();
+        self.result_refs.clear();
+        // A retry rebases onto a different run id; the failed run's token total
+        // belongs to that run and must not be re-reported under the new one.
+        // (Same-run gate resumes return early above, preserving the total.)
+        self.cumulative_model_usage = None;
+        self
     }
 }
 
@@ -702,6 +822,116 @@ mod tests {
         let result = LoopExecutionState::from_checkpoint_payload(&payload, CheckpointKind::Final);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), state);
+    }
+
+    #[test]
+    fn rebase_for_run_resets_run_owned_refs_and_input_cursor() {
+        let source_context = test_run_context();
+        let target_context = test_run_context();
+        let mut state = LoopExecutionState::initial_for_run(&source_context);
+        state.input_cursor = LoopInputCursor::from_host_token(
+            &source_context,
+            ironclaw_turns::run_profile::LoopInputCursorToken::new("input-cursor:source-seen")
+                .unwrap(),
+        );
+        state
+            .assistant_refs
+            .push(LoopMessageRef::new("msg:source-run").unwrap());
+        state
+            .result_refs
+            .push(ironclaw_turns::LoopResultRef::new("result:source-run").unwrap());
+        state.iteration = 4;
+        state.cumulative_model_usage = Some(ironclaw_turns::run_profile::LoopModelUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        });
+        // Gate-bound resume state must survive the rebase: this path also
+        // resumes a run after an approval/auth gate, where the pending-resume
+        // record drives re-dispatch of the gated capability.
+        state.last_gate = Some(LoopGateRef::new("gate:source-run").unwrap());
+        state.pending_approval_resume = Some(PendingApprovalResume {
+            gate_ref: LoopGateRef::new("gate:source-approval").unwrap(),
+            capability_id: CapabilityId::new("gsuite.calendar.list_events").unwrap(),
+            approval_request_id: ApprovalRequestId::new(),
+            resume_token: CapabilityResumeToken::new("00000000-0000-0000-0000-000000000002")
+                .unwrap(),
+            activity_id: CapabilityActivityId::new(),
+            correlation_id: CorrelationId::new(),
+            surface_version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+            input_ref: CapabilityInputRef::new("input:source-approval").unwrap(),
+            effective_capability_ids: vec![],
+            provider_replay: None,
+            input: json!({ "k": "v" }),
+            estimate: ResourceEstimate::default(),
+            disposition: None,
+        });
+        state.pending_auth_resume = Some(PendingAuthResume {
+            gate_ref: LoopGateRef::new("gate:source-auth").unwrap(),
+            capability_id: CapabilityId::new("gsuite.calendar.list_events").unwrap(),
+            surface_version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+            input_ref: CapabilityInputRef::new("input:source").unwrap(),
+            effective_capability_ids: vec![],
+            provider_replay: None,
+            resume_token: None,
+            activity_id: CapabilityActivityId::new(),
+            prior_approval: None,
+            replay: None,
+            disposition: None,
+        });
+
+        let rebased = state.clone().rebase_for_run(&target_context);
+
+        assert_eq!(rebased.iteration, state.iteration);
+        assert!(rebased.input_cursor.is_for_run(&target_context));
+        assert_eq!(
+            rebased.input_cursor,
+            LoopInputCursor::origin_for_run(&target_context)
+        );
+        assert!(rebased.assistant_refs.is_empty());
+        assert!(rebased.result_refs.is_empty());
+        // A retry rebases onto a different run id, so the failed run's token
+        // total must be dropped rather than re-reported under the new run.
+        assert!(rebased.cumulative_model_usage.is_none());
+        // Gate-bound resume state is preserved so an approval/auth resume can
+        // re-dispatch the gated capability.
+        assert_eq!(rebased.last_gate, state.last_gate);
+        assert_eq!(
+            rebased.pending_approval_resume,
+            state.pending_approval_resume
+        );
+        assert_eq!(rebased.pending_auth_resume, state.pending_auth_resume);
+    }
+
+    #[test]
+    fn rebase_for_run_preserves_refs_for_same_run_gate_resume() {
+        let context = test_run_context();
+        let mut state = LoopExecutionState::initial_for_run(&context);
+        state.input_cursor = LoopInputCursor::from_host_token(
+            &context,
+            ironclaw_turns::run_profile::LoopInputCursorToken::new("input-cursor:gate-seen")
+                .unwrap(),
+        );
+        state
+            .assistant_refs
+            .push(LoopMessageRef::new("msg:same-run").unwrap());
+        state
+            .result_refs
+            .push(ironclaw_turns::LoopResultRef::new("result:same-run").unwrap());
+        state.iteration = 3;
+        // A same-run gate resume must preserve the run's accumulated token
+        // total; the full-equality assertion below locks that in.
+        state.cumulative_model_usage = Some(ironclaw_turns::run_profile::LoopModelUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        });
+
+        let rebased = state.clone().rebase_for_run(&context);
+
+        assert_eq!(rebased, state);
     }
 
     #[test]

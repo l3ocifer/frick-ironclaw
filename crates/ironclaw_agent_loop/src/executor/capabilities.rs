@@ -2,13 +2,15 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 
 use async_trait::async_trait;
+use ironclaw_host_api::INPUT_ENCODE_HUMAN_SUMMARY;
 use ironclaw_turns::{
     LoopFailureKind, LoopResultRef,
     run_profile::{
         AuthResumeApprovalIdentity, CapabilityActivityId, CapabilityApprovalResume,
         CapabilityAuthResume, CapabilityAuthResumeReplay, CapabilityBatchInvocation,
         CapabilityCallCandidate, CapabilityFailureKind, CapabilityOutcome, CapabilityProgress,
-        CapabilityResultMessage, LoopDriverNoteKind, LoopProgressEvent, VisibleCapabilitySurface,
+        CapabilityResultMessage, LoopDriverNoteKind, LoopProgressEvent,
+        ModelVisibleToolObservation, VisibleCapabilitySurface,
     },
 };
 
@@ -16,27 +18,30 @@ use crate::{
     state::{CapabilityOutputObservation, CheckpointKind, LoopExecutionState},
     strategies::{
         BatchPolicy, CapabilityBatchTurnSummary, CapabilityErrorClass, CapabilityErrorSummary,
-        GateKind, RecoveryOutcome, SanitizedStrategySummary, TurnSummary,
+        GateKind, RecoveryOutcome, RetryAlteration, SanitizedStrategySummary, TurnSummary,
     },
 };
 
 use super::{
     AgentLoopExecutorError, AwaitDependentRunGateInput, AwaitDependentRunGateStage, BatchStep,
-    CancelCheck, CapabilitySurfaceIndex, CheckpointStage, ExecutorStage, GateInput, GateStage,
-    MAX_CAPABILITY_RETRIES, StageContext, TurnCompletedStep, append_capability_error_ref,
-    append_capability_result_ref, append_capability_safe_summary_ref, batch_policy_kind,
-    cancelled_exit, capability_batch_counts, capability_call_signature, capability_error_class,
+    CancelCheck, CapabilitySurfaceIndex, CheckpointStage, ExecutorStage, FailedExitDetails,
+    GateInput, GateStage, MAX_CAPABILITY_RETRIES, StageContext, TurnCompletedStep,
+    append_capability_error_ref, append_capability_result_ref, append_capability_safe_summary_ref,
+    attach_failure_explanation, batch_policy_kind, cancelled_exit, capability_batch_counts,
+    capability_call_signature, capability_error_class, capability_error_failure_category,
     capability_failure_kind, capability_host_error,
     capability_invocation_from_auth_resume_candidate, capability_invocation_from_candidate,
-    capability_is_visible, capability_summary, clear_matching_pending_auth_resume, failed_exit,
-    honor_retry_alteration, model_visible_capability_failure_observation, push_call_signature_once,
-    push_completed_result, sanitized_strategy_summary,
+    capability_is_visible, capability_summary, clear_matching_pending_auth_resume,
+    clear_matching_pending_external_tool_resume, failed_exit, honor_retry_alteration,
+    model_visible_capability_failure_observation, push_call_signature_once, push_completed_result,
+    sanitized_strategy_summary,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct CapabilityStage;
 
 const MAX_SAFE_SUMMARY_BYTES: usize = 512;
+const STRATEGY_INPUT_COULD_NOT_BE_ENCODED_SUMMARY: &str = "input could not be encoded";
 
 pub(super) struct CapabilityInput {
     pub(super) state: LoopExecutionState,
@@ -200,6 +205,43 @@ impl ExecutorStage<CapabilityInput> for CapabilityStage {
             }
         }
 
+        // A run resumed from a cancelled/denied external-tool gate must not
+        // re-dispatch the parked client tool (no output was submitted →
+        // re-park → infinite loop). Surface a model-visible failure for the
+        // denied call and let other parallel calls proceed.
+        if let Some(pending) = state.pending_external_tool_resume.as_ref().filter(|p| {
+            matches!(
+                p.disposition.as_ref(),
+                Some(ironclaw_turns::GateResumeDisposition::Denied)
+            )
+        }) {
+            let denied_activity_id = pending.activity_id_for_resume();
+            state.pending_external_tool_resume = None;
+            match self
+                .short_circuit_denied_resume(
+                    ctx,
+                    state,
+                    &mut signatures,
+                    &mut capability_batch,
+                    denied_activity_id,
+                    "external tool gate cancelled by client",
+                    visible_calls,
+                )
+                .await?
+            {
+                ControlFlow::Break(exit) => return Ok(exit),
+                ControlFlow::Continue((next, remaining)) => {
+                    state = next;
+                    visible_calls = remaining;
+                }
+            }
+            if visible_calls.is_empty() {
+                return self
+                    .completed_turn(ctx, state, result_refs_start, capability_batch)
+                    .await;
+            }
+        }
+
         // Compute batch policy from the final set of calls that will actually
         // reach invoke_capability_batch (post auth-deny partition if applicable).
         let summaries = visible_calls
@@ -344,6 +386,7 @@ impl ExecutorStage<CapabilityInput> for CapabilityStage {
                         push_call_signature_once(&mut state, &mut signatures, &call)?;
                         clear_matching_pending_approval_resume(&mut state, &call);
                         clear_matching_pending_auth_resume(&mut state, &call);
+                        clear_matching_pending_external_tool_resume(&mut state, &call);
                         append_completed_capability_result(
                             ctx.host,
                             &mut state,
@@ -357,18 +400,23 @@ impl ExecutorStage<CapabilityInput> for CapabilityStage {
                         result_ref,
                         safe_summary,
                         byte_len,
+                        model_observation,
                         ..
                     } => {
                         push_call_signature_once(&mut state, &mut signatures, &call)?;
                         clear_matching_pending_approval_resume(&mut state, &call);
                         clear_matching_pending_auth_resume(&mut state, &call);
+                        clear_matching_pending_external_tool_resume(&mut state, &call);
                         append_spawned_child_result(
                             ctx.host,
                             &mut state,
                             &call,
-                            result_ref,
-                            safe_summary,
-                            byte_len,
+                            ChildResultAppendInput {
+                                result_ref,
+                                safe_summary,
+                                byte_len,
+                                model_observation,
+                            },
                             &mut capability_batch,
                         )
                         .await?;
@@ -378,6 +426,7 @@ impl ExecutorStage<CapabilityInput> for CapabilityStage {
                         result_ref,
                         safe_summary,
                         byte_len,
+                        model_observation,
                     } if coalesced_gate_step
                         .as_ref()
                         .is_some_and(|(gate, _)| gate == &gate_ref) =>
@@ -385,6 +434,7 @@ impl ExecutorStage<CapabilityInput> for CapabilityStage {
                         push_call_signature_once(&mut state, &mut signatures, &call)?;
                         clear_matching_pending_approval_resume(&mut state, &call);
                         clear_matching_pending_auth_resume(&mut state, &call);
+                        clear_matching_pending_external_tool_resume(&mut state, &call);
                         let result = CapabilityResultMessage {
                             result_ref,
                             safe_summary,
@@ -392,6 +442,7 @@ impl ExecutorStage<CapabilityInput> for CapabilityStage {
                             terminate_hint: false,
                             byte_len,
                             output_digest: None,
+                            model_observation,
                         };
                         append_completed_capability_result(
                             ctx.host,
@@ -493,12 +544,21 @@ fn prefixed_capability_summary(
     prefix: String,
     safe_summary: String,
 ) -> Result<SanitizedStrategySummary, AgentLoopExecutorError> {
+    let safe_summary = strategy_safe_capability_summary_detail(safe_summary);
     let detail = sanitized_strategy_summary(safe_summary)?;
     let detail = truncate_summary_detail(
         detail.as_str(),
         MAX_SAFE_SUMMARY_BYTES.saturating_sub(prefix.len()),
     );
     sanitized_strategy_summary(format!("{prefix}{detail}"))
+}
+
+fn strategy_safe_capability_summary_detail(safe_summary: String) -> String {
+    if safe_summary == INPUT_ENCODE_HUMAN_SUMMARY {
+        STRATEGY_INPUT_COULD_NOT_BE_ENCODED_SUMMARY.to_string()
+    } else {
+        safe_summary
+    }
 }
 
 fn truncate_summary_detail(detail: &str, max_bytes: usize) -> &str {
@@ -546,6 +606,7 @@ impl CapabilityStage {
             CapabilityOutcome::Completed(result) => {
                 clear_matching_pending_approval_resume(&mut state, &call);
                 clear_matching_pending_auth_resume(&mut state, &call);
+                clear_matching_pending_external_tool_resume(&mut state, &call);
                 append_completed_capability_result(
                     ctx.host,
                     &mut state,
@@ -560,17 +621,22 @@ impl CapabilityStage {
                 result_ref,
                 safe_summary,
                 byte_len,
+                model_observation,
                 ..
             } => {
                 clear_matching_pending_approval_resume(&mut state, &call);
                 clear_matching_pending_auth_resume(&mut state, &call);
+                clear_matching_pending_external_tool_resume(&mut state, &call);
                 append_spawned_child_result(
                     ctx.host,
                     &mut state,
                     &call,
-                    result_ref,
-                    safe_summary,
-                    byte_len,
+                    ChildResultAppendInput {
+                        result_ref,
+                        safe_summary,
+                        byte_len,
+                        model_observation,
+                    },
                     capability_batch,
                 )
                 .await?;
@@ -616,6 +682,7 @@ impl CapabilityStage {
                 // outcomes GateStage re-populates the record when it blocks.
                 clear_matching_pending_approval_resume(&mut state, &call);
                 clear_matching_pending_auth_resume(&mut state, &call);
+                clear_matching_pending_external_tool_resume(&mut state, &call);
                 let auth_resume = auth_resume_for_gate(auth_resume, prior_approval.as_ref());
                 GateStage
                     .process(
@@ -648,11 +715,31 @@ impl CapabilityStage {
                     )
                     .await
             }
+            CapabilityOutcome::ExternalToolPending { gate_ref, .. } => {
+                // The model called a client-supplied tool: park the run and
+                // return control to the API client. No resume payload here —
+                // the client submits the tool output on resume.
+                GateStage
+                    .process(
+                        ctx,
+                        GateInput {
+                            state,
+                            call,
+                            kind: GateKind::ExternalTool,
+                            gate_ref,
+                            credential_requirements: Vec::new(),
+                            approval_resume: None,
+                            auth_resume: None,
+                        },
+                    )
+                    .await
+            }
             CapabilityOutcome::AwaitDependentRun {
                 gate_ref,
                 result_ref,
                 safe_summary,
                 byte_len,
+                model_observation,
             } => {
                 let resolved_result = CapabilityResultMessage {
                     result_ref,
@@ -661,6 +748,7 @@ impl CapabilityStage {
                     terminate_hint: false,
                     byte_len,
                     output_digest: None,
+                    model_observation,
                 };
                 AwaitDependentRunGateStage
                     .process(
@@ -777,6 +865,7 @@ impl CapabilityStage {
 
         clear_matching_pending_approval_resume(&mut state, &call);
         clear_matching_pending_auth_resume(&mut state, &call);
+        clear_matching_pending_external_tool_resume(&mut state, &call);
         for _ in 0..MAX_CAPABILITY_RETRIES {
             match ctx
                 .planner
@@ -819,6 +908,8 @@ impl CapabilityStage {
                         CancelCheck::Continue(next) => state = *next,
                         CancelCheck::Exit(exit) => return Ok(BatchStep::Exit(exit)),
                     }
+                    let explanation_message_ref =
+                        attach_failure_explanation(ctx, &mut state, failure_kind).await?;
                     let checked = CheckpointStage
                         .write(ctx, state, CheckpointKind::Final)
                         .await?;
@@ -827,6 +918,11 @@ impl CapabilityStage {
                         checked.state,
                         failure_kind,
                         Some(checked.checkpoint_id),
+                        FailedExitDetails {
+                            diagnostic_ref: summary.diagnostic_ref.clone(),
+                            safe_summary: Some(capability_error_failure_category(summary.class)?),
+                            explanation_message_ref,
+                        },
                     )?));
                 }
                 RecoveryOutcome::Retry {
@@ -860,6 +956,11 @@ impl CapabilityStage {
                     match CheckpointStage.cancel_if_requested(ctx, state).await? {
                         CancelCheck::Continue(next) => state = *next,
                         CancelCheck::Exit(exit) => return Ok(BatchStep::Exit(exit)),
+                    }
+                    if matches!(alter, Some(RetryAlteration::RepairInvalidModelOutput)) {
+                        return Err(AgentLoopExecutorError::PlannerContract {
+                            detail: "invalid model output repair retry is model-only",
+                        });
                     }
                     honor_retry_alteration(alter.as_ref())?;
                     CheckpointStage
@@ -943,14 +1044,26 @@ impl CapabilityStage {
             capability_batch,
         )
         .await?;
+        // Route through the single failure-explanation chokepoint so the
+        // recent-failure-kind record and (when the kind is explainable) the
+        // explanation message ref are produced consistently with the other
+        // failed-exit sites instead of being pushed inline here.
+        let failure_kind = exhausted_capability_failure_kind(summary.class);
+        let explanation_message_ref =
+            attach_failure_explanation(ctx, &mut state, failure_kind).await?;
         let checked = CheckpointStage
             .write(ctx, state, CheckpointKind::Final)
             .await?;
         Ok(BatchStep::Exit(failed_exit(
             ctx.host,
             checked.state,
-            LoopFailureKind::DriverBug,
+            failure_kind,
             Some(checked.checkpoint_id),
+            FailedExitDetails {
+                diagnostic_ref: summary.diagnostic_ref.clone(),
+                safe_summary: Some(capability_error_failure_category(summary.class)?),
+                explanation_message_ref,
+            },
         )?))
     }
 
@@ -968,6 +1081,9 @@ impl CapabilityStage {
             "capability process wait is not supported".to_string(),
         )
         .await?;
+        let explanation_message_ref =
+            attach_failure_explanation(ctx, &mut state, LoopFailureKind::CapabilityProtocolError)
+                .await?;
         let checked = CheckpointStage
             .write(ctx, state, CheckpointKind::Final)
             .await?;
@@ -976,6 +1092,11 @@ impl CapabilityStage {
             checked.state,
             LoopFailureKind::CapabilityProtocolError,
             Some(checked.checkpoint_id),
+            FailedExitDetails {
+                diagnostic_ref: None,
+                safe_summary: None,
+                explanation_message_ref,
+            },
         )?))
     }
 
@@ -1053,6 +1174,9 @@ impl CapabilityStage {
                         activity_id: denied_activity_id,
                         capability_id: call.capability_id.clone(),
                         reason_kind: CapabilityFailureKind::GateDeclined,
+                        // Gate denial carries no host-authored message; the
+                        // model-visible text is produced separately below.
+                        safe_summary: None,
                     },
                 )
                 .await;
@@ -1111,6 +1235,18 @@ fn clear_matching_pending_approval_resume(
     }
 }
 
+fn exhausted_capability_failure_kind(class: CapabilityErrorClass) -> LoopFailureKind {
+    match class {
+        CapabilityErrorClass::PolicyDenied => LoopFailureKind::PolicyDenied,
+        CapabilityErrorClass::InputInvalid => LoopFailureKind::ModelError,
+        CapabilityErrorClass::Transient
+        | CapabilityErrorClass::Permanent
+        | CapabilityErrorClass::OperationFailed
+        | CapabilityErrorClass::Unavailable
+        | CapabilityErrorClass::Internal => LoopFailureKind::CapabilityProtocolError,
+    }
+}
+
 fn auth_resume_for_gate(
     mut auth_resume: Option<CapabilityAuthResume>,
     prior_approval: Option<&CapabilityApprovalResume>,
@@ -1143,23 +1279,29 @@ fn auth_resume_for_gate(
     }
 }
 
+struct ChildResultAppendInput {
+    result_ref: LoopResultRef,
+    safe_summary: String,
+    byte_len: u64,
+    model_observation: Option<ModelVisibleToolObservation>,
+}
+
 async fn append_spawned_child_result(
     host: &(dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync),
     state: &mut LoopExecutionState,
     call: &CapabilityCallCandidate,
-    result_ref: LoopResultRef,
-    safe_summary: String,
-    byte_len: u64,
+    input: ChildResultAppendInput,
     capability_batch: &mut CapabilityBatchTurnSummary,
 ) -> Result<(), AgentLoopExecutorError> {
-    let safe_summary = sanitized_strategy_summary(safe_summary)?.into_inner();
+    let safe_summary = sanitized_strategy_summary(input.safe_summary)?.into_inner();
     let result = CapabilityResultMessage {
-        result_ref,
+        result_ref: input.result_ref,
         safe_summary,
         progress: CapabilityProgress::MadeProgress,
         terminate_hint: false,
-        byte_len,
+        byte_len: input.byte_len,
         output_digest: None,
+        model_observation: input.model_observation,
     };
     append_completed_capability_result(host, state, call, result, capability_batch).await
 }
@@ -1288,6 +1430,7 @@ mod tests {
             result_ref: LoopResultRef::new(format!("result:{result}")).unwrap(),
             safe_summary: "summary".to_string(),
             byte_len: 0,
+            model_observation: None,
         }
     }
 
@@ -1299,6 +1442,7 @@ mod tests {
             terminate_hint: false,
             byte_len: 0,
             output_digest: None,
+            model_observation: None,
         })
     }
 
@@ -1378,5 +1522,19 @@ mod tests {
             Err(AgentLoopExecutorError::PlannerContract { detail })
                 if detail == "host returned unsafe strategy summary"
         ));
+    }
+
+    #[test]
+    fn prefixed_capability_summary_rephrases_fixed_input_encode_summary() {
+        let summary = prefixed_capability_summary(
+            "capability failed with invalid_input: ".to_string(),
+            INPUT_ENCODE_HUMAN_SUMMARY.to_string(),
+        )
+        .expect("fixed input encode summary should be strategy-safe");
+
+        assert_eq!(
+            summary.as_str(),
+            "capability failed with invalid_input: input could not be encoded"
+        );
     }
 }

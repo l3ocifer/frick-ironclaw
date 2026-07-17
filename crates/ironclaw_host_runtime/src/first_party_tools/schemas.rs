@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use crate::first_party_tools::time::UNIX_MILLIS_THRESHOLD;
+
 pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value> {
     Some(match reference {
         "schemas/builtin/echo.input.v1.json" => json!({
@@ -18,10 +20,11 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
                     "enum": ["now", "parse", "convert", "format", "diff"],
                     "description": "Time operation to perform. Defaults to now."
                 },
-                "input": { "type": "string", "description": "Timestamp input for parse, convert, format, or diff" },
-                "timestamp": { "type": "string", "description": "Alias for input" },
-                "timestamp2": { "type": "string", "description": "Second timestamp for diff" },
+                "input": timestamp_input_schema("Timestamp input for parse, convert, format, or diff"),
+                "timestamp": timestamp_input_schema("Alias for input"),
+                "timestamp2": timestamp_input_schema("Second timestamp for diff"),
                 "timezone": { "type": "string", "description": "IANA timezone name" },
+                "utc_offset": { "type": "string", "description": "UTC offset for now output, e.g. +03:00 or -07:00" },
                 "from_timezone": { "type": "string", "description": "IANA timezone for interpreting the input" },
                 "to_timezone": { "type": "string", "description": "IANA timezone for conversion output" },
                 "format": { "type": "string", "description": "chrono format string for format operation" },
@@ -46,10 +49,11 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
         "schemas/builtin/http-save.input.v1.json" => http_schema(true),
         "schemas/builtin/memory_search.input.v1.json" => json!({
             "type": "object",
+            "description": "Searches only Reborn internal persistent memory. This does not search connected app or extension data.",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Preferred natural language search query for persistent memory"
+                    "description": "Preferred natural language search query for Reborn internal persistent memory"
                 },
                 "q": {
                     "type": "string",
@@ -147,7 +151,7 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
         "schemas/builtin/shell.input.v1.json" => json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "Shell command to execute" },
+                "command": { "type": "string", "description": "Shell command to execute. Prefer ONE command that does the whole job: combine steps with '&&' or pipes, or write and run a single script (awk/python) — do NOT issue one command per metric/day/line, and don't re-read files you already have." },
                 "workdir": { "type": "string", "description": "Optional scoped working directory" },
                 "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds" }
             },
@@ -156,7 +160,7 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
         }),
         // NOTE: this schema is published by the host_runtime first-party
         // capability registry (consumed by `surface.rs::resolve_builtin_input_schema_ref`).
-        // The decorator path (`ironclaw_loop_support::build_spawn_subagent_parameters_schema`)
+        // The decorator path (`ironclaw_loop_host::build_spawn_subagent_parameters_schema`)
         // builds an equivalent schema dynamically from the registered flavor
         // catalog and overrides the model-facing tool definition at runtime.
         // The two shapes MUST stay in sync. Long-term, route this entry
@@ -220,6 +224,16 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
                 "confirmed": {
                     "type": "boolean",
                     "description": "Must be true only after the user has explicitly asked to mint a manual/browser profile-management token in this conversation (default: false)"
+                }
+            },
+            "additionalProperties": false
+        }),
+        "schemas/builtin/trace_commons-account_login_link.input.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true only after the user explicitly asked to open a Trace Commons account/profile login link in this conversation (default: false)"
                 }
             },
             "additionalProperties": false
@@ -474,7 +488,11 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Prompt submitted when the trigger fires. Runtime validation caps UTF-8 content at 32768 bytes. Do not embed delivery routing here; when the user asks to send routine or trigger results through an outbound product/channel, first select the target through the visible outbound delivery target capabilities, then create the trigger."
+                    "description": "Prompt submitted when the trigger fires. Write only the action performed at fire time. If delivery_target_id is set, never put a send, post, or deliver-results step for that result here; the host delivers the final reply automatically. Never tell the prompt to send results back to the requesting user — receiving results is routing, never a prompt step, even when phrased as 'send me the result' or when the requester's conversation id is known. Put messaging here only when messaging someone else is itself the task, and pin that third-party recipient while the user is present. Do not describe creating, scheduling, or configuring the trigger. Runtime validation caps UTF-8 content at 32768 bytes."
+                },
+                "delivery_target_id": {
+                    "type": "string",
+                    "description": "Optional per-trigger outbound delivery target id from builtin__outbound_delivery_targets_list. When set, the host delivers this trigger's final results to that target. Do not also put a send, post, or deliver-results step for that result in prompt. When omitted, the user's default outbound delivery target at fire time is used. Prefer setting this whenever the user names a destination for this trigger's results."
                 },
                 "schedule": {
                     "description": "When and how often the trigger fires. This value is the schedule object itself. For recurring triggers use {\"kind\":\"cron\",\"expression\":\"0 14 * * 2\",\"timezone\":\"America/Los_Angeles\"}. For one-time triggers use {\"kind\":\"once\",\"at\":\"2026-06-23T14:00:00\",\"timezone\":\"America/Los_Angeles\"}. Do not pass {\"operation\":\"parse\",\"data\":...}.",
@@ -548,6 +566,18 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
             "additionalProperties": false
         }),
         _ => return None,
+    })
+}
+
+fn timestamp_input_schema(description: &str) -> Value {
+    json!({
+        "description": format!(
+            "{description}. Accepts an ISO 8601 string, Unix seconds (including fractional Slack timestamps), or Unix milliseconds. Integer values with absolute magnitude at least {UNIX_MILLIS_THRESHOLD} are interpreted as milliseconds."
+        ),
+        "oneOf": [
+            { "type": "string" },
+            { "type": "number" }
+        ]
     })
 }
 
@@ -626,4 +656,30 @@ fn response_body_limit_schema(require_save_to: bool) -> Value {
         "default": default,
         "description": description
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_builtin_input_schema_ref;
+
+    #[test]
+    fn trigger_create_prompt_description_warns_against_self_referential_creation_prompts() {
+        // Issue #5505 (generation-time defense): the model must write the
+        // trigger's per-fire action steps, not meta-instructions describing
+        // creating/scheduling the trigger itself — otherwise a fired trigger
+        // re-invokes trigger_create instead of doing the task ("a routine
+        // that creates routines").
+        let schema =
+            resolve_builtin_input_schema_ref("schemas/builtin/trigger_create.input.v1.json")
+                .expect("trigger_create schema is registered");
+        let description = schema["properties"]["prompt"]["description"]
+            .as_str()
+            .expect("prompt description is a string");
+
+        assert!(
+            description
+                .contains("Do not describe creating, scheduling, or configuring the trigger"),
+            "prompt description must warn against self-referential creation prompts: {description}"
+        );
+    }
 }
