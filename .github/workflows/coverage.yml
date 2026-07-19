@@ -59,7 +59,7 @@ jobs:
             has_postgres: false
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
