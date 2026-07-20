@@ -13,7 +13,7 @@
 //! endpoints — works end-to-end without anything mocked above the LLM
 //! boundary.
 
-#![cfg(all(feature = "webui-v2-beta", feature = "test-support"))]
+#![cfg(feature = "test-support")]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -42,12 +42,12 @@ use ironclaw_loop_host::{
 };
 use ironclaw_reborn_composition::{
     PollSettings, RebornBuildInput, RebornRuntime, RebornRuntimeIdentity, RebornRuntimeInput,
-    WebuiAuthentication, WebuiAuthenticator, WebuiServeConfig, build_reborn_runtime,
-    build_webui_services, webui_v2_app,
+    build_reborn_runtime, build_webui_services,
 };
 use ironclaw_turns::run_profile::{
     CapabilityCallCandidate, LoopCapabilityPort, ProviderToolCall, RegisterProviderToolCallRequest,
 };
+use ironclaw_webui::{WebuiAuthentication, WebuiAuthenticator, WebuiServeConfig, webui_v2_app};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
@@ -1727,7 +1727,6 @@ async fn untrusted_request_body_cannot_inject_system_scope() {
 // failed to deserialize, so the very next read-back (snapshot metadata, or the
 // previous-key read on a second save) returned `service_unavailable`.
 
-#[cfg(feature = "root-llm-provider")]
 mod operator_llm_config {
     use super::*;
     use ironclaw_reborn_config::{RebornBootConfig, RebornHome, RebornProfile};

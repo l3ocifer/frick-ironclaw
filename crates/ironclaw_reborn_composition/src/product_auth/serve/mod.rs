@@ -14,7 +14,6 @@ mod oauth;
 #[cfg(test)]
 mod oauth_start_tests;
 
-#[cfg(feature = "slack-v2-host-beta")]
 pub(crate) use oauth::{
     CallbackScopeResolution, OAuthCallbackDescriptor, OAuthCallbackTerminalHookFuture,
     oauth_provider_callback_handler,
@@ -73,9 +72,7 @@ use crate::product_auth::api::auth::{
     RebornDcrOAuthStartFlowRequest, RebornOAuthCallbackAttemptError,
     RebornOAuthCallbackFailureStage, RebornOAuthStartFlowRequest,
 };
-#[cfg(feature = "slack-v2-host-beta")]
 use crate::slack::slack_host_beta::SlackPersonalConnectionScopeResolver;
-#[cfg(feature = "slack-v2-host-beta")]
 use crate::slack::slack_personal_binding::{
     RebornUserIdentityBindingDeleteStore, SlackPersonalUserBinder, SlackUserBindingLifecycleStore,
 };
@@ -94,7 +91,6 @@ pub(crate) const OAUTH_FLOW_RECONCILE_PATH: &str =
 pub(crate) const GOOGLE_OAUTH_START_PATH: &str = "/api/reborn/product-auth/oauth/google/start";
 pub(crate) const GOOGLE_OAUTH_CALLBACK_PATH: &str =
     "/api/reborn/product-auth/oauth/google/callback";
-#[cfg(feature = "slack-v2-host-beta")]
 pub(crate) const SLACK_PERSONAL_OAUTH_CALLBACK_PATH: &str =
     "/api/reborn/product-auth/oauth/slack_personal/callback";
 pub(crate) const EXTENSION_OAUTH_START_PATH: &str =
@@ -115,7 +111,6 @@ const OAUTH_FLOW_STATUS_ROUTE_ID: &str = "product_auth.oauth.flow_status";
 const OAUTH_FLOW_RECONCILE_ROUTE_ID: &str = "product_auth.oauth.flow_reconcile";
 const GOOGLE_OAUTH_START_ROUTE_ID: &str = "product_auth.oauth.google.start";
 const GOOGLE_OAUTH_CALLBACK_ROUTE_ID: &str = "product_auth.oauth.google.callback";
-#[cfg(feature = "slack-v2-host-beta")]
 const SLACK_PERSONAL_OAUTH_CALLBACK_ROUTE_ID: &str = "product_auth.oauth.slack_personal.callback";
 const EXTENSION_OAUTH_START_ROUTE_ID: &str = "webui_v2.extensions.oauth.start";
 const MANUAL_TOKEN_SUBMIT_ROUTE_ID: &str = "product_auth.manual_token.submit";
@@ -175,16 +170,14 @@ const OAUTH_CALLBACK_SCOPES_MAX_BYTES: usize = 4 * 1024;
 const RAW_OAUTH_VALUE_MAX_BYTES: usize = 4 * 1024;
 
 #[derive(Clone)]
-pub(crate) struct ProductAuthRouteState {
+pub struct ProductAuthRouteState {
     product_auth: Arc<RebornProductAuthServices>,
     installed_extension_lookup: Option<Arc<dyn InstalledExtensionLookup>>,
     tenant_id: TenantId,
     default_agent_id: Option<AgentId>,
     default_project_id: Option<ProjectId>,
     google_oauth: Option<GoogleOAuthRouteConfig>,
-    #[cfg(feature = "slack-v2-host-beta")]
     slack_personal_oauth: Option<crate::slack::slack_setup::SlackPersonalSetupServiceSlot>,
-    #[cfg(feature = "slack-v2-host-beta")]
     slack_personal_oauth_binding: Option<SlackPersonalOAuthBindingConfig>,
     // First-slice WebUI OAuth stores the raw PKCE verifier process-locally
     // because `AuthFlowRecord` deliberately serializes hashes only. Production
@@ -237,7 +230,7 @@ impl InstalledExtensionLookup for TestInstalledExtensionLookup {
 }
 
 impl ProductAuthRouteState {
-    pub(crate) fn new(
+    pub fn new(
         product_auth: Arc<RebornProductAuthServices>,
         tenant_id: TenantId,
         default_agent_id: Option<AgentId>,
@@ -250,9 +243,7 @@ impl ProductAuthRouteState {
             default_agent_id,
             default_project_id,
             google_oauth: None,
-            #[cfg(feature = "slack-v2-host-beta")]
             slack_personal_oauth: None,
-            #[cfg(feature = "slack-v2-host-beta")]
             slack_personal_oauth_binding: None,
             pkce_verifiers: ExpiringLruCache::new(
                 OAUTH_PKCE_VERIFIER_CACHE_CAPACITY,
@@ -261,7 +252,7 @@ impl ProductAuthRouteState {
         }
     }
 
-    pub(crate) fn with_webui_api(mut self, webui_api: Arc<dyn RebornServicesApi>) -> Self {
+    pub fn with_webui_api(mut self, webui_api: Arc<dyn RebornServicesApi>) -> Self {
         self.installed_extension_lookup = Some(Arc::new(RebornServicesInstalledExtensionLookup {
             api: webui_api,
         }));
@@ -302,12 +293,11 @@ impl ProductAuthRouteState {
         Ok(())
     }
 
-    pub(crate) fn with_google_oauth(mut self, config: GoogleOAuthRouteConfig) -> Self {
+    pub fn with_google_oauth(mut self, config: GoogleOAuthRouteConfig) -> Self {
         self.google_oauth = Some(config);
         self
     }
 
-    #[cfg(feature = "slack-v2-host-beta")]
     pub(crate) fn product_auth_services(&self) -> &RebornProductAuthServices {
         &self.product_auth
     }
@@ -318,8 +308,7 @@ impl ProductAuthRouteState {
             .ok_or_else(ProductAuthRouteFailure::backend_unavailable)
     }
 
-    #[cfg(feature = "slack-v2-host-beta")]
-    pub(crate) fn with_slack_personal_oauth(
+    pub fn with_slack_personal_oauth(
         mut self,
         slot: crate::slack::slack_setup::SlackPersonalSetupServiceSlot,
     ) -> Self {
@@ -327,7 +316,6 @@ impl ProductAuthRouteState {
         self
     }
 
-    #[cfg(feature = "slack-v2-host-beta")]
     pub(crate) async fn slack_personal_oauth_credentials(
         &self,
     ) -> Result<
@@ -355,8 +343,7 @@ impl ProductAuthRouteState {
         Ok((client_id, redirect_uri))
     }
 
-    #[cfg(feature = "slack-v2-host-beta")]
-    pub(crate) fn with_slack_personal_oauth_binding(
+    pub fn with_slack_personal_oauth_binding(
         mut self,
         config: SlackPersonalOAuthBindingConfig,
     ) -> Self {
@@ -364,7 +351,6 @@ impl ProductAuthRouteState {
         self
     }
 
-    #[cfg(feature = "slack-v2-host-beta")]
     pub(crate) fn slack_personal_oauth_binding_config(
         &self,
     ) -> Option<&SlackPersonalOAuthBindingConfig> {
@@ -414,9 +400,7 @@ impl std::fmt::Debug for ProductAuthRouteState {
             .field("default_agent_id", &self.default_agent_id)
             .field("default_project_id", &self.default_project_id)
             .field("google_oauth", &self.google_oauth.is_some());
-        #[cfg(feature = "slack-v2-host-beta")]
         builder.field("slack_personal_oauth", &self.slack_personal_oauth.is_some());
-        #[cfg(feature = "slack-v2-host-beta")]
         builder.field(
             "slack_personal_oauth_binding",
             &self.slack_personal_oauth_binding.is_some(),
@@ -427,7 +411,6 @@ impl std::fmt::Debug for ProductAuthRouteState {
     }
 }
 
-#[cfg(feature = "slack-v2-host-beta")]
 #[derive(Clone)]
 pub struct SlackPersonalOAuthBindingConfig {
     pub(crate) binding_service: Arc<dyn SlackPersonalUserBinder>,
@@ -440,7 +423,6 @@ pub struct SlackPersonalOAuthBindingConfig {
     pub(crate) lifecycle_store: Arc<dyn SlackUserBindingLifecycleStore>,
 }
 
-#[cfg(feature = "slack-v2-host-beta")]
 impl SlackPersonalOAuthBindingConfig {
     pub(crate) fn new(
         binding_service: Arc<dyn SlackPersonalUserBinder>,
@@ -457,7 +439,6 @@ impl SlackPersonalOAuthBindingConfig {
     }
 }
 
-#[cfg(feature = "slack-v2-host-beta")]
 impl std::fmt::Debug for SlackPersonalOAuthBindingConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -549,10 +530,10 @@ impl StoredPkceVerifier {
     }
 }
 
-pub(crate) struct ProductAuthRouteMount {
-    pub(crate) protected: Router,
-    pub(crate) public: Router,
-    pub(crate) descriptors: Vec<IngressRouteDescriptor>,
+pub struct ProductAuthRouteMount {
+    pub protected: Router,
+    pub public: Router,
+    pub descriptors: Vec<IngressRouteDescriptor>,
 }
 
 async fn extension_oauth_start_handler(
@@ -567,18 +548,13 @@ async fn extension_oauth_start_handler(
         .require_installed_extension(&caller, &requester_extension)
         .await?;
     let response = if request.provider == SLACK_PERSONAL_PROVIDER_ID {
-        #[cfg(feature = "slack-v2-host-beta")]
-        let response = crate::slack::slack_personal_oauth::start_extension_oauth_flow(
+        crate::slack::slack_personal_oauth::start_extension_oauth_flow(
             state.clone(),
             caller.clone(),
             request,
             requester_extension.clone(),
         )
-        .await?;
-        #[cfg(not(feature = "slack-v2-host-beta"))]
-        return Err(ProductAuthRouteFailure::backend_unavailable());
-        #[cfg(feature = "slack-v2-host-beta")]
-        response
+        .await?
     } else {
         oauth::start_extension_oauth_flow(
             state.clone(),
@@ -603,14 +579,13 @@ async fn extension_oauth_start_handler(
 // tool calls and must not surface raw secrets through the model-visible
 // tool-dispatch path. Contract: `docs/reborn/contracts/auth-product.md`.
 // dispatch-exempt: host-owned auth/secret ingress, not in-turn tool dispatch
-pub(crate) fn product_auth_route_mount(state: ProductAuthRouteState) -> ProductAuthRouteMount {
+pub fn product_auth_route_mount(state: ProductAuthRouteState) -> ProductAuthRouteMount {
     let public = Router::new()
         .route(OAUTH_CALLBACK_PATH, get(oauth::oauth_callback_handler))
         .route(
             GOOGLE_OAUTH_CALLBACK_PATH,
             get(oauth::google_oauth_callback_handler),
         );
-    #[cfg(feature = "slack-v2-host-beta")]
     let public = public.route(
         SLACK_PERSONAL_OAUTH_CALLBACK_PATH,
         get(crate::slack::slack_personal_oauth::slack_personal_oauth_callback_handler),
@@ -728,7 +703,6 @@ pub(crate) fn product_auth_route_descriptors() -> Vec<IngressRouteDescriptor> {
         GOOGLE_OAUTH_CALLBACK_PATH,
         callback_policy(),
     ));
-    #[cfg(feature = "slack-v2-host-beta")]
     descriptors.push(descriptor(
         SLACK_PERSONAL_OAUTH_CALLBACK_ROUTE_ID,
         NetworkMethod::Get,
@@ -1747,7 +1721,7 @@ mod tests {
         NetworkMethod, RuntimeCredentialAccountProviderId, RuntimeCredentialAuthRequirement,
         RuntimeHttpEgress, RuntimeHttpEgressRequest, RuntimeHttpEgressResponse, SecretHandle,
     };
-    use ironclaw_secrets::{InMemorySecretStore, SecretMaterial, SecretStore};
+    use ironclaw_secrets::{FilesystemSecretStore, SecretMaterial, SecretStore};
     use ironclaw_turns::{TurnRunId, TurnScope};
     use tower::ServiceExt;
 
@@ -1927,7 +1901,7 @@ mod tests {
 
     #[tokio::test]
     async fn extension_oauth_start_handler_starts_dcr_setup_flow_for_notion() {
-        let secret_store = Arc::new(InMemorySecretStore::new());
+        let secret_store = Arc::new(FilesystemSecretStore::ephemeral());
         let dcr_provider = Arc::new(
             OAuthDcrProvider::new(
                 OAuthDcrProviderConfig {
@@ -2005,7 +1979,7 @@ mod tests {
 
     #[tokio::test]
     async fn extension_oauth_start_aborts_flow_when_extension_disappears_after_creation() {
-        let secret_store = Arc::new(InMemorySecretStore::new());
+        let secret_store = Arc::new(FilesystemSecretStore::ephemeral());
         let dcr_provider = Arc::new(
             OAuthDcrProvider::new(
                 OAuthDcrProviderConfig {
@@ -2353,7 +2327,7 @@ mod tests {
 
     #[tokio::test]
     async fn dcr_oauth_callback_retrieves_pkce_from_registry_when_route_cache_misses() {
-        let secret_store = Arc::new(InMemorySecretStore::new());
+        let secret_store = Arc::new(FilesystemSecretStore::ephemeral());
         let secret_store_for_provider: Arc<dyn SecretStore> = secret_store.clone();
         let dcr_provider = Arc::new(
             OAuthDcrProvider::new(
@@ -2431,7 +2405,7 @@ mod tests {
     #[tokio::test]
     async fn dcr_oauth_callback_resumes_blocked_turn_gate() {
         let shared = Arc::new(ironclaw_auth::InMemoryAuthProductServices::new());
-        let secret_store = Arc::new(InMemorySecretStore::new());
+        let secret_store = Arc::new(FilesystemSecretStore::ephemeral());
         let secret_store_for_provider: Arc<dyn SecretStore> = secret_store;
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let dcr_provider = Arc::new(

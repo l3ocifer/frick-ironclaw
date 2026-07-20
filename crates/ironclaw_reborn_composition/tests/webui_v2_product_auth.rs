@@ -2,8 +2,6 @@
 
 // arch-exempt: large_file, caller-level product-auth route regression coverage, plan #5905
 
-#![cfg(feature = "webui-v2-beta")]
-
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -44,9 +42,9 @@ use ironclaw_product_workflow::{
 };
 use ironclaw_reborn_composition::{
     GoogleOAuthRouteConfig, RebornAuthContinuationDispatcher, RebornProductAuthServices,
-    RebornReadiness, RebornWebuiBundle, WebuiAuthentication, WebuiAuthenticator, WebuiServeConfig,
-    webui_v2_app,
+    RebornReadiness, RebornWebuiBundle,
 };
+use ironclaw_webui::{WebuiAuthentication, WebuiAuthenticator, WebuiServeConfig, webui_v2_app};
 use serde_json::json;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -2169,7 +2167,6 @@ async fn product_auth_callback_malformed_flow_id_uses_sanitized_error() {
 // directly, which would stay green if webui_serve stopped carrying
 // WebuiServeConfig::with_slack_personal_oauth into webui_v2_app. These tests
 // drive the composed router so that composition seam cannot regress silently.
-#[cfg(feature = "slack-v2-host-beta")]
 mod slack_personal_oauth_serve {
     use super::*;
     use ironclaw_product_adapters::AdapterInstallationId;
