@@ -73,6 +73,33 @@ spec:
           volumeMounts:
             - { name: state, mountPath: /data }
             - { name: reborn-config, mountPath: /etc/ironclaw/reborn, readOnly: true }
+        # Reborn's Postgres client trusts whatever rustls-native-certs finds,
+        # which is the SSL_CERT_FILE/SSL_CERT_DIR pair or the system default.
+        # There is no CA-file knob on the connection, so the only way to trust
+        # CNPG's per-cluster CA is to put it in the trust store the process
+        # reads. Pointing SSL_CERT_FILE at the CA alone would *replace* the
+        # public roots and break every outbound HTTPS call in the container
+        # (LiteLLM, gh, bw), so concatenate: public roots first, CNPG CA
+        # appended.
+        #
+        # This runs on the agent image rather than busybox because it has to
+        # read that image's own ca-certificates bundle — busybox ships none.
+        - name: build-ca-bundle
+          image: git.leopaska.xyz/leo/frick-ironclaw:homelab
+          imagePullPolicy: Always
+          securityContext: { runAsUser: 0 }
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              cat /etc/ssl/certs/ca-certificates.crt /etc/homelab/pg-ca/ca.crt \
+                > /etc/homelab/tls/ca-bundle.crt
+              chmod 0644 /etc/homelab/tls/ca-bundle.crt
+              echo "ca-bundle: $(grep -c 'BEGIN CERTIFICATE' /etc/homelab/tls/ca-bundle.crt) certificates"
+          volumeMounts:
+            - { name: pg-ca,     mountPath: /etc/homelab/pg-ca, readOnly: true }
+            - { name: ca-bundle, mountPath: /etc/homelab/tls }
       containers:
         - name: ironclaw
           image: git.leopaska.xyz/leo/frick-ironclaw:homelab
@@ -147,24 +174,22 @@ spec:
             # strategy changes to RollingUpdate, this assertion becomes false
             # and two governors will race over the same tables.
             - { name: IRONCLAW_REBORN_POSTGRES_RESOURCE_GOVERNOR_SINGLETON, value: "true" }
-            # Reborn rejects a non-local Postgres without one of these two
-            # opt-ins. TLS was tried first and does not currently work:
-            # `require` in Reborn *verifies* the chain (rustls native roots,
-            # no CA-file knob), CNPG signs with its own per-cluster CA, and
-            # that CA lives in secret homelab-pg-ca in the `databases`
-            # namespace — unreachable from a Pod in agents-shared. Copying it
-            # into git is not an option either: CNPG rotates it every 90 days
-            # (currently 2026-07-19 → 2026-10-17), so a pinned copy would break
-            # the agent every quarter. The hostname would otherwise be fine —
-            # homelab-pg-rw.databases.svc.cluster.local is in the cert's SANs.
+            # Verified TLS to CNPG. This overrides the `?sslmode=disable` still
+            # baked into the DATABASE_URL secret — the env var is applied to
+            # the parsed DSN, so the secret does not need resealing.
             #
-            # So: cleartext over the cluster CNI, which is what every other
-            # consumer of this database already does. To turn TLS on properly,
-            # the CA has to be replicated into agents-shared automatically
-            # (a sync CronJob or a replicator controller) — see homelab
-            # docs/status/STATUS.md.
-            - { name: DATABASE_SSLMODE, value: "disable" }
-            - { name: IRONCLAW_REBORN_ALLOW_REMOTE_POSTGRES_CLEAR_TEXT, value: "true" }
+            # Reborn's `require` is stricter than libpq's: it validates the
+            # full chain *and* the hostname. Both hold here —
+            # homelab-pg-rw.databases.svc.cluster.local is in the server
+            # cert's SANs, and the CNPG CA reaches this namespace via the
+            # cnpg-ca-sync CronJob (homelab argocd/apps/_agents/cnpg-ca-sync).
+            # That job re-copies every 6h, so CNPG's 90-day CA rotation is
+            # tracked without a pinned copy in git.
+            - { name: DATABASE_SSLMODE, value: "require" }
+            # Trust store assembled by the build-ca-bundle initContainer:
+            # public roots plus the CNPG CA. rustls-native-certs reads this,
+            # and so does every OpenSSL-based tool in the image.
+            - { name: SSL_CERT_FILE, value: "/etc/homelab/tls/ca-bundle.crt" }
             # Same M2M token the agent-bus and A2A callers already present,
             # so existing callers keep working against the Reborn WebUI.
             - name: IRONCLAW_REBORN_WEBUI_TOKEN
@@ -196,6 +221,7 @@ spec:
             limits:   { memory: "8Gi" }
           volumeMounts:
             - { name: state,           mountPath: /data }
+            - { name: ca-bundle,       mountPath: /etc/homelab/tls, readOnly: true }
             - { name: persona,         mountPath: /etc/ironclaw/persona, readOnly: true }
             - { name: ironclaw-config, mountPath: /etc/ironclaw/openclaw.json, subPath: openclaw.json, readOnly: true }
             - { name: graph-frick,     mountPath: /data/graphs/frick }
@@ -212,6 +238,12 @@ spec:
         - { name: persona,          configMap: { name: frick-persona } }
         - { name: ironclaw-config,  configMap: { name: frick-ironclaw-config } }
         - { name: reborn-config,    configMap: { name: frick-reborn-config } }
+        # Deliberately not `optional` — if cnpg-ca-sync has not populated this
+        # secret the pod should fail on a missing-secret event, not boot with a
+        # trust store that silently omits the CNPG root and surface it later as
+        # an opaque TLS handshake error.
+        - { name: pg-ca,            secret: { secretName: homelab-pg-ca } }
+        - { name: ca-bundle,        emptyDir: {} }
         - { name: graph-frick,      persistentVolumeClaim: { claimName: frick-graph } }
         - { name: graph-frack,      persistentVolumeClaim: { claimName: frack-graph } }
         - { name: graph-sancho,     persistentVolumeClaim: { claimName: sancho-graph } }

@@ -114,17 +114,47 @@ rejects them while assembling, so they cost a crash-loop each:
   and `replicas: 1` + `strategy: Recreate` means no second pod overlaps —
   **scaling this Deployment past 1, or switching to RollingUpdate, silently
   invalidates it.**
-- `DATABASE_SSLMODE=disable` plus
-  `IRONCLAW_REBORN_ALLOW_REMOTE_POSTGRES_CLEAR_TEXT=true`. Reborn refuses a
-  remote Postgres that is neither TLS-verified nor explicitly waived. TLS was
-  attempted first: Reborn's `require` *verifies* the chain against rustls
-  native roots and exposes no CA-file setting, CNPG signs with a per-cluster CA
-  that lives in `homelab-pg-ca` in the `databases` namespace, and a Pod in
-  `agents-shared` cannot mount it. Pinning the CA in git is worse than useless
-  — CNPG rotates it every 90 days. The hostname itself was never the problem
-  (`homelab-pg-rw.databases.svc.cluster.local` is in the cert SANs), so the day
-  that CA is replicated into `agents-shared` automatically, flipping this back
-  to `require` is the whole change.
+- a TLS decision. Reborn refuses a remote Postgres that is neither
+  TLS-verified nor explicitly waived, and its `require` is stricter than
+  libpq's: it validates the full chain *and* the hostname against rustls'
+  native roots, with no CA-file setting on the connection. CNPG signs with a
+  per-cluster CA in `homelab-pg-ca` in the `databases` namespace, which a Pod
+  in `agents-shared` cannot mount, so this first shipped on cleartext
+  (`DATABASE_SSLMODE=disable` + `IRONCLAW_REBORN_ALLOW_REMOTE_POSTGRES_CLEAR_TEXT=true`).
+
+### Verified TLS, and why it takes an initContainer
+
+Cleartext is now gone. Two pieces were needed:
+
+1. **The CA has to reach the namespace.** `cnpg-ca-sync`
+   (homelab `argocd/apps/_agents/cnpg-ca-sync`) mirrors `databases/homelab-pg-ca`
+   into `agents-shared` every 6 hours, copying `ca.crt` only — CNPG keeps the
+   CA *private key* in that same secret, and replicating it would let anything
+   reading this namespace mint certs the server trusts. A scheduled copy rather
+   than a sealed one because CNPG rotates the CA every 90 days.
+2. **The CA has to be in the trust store the process reads.** Since there is no
+   CA-file knob, the lever is `SSL_CERT_FILE`, which `rustls-native-certs`
+   honours. But setting it to the CNPG CA alone *replaces* the public roots and
+   would break every outbound HTTPS call in the container. So the
+   `build-ca-bundle` initContainer concatenates the image's own
+   `ca-certificates.crt` with the CNPG CA into an emptyDir, and `SSL_CERT_FILE`
+   points at the result. It runs on the agent image, not busybox, precisely
+   because it needs that image's public bundle.
+
+`DATABASE_SSLMODE=require` then overrides the `?sslmode=disable` still baked
+into the `DATABASE_URL` secret — the env var is applied to the parsed DSN, so
+the secret never had to be resealed. Verified before rollout with a
+credential-free probe from `agents-shared`: `sslmode=verify-full` against
+`homelab-pg-rw.databases.svc.cluster.local` reached the auth stage ("no
+password supplied"), and `openssl s_client` returned `Verify return code: 0`.
+
+Two failure modes to recognise:
+
+- **`UnknownIssuer` on boot** — the bundle is missing the CNPG root. Check that
+  `cnpg-ca-sync` last ran and that its output actually changed the secret.
+- **CA rotation** — the bundle is built once, at pod start. When CNPG rotates,
+  the sync job updates the secret but running pods keep the old bundle; they
+  need a restart. The job logs `CA ROTATED` when this happens.
 
 ### Not carried over — verify before trusting these
 
