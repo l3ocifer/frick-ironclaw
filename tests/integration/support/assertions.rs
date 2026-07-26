@@ -253,6 +253,134 @@ impl RebornIntegrationHarness {
         .into())
     }
 
+    /// Assert that the textual `content` of some message sent to the model
+    /// contains `needle`. Unlike [`assert_model_request_contains`], this does
+    /// not serialize the request a second time, so JSON embedded in a tool
+    /// result is matched exactly as the model receives it rather than through
+    /// an additional layer of escape characters.
+    pub async fn assert_model_message_content_contains(&self, needle: &str) -> HarnessResult<()> {
+        let requests = self.scripted_llm.captured_requests();
+        if requests
+            .iter()
+            .flatten()
+            .any(|message| message.content.contains(needle))
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "no model message content contained {needle:?}; captured {} request(s)",
+            requests.len()
+        )
+        .into())
+    }
+
+    /// Assert that one model-visible message contains every `needle` in the
+    /// supplied order. Other content may appear between needles.
+    pub async fn assert_model_message_content_in_order(
+        &self,
+        needles: &[&str],
+    ) -> HarnessResult<()> {
+        if needles.is_empty() {
+            return Err("ordered model-message assertion needs at least one needle".into());
+        }
+        let requests = self.scripted_llm.captured_requests();
+        'message: for message in requests.iter().flatten() {
+            let mut remaining = message.content.as_str();
+            for needle in needles {
+                let Some(position) = remaining.find(needle) else {
+                    continue 'message;
+                };
+                remaining = &remaining[position + needle.len()..];
+            }
+            return Ok(());
+        }
+        Err(format!(
+            "no model message content contained {needles:?} in order; captured {} request(s)",
+            requests.len()
+        )
+        .into())
+    }
+
+    /// Assert the exact number of interactive, tool-capable calls observed by
+    /// the recoverable-failure provider wrapper. Text-only system-inference
+    /// calls used for compaction are intentionally excluded.
+    pub async fn assert_interactive_model_provider_call_count(
+        &self,
+        expected: usize,
+    ) -> HarnessResult<()> {
+        let probe = self
+            .model_provider_call_probe
+            .as_ref()
+            .ok_or("model provider call probe is not enabled for this harness")?;
+        let actual = probe.interactive_calls();
+        if actual == expected {
+            return Ok(());
+        }
+        Err(
+            format!("expected {expected} interactive model provider call(s), observed {actual}")
+                .into(),
+        )
+    }
+
+    /// Assert the exact number of times `needle` occurs across every request
+    /// seen by the recoverable-failure provider, including injected failures
+    /// that never reach the delegated `TraceLlm`.
+    pub async fn assert_model_message_content_occurrences(
+        &self,
+        needle: &str,
+        expected: usize,
+    ) -> HarnessResult<()> {
+        let probe = self
+            .model_provider_call_probe
+            .as_ref()
+            .ok_or("model provider call probe is not enabled for this harness")?;
+        let actual = probe.message_content_occurrences(needle);
+        if actual == expected {
+            return Ok(());
+        }
+        Err(format!(
+            "expected model message content to contain {needle:?} {expected} time(s), observed {actual}"
+        )
+        .into())
+    }
+
+    /// Assert that at least `minimum` text-only provider calls occurred. These
+    /// are system-inference calls in the recovery scenarios, including context
+    /// compaction.
+    pub async fn assert_text_model_provider_call_count_at_least(
+        &self,
+        minimum: usize,
+    ) -> HarnessResult<()> {
+        let probe = self
+            .model_provider_call_probe
+            .as_ref()
+            .ok_or("model provider call probe is not enabled for this harness")?;
+        let actual = probe.text_calls();
+        if actual >= minimum {
+            return Ok(());
+        }
+        Err(format!(
+            "expected at least {minimum} text-only model provider call(s), observed {actual}"
+        )
+        .into())
+    }
+
+    /// Assert no request seen by the recoverable-failure provider contains
+    /// `needle`, including requests rejected before `TraceLlm` delegation.
+    pub async fn assert_model_message_content_not_contains(
+        &self,
+        needle: &str,
+    ) -> HarnessResult<()> {
+        let probe = self
+            .model_provider_call_probe
+            .as_ref()
+            .ok_or("model provider call probe is not enabled for this harness")?;
+        if !probe.message_content_contains(needle) {
+            return Ok(());
+        }
+        Err(format!("model message content unexpectedly contained {needle:?}").into())
+    }
+
     /// Assert some SINGLE model request contains EVERY needle in `needles`
     /// (all in one request, not spread across several) — the multi-turn "sees
     /// prior context" proof: an earlier-turn needle plus a current-turn needle
@@ -332,8 +460,8 @@ impl RebornIntegrationHarness {
 
     /// Harness-port-seam Change 4: assert the LATEST captured `tools` argument
     /// carries a definition named `name` whose `description` contains
-    /// `needle` — pins `wrap_local_dev_surface_disclosure`'s scoped-roots note
-    /// mutation (`LocalDevSurfaceDisclosure::apply_to_surface_fields`), which
+    /// `needle` — pins `wrap_surface_disclosure`'s scoped-roots note
+    /// mutation (`HostSurfaceDisclosure::apply_to_surface_fields`), which
     /// mutates `ProviderToolDefinition::description`/`parameters`, not tool
     /// presence/absence.
     pub async fn assert_model_tool_description_contains(
@@ -436,12 +564,26 @@ impl RebornIntegrationHarness {
         &self,
         kind: ironclaw_turns::TurnEventKind,
     ) -> HarnessResult<()> {
-        let events = self.recorded_turn_events();
-        if events.iter().any(|event| event.kind == kind) {
-            return Ok(());
+        // Lifecycle events publish best-effort AFTER the status transition the
+        // caller waited on (`wait_for_status` reads the store's hot-cache
+        // status, which the transition sets synchronously; the sink publish
+        // runs just after that transition returns). So a just-completed turn's
+        // terminal event can land a moment after its status is observable —
+        // poll briefly rather than checking exactly once, which otherwise races
+        // the publish.
+        for _ in 0..100 {
+            if self
+                .recorded_turn_events()
+                .iter()
+                .any(|event| event.kind == kind)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        let events = self.recorded_turn_events();
         let seen: Vec<_> = events.iter().map(|event| &event.kind).collect();
-        Err(format!("no recorded turn event of kind {kind:?}; saw {seen:?}").into())
+        Err(format!("no recorded turn event of kind {kind:?} after waiting; saw {seen:?}").into())
     }
 
     /// Assert the always-wired security-audit recorder captured an event with
@@ -1157,6 +1299,46 @@ impl RebornIntegrationHarness {
     pub async fn assert_conversation_history_contains(&self, needle: &str) -> HarnessResult<()> {
         self.conversation_history_contains_impl(0, None, needle)
             .await
+    }
+
+    /// Assert NO persisted thread-history message's `content` contains
+    /// `needle`, across the FULL history and ANY role.
+    ///
+    /// The counterpart to [`assert_conversation_history_contains`], and the one
+    /// that catches DEGRADATION rather than error: a host-authored remediation
+    /// that collapsed to the safe-summary placeholder still produces a
+    /// completed run and a plausible-looking error message, so a test that only
+    /// asserts "something was surfaced" stays green while the UX is dead. Pair
+    /// the two — assert the expected step is present AND the placeholder is
+    /// absent.
+    pub async fn assert_conversation_history_lacks(&self, needle: &str) -> HarnessResult<()> {
+        let history = self.persisted_history().await?;
+        let slice = Self::history_slice(&history, 0)?;
+        let offending: Vec<String> = slice
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains(needle))
+            })
+            .map(|message| {
+                let body = message.content.as_deref().unwrap_or("<no-content>");
+                let body = match body.char_indices().nth(160) {
+                    Some((cutoff, _)) => format!("{}...", &body[..cutoff]), // safety: `cutoff` from `char_indices`, always a valid UTF-8 boundary.
+                    None => body.to_string(),
+                };
+                format!("{:?}:{body:?}", message.kind)
+            })
+            .collect();
+        if offending.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "conversation history must NOT contain {needle:?}, but {} message(s) did: {offending:?}",
+            offending.len()
+        )
+        .into())
     }
 
     /// [`assert_conversation_history_contains`], scoped to the `[baseline..]`

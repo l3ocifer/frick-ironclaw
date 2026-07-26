@@ -15,6 +15,7 @@ mod support;
 
 use reborn_support::assertions::ToolErrorClass;
 use reborn_support::builder::RebornIntegrationHarness;
+use reborn_support::group::RebornIntegrationGroup;
 use reborn_support::reply::RebornScriptedReply;
 use support::mock_mcp_server::{MockMcpServer, MockToolResponse, start_mock_mcp_server};
 
@@ -46,6 +47,91 @@ fn assert_recorded_tools_call(server: &MockMcpServer, expected_tool: &str, expec
             .and_then(|a| a.get("query"))
             .and_then(|q| q.as_str()),
         Some(expected_query)
+    );
+}
+
+/// The bundled `nearai` package is hosted MCP rather than Emulate-backed.
+/// Install and activate the real first-party manifest, then prove its static
+/// search capability crosses the mediated MCP boundary with its credential
+/// and returns the hermetic server result to the model.
+#[tokio::test]
+async fn nearai_web_search_dispatches_through_bundled_hosted_mcp() {
+    let group = RebornIntegrationGroup::extension_lifecycle()
+        .await
+        .expect("extension-lifecycle group builds");
+    let h = group
+        .thread("nearai-hosted-mcp-lifecycle")
+        .script([
+            RebornScriptedReply::tool_call(
+                "builtin.extension_install",
+                serde_json::json!({"extension_id": "nearai"}),
+            ),
+            RebornScriptedReply::text("NEAR AI search is installed."),
+            RebornScriptedReply::tool_call(
+                "nearai.web_search",
+                serde_json::json!({"query": "IronClaw capability evidence"}),
+            ),
+            RebornScriptedReply::text("search complete"),
+        ])
+        .build()
+        .await
+        .expect("NEAR AI lifecycle thread builds");
+
+    // #6520 removed the public activate action: install owns readiness, so
+    // the caller's nearai account must resolve BEFORE install for the
+    // package to reconcile straight to active.
+    h.seed_capability_credential_account("nearai", "NEAR AI integration account", &[])
+        .await
+        .expect("NEAR AI account is seeded under the dispatching user");
+    h.submit_turn("install NEAR AI search")
+        .await
+        .expect("install turn completes");
+    h.assert_tool_result_contains(r#""installed":true"#)
+        .await
+        .expect("NEAR AI package installed");
+    h.submit_turn("search for IronClaw capability evidence")
+        .await
+        .expect("search turn completes");
+    h.assert_model_tools_contains("nearai__web_search")
+        .await
+        .expect("activated NEAR AI capability is disclosed to the model");
+    h.assert_tool_invoked("nearai.web_search")
+        .await
+        .expect("canonical NEAR AI capability dispatched");
+    h.assert_tool_result_contains("REBORN_NEARAI_WEB_SEARCH_RESULT")
+        .await
+        .expect("hosted MCP response reached the model-facing result");
+
+    let requests = h.captured_network_requests_for_test();
+    let tools_call = requests
+        .iter()
+        .find(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| body["method"].as_str().map(str::to_owned))
+                .as_deref()
+                == Some("tools/call")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no hosted MCP tools/call captured across {} redacted request(s)",
+                requests.len()
+            )
+        });
+    let body: serde_json::Value =
+        serde_json::from_slice(&tools_call.body).expect("tools/call body is JSON");
+    assert_eq!(body["params"]["name"], "web_search");
+    assert_eq!(
+        body["params"]["arguments"]["query"],
+        "IronClaw capability evidence"
+    );
+    assert!(
+        tools_call.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization")
+                && value.starts_with("Bearer ")
+                && value.len() > "Bearer ".len()
+        }),
+        "hosted MCP tools/call must carry a mediated bearer credential"
     );
 }
 
@@ -168,13 +254,13 @@ async fn assert_mcp_tool_called_fails_when_no_mcp_call_ran() {
 /// `driver_unavailable`. Distinct wire path from the 5xx case below: this trips
 /// the client's JSON-RPC error-field guard, not its HTTP status gate.
 #[tokio::test]
-async fn mcp_tool_call_error_surfaces_recoverable_failed() {
+async fn mcp_tool_call_error_cause_reaches_next_model_request() {
     let server = start_mock_mcp_server(vec![MockToolResponse {
         name: "search".to_string(),
         content: serde_json::json!({"results": []}),
     }])
     .await;
-    server.set_tool_call_error(-32602, "unknown tool");
+    server.set_tool_call_error(-32602, "distinctive-mcp-cause-5965");
 
     let h = RebornIntegrationHarness::test_default()
         .script([
@@ -194,6 +280,9 @@ async fn mcp_tool_call_error_surfaces_recoverable_failed() {
     h.assert_tool_error(ToolErrorClass::Failed, "backend")
         .await
         .expect("JSON-RPC error surfaced as a model-visible Failed tool error");
+    h.assert_model_request_contains("distinctive-mcp-cause-5965")
+        .await
+        .expect("MCP backend cause reached the next captured model request");
     h.assert_reply_contains("done")
         .await
         .expect("run recovered and finalized (not terminal driver_unavailable)");

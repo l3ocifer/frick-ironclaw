@@ -3,10 +3,10 @@ mod commands;
 mod context;
 mod dto;
 mod file_write;
+mod first_party;
 mod operator_env;
 mod render;
 mod runtime;
-#[cfg(feature = "webui-v2-beta")]
 mod serve_invocation;
 mod webui_token;
 

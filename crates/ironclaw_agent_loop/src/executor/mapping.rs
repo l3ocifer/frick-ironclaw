@@ -1,8 +1,9 @@
+use ironclaw_host_api::{Resolution, ToolVerdict};
 use ironclaw_turns::{
     LoopBlockedKind, LoopFailureKind, SanitizedFailure,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, BatchPolicyKind, CapabilityFailureKind,
-        CapabilityOutcome, LoopCheckpointKind, LoopGateKind,
+        LoopCheckpointKind, LoopGateKind, LoopSafeSummary, sanitize_model_visible_text,
     },
 };
 
@@ -52,29 +53,24 @@ pub(super) fn batch_policy_kind(policy: BatchPolicy) -> BatchPolicyKind {
     }
 }
 
-pub(super) fn capability_batch_counts(outcomes: &[CapabilityOutcome]) -> (u32, u32, u32, u32) {
+pub(super) fn capability_batch_counts(resolutions: &[Resolution]) -> (u32, u32, u32, u32) {
     let mut result_count = 0;
     let mut denied_count = 0;
     let mut gated_count = 0;
     let mut failed_count = 0;
-    for outcome in outcomes {
-        match outcome {
-            CapabilityOutcome::Completed(_) | CapabilityOutcome::SpawnedChildRun { .. } => {
-                result_count += 1
-            }
-            CapabilityOutcome::Denied(_) => denied_count += 1,
-            CapabilityOutcome::ApprovalRequired { .. }
-            | CapabilityOutcome::AuthRequired { .. }
-            | CapabilityOutcome::ResourceBlocked { .. }
-            // ExternalToolPending: the run parks waiting for the client to submit
-            // tool output — a non-completing, non-failing, non-denied gate.
-            | CapabilityOutcome::ExternalToolPending { .. }
-            | CapabilityOutcome::AwaitDependentRun { .. }
-            // SpawnedProcess: treated as gated — it is a non-completing, non-failing, non-denied
-            // outcome that defers completion to a background process. Grouped with gated to avoid
-            // treating it as completed or failed in batch accounting.
-            | CapabilityOutcome::SpawnedProcess(_) => gated_count += 1,
-            CapabilityOutcome::Failed(_) => failed_count += 1,
+    for resolution in resolutions {
+        // Exhaustive over `Resolution`, no wildcard (§11.9). `Done` splits on its
+        // verdict: `Success`/`ChildSpawned` are results, a `RecoverableFailure` is
+        // a model-visible failure. `Denied` is denied; every `Blocked` gate and
+        // every `Suspended` (process/dependent-run/external-tool) is gated — a
+        // non-completing, non-failing, non-denied outcome that defers completion.
+        match resolution {
+            Resolution::Done(outcome) => match &outcome.verdict {
+                ToolVerdict::Success | ToolVerdict::ChildSpawned { .. } => result_count += 1,
+                ToolVerdict::RecoverableFailure { .. } => failed_count += 1,
+            },
+            Resolution::Denied(_) => denied_count += 1,
+            Resolution::Blocked(_) | Resolution::Suspended(_) => gated_count += 1,
         }
     }
     (result_count, denied_count, gated_count, failed_count)
@@ -96,6 +92,7 @@ pub(super) fn model_error_class(error: &AgentLoopHostError) -> Option<ModelError
         AgentLoopHostErrorKind::Unavailable => Some(ModelErrorClass::Unavailable),
         AgentLoopHostErrorKind::Internal => Some(ModelErrorClass::Internal),
         AgentLoopHostErrorKind::InvalidOutput => Some(ModelErrorClass::InvalidOutput),
+        AgentLoopHostErrorKind::ContentFiltered => Some(ModelErrorClass::ContentFiltered),
         AgentLoopHostErrorKind::BudgetExceeded => Some(ModelErrorClass::ContextOverflow),
         // Accounting storage failed before the host could establish a
         // trustworthy budget outcome. Preserve the typed host error instead
@@ -106,15 +103,35 @@ pub(super) fn model_error_class(error: &AgentLoopHostError) -> Option<ModelError
         // path takes over rather than the recovery strategy.
         AgentLoopHostErrorKind::BudgetApprovalRequired => None,
         AgentLoopHostErrorKind::Cancelled => None,
+        // Unclassified so the runner derives the precise category from
+        // kind + reason_kind (`model_credits_exhausted` vs
+        // `model_credentials_unavailable`); classifying here would lose the
+        // reason_kind distinction. See
+        // `ironclaw_runner::model_failure_mapping::model_stage_failure_category`.
         AgentLoopHostErrorKind::CredentialUnavailable => None,
-        AgentLoopHostErrorKind::Unauthorized
-        | AgentLoopHostErrorKind::ScopeMismatch
-        | AgentLoopHostErrorKind::StaleSurface
-        | AgentLoopHostErrorKind::InvalidInvocation
+        // Model-fixable by rebuild: the request was built against a stale
+        // surface or prompt bundle (surface refreshed mid-iteration, host
+        // state moved). An iteration-scoped retry rebuilds both; exhaustion
+        // fails with the precise `model_stale_request` category. Audit
+        // §6.1/§7, docs/plans/2026-06-28-reborn-error-recoverability-audit.md.
+        AgentLoopHostErrorKind::StaleSurface => Some(ModelErrorClass::StaleRequest),
+        // Precise terminal categories: immediate abort via the recovery
+        // strategy so the run fails gracefully (`LoopExit::Failed` with a
+        // user-actionable category) instead of hard-borking as a generic
+        // model-stage unavailability.
+        AgentLoopHostErrorKind::Unauthorized => Some(ModelErrorClass::Unauthorized),
+        AgentLoopHostErrorKind::CheckpointRejected => Some(ModelErrorClass::CheckpointRejected),
+        AgentLoopHostErrorKind::TranscriptWriteFailed => {
+            Some(ModelErrorClass::TranscriptWriteFailed)
+        }
+        // Deliberately unclassified (terminal with diagnostics): deterministic
+        // request-invalid errors must not masquerade as stale/retryable, while
+        // policy denial and scope mismatch remain host/config-shaped. The
+        // runner preserves the original kind when categorizing the failure.
+        AgentLoopHostErrorKind::InvalidInvocation
         | AgentLoopHostErrorKind::Invalid
-        | AgentLoopHostErrorKind::PolicyDenied
-        | AgentLoopHostErrorKind::CheckpointRejected
-        | AgentLoopHostErrorKind::TranscriptWriteFailed => None,
+        | AgentLoopHostErrorKind::ScopeMismatch
+        | AgentLoopHostErrorKind::PolicyDenied => None,
     }
 }
 
@@ -122,13 +139,39 @@ pub(super) fn capability_host_error(error: AgentLoopHostError) -> AgentLoopExecu
     if error.kind == AgentLoopHostErrorKind::Cancelled {
         return AgentLoopExecutorError::Cancelled;
     }
-    tracing::warn!(
-        kind = error.kind.as_str(),
-        safe_summary = error.safe_summary.as_str(),
-        "capability host error mapped to HostUnavailable"
-    );
-    AgentLoopExecutorError::HostUnavailable {
+    // Fail soft on a malformed summary: a summary that fails strict validation
+    // (e.g. contains `/`, `{`) must NOT bork the run. Degrade to a canned
+    // fallback and carry the real cause on the model-visible detail channel so
+    // the failure explainer/runner still sees why the call failed. debug! only
+    // — info!/warn! corrupt the REPL/TUI (see repo CLAUDE.md).
+    let raw_summary = error.safe_summary;
+    let (safe_summary, rejected_summary_detail) = match LoopSafeSummary::new(raw_summary.clone()) {
+        Ok(summary) => (summary, None),
+        Err(validation_error) => {
+            tracing::debug!(
+                kind = error.kind.as_str(),
+                validation_error = %validation_error,
+                "capability host error summary rejected; using fallback"
+            );
+            (
+                LoopSafeSummary::capability_failure_summary(raw_summary.clone()),
+                Some(sanitize_model_visible_text(raw_summary)),
+            )
+        }
+    };
+    let detail = error.detail.or(rejected_summary_detail);
+    if detail.is_none() && error.reason_kind.is_none() && error.diagnostic_ref.is_none() {
+        return AgentLoopExecutorError::HostUnavailable {
+            stage: HostStage::Capability,
+        };
+    }
+    AgentLoopExecutorError::HostUnavailableWithDiagnostics {
         stage: HostStage::Capability,
+        kind: error.kind,
+        safe_summary,
+        reason_kind: error.reason_kind,
+        diagnostic_ref: error.diagnostic_ref,
+        detail,
     }
 }
 
@@ -226,6 +269,13 @@ pub(super) fn model_error_failure_category(
         ModelErrorClass::InvalidOutput => "model_invalid_output",
         ModelErrorClass::Unavailable => "model_unavailable",
         ModelErrorClass::Internal => "model_internal",
+        ModelErrorClass::StaleRequest => "model_stale_request",
+        // Pinned category shared with the runner's CredentialUnavailable
+        // mapping (`ironclaw_runner::failure_categories`): an unauthorized
+        // model call is a credentials/permission problem the user must fix.
+        ModelErrorClass::Unauthorized => "model_credentials_unavailable",
+        ModelErrorClass::CheckpointRejected => "checkpoint_rejected",
+        ModelErrorClass::TranscriptWriteFailed => "transcript_write_failed",
     })
 }
 
@@ -244,12 +294,27 @@ fn sanitized_failure_category(
     })
 }
 
-pub(super) fn sanitized_strategy_summary(
+/// Sanitize a strategy summary, failing soft: a summary that fails strict
+/// validation degrades to a fixed fallback instead of aborting the run, and the
+/// secret-value-scrubbed raw cause is returned alongside so the caller can carry
+/// it on the model-visible detail channel.
+pub(super) fn sanitized_strategy_summary_or_fallback(
     summary: String,
-) -> Result<SanitizedStrategySummary, AgentLoopExecutorError> {
-    SanitizedStrategySummary::new(summary).map_err(|_| AgentLoopExecutorError::PlannerContract {
-        detail: "host returned unsafe strategy summary",
-    })
+    fallback: &'static str,
+) -> (SanitizedStrategySummary, Option<String>) {
+    match SanitizedStrategySummary::new(summary.clone()) {
+        Ok(summary) => (summary, None),
+        Err(validation_error) => {
+            tracing::debug!(
+                validation_error = %validation_error,
+                "strategy summary rejected; using fallback"
+            );
+            (
+                SanitizedStrategySummary::from_trusted_static(fallback),
+                Some(sanitize_model_visible_text(summary)),
+            )
+        }
+    }
 }
 
 pub(super) fn honor_retry_alteration(
@@ -365,6 +430,75 @@ mod tests {
             capability_error_class(&CapabilityFailureKind::Permanent),
             CapabilityErrorClass::Permanent
         );
+    }
+
+    /// Classification lock for `model_error_class`: every model-path
+    /// `AgentLoopHostErrorKind` maps to a deliberate outcome. `Some(class)`
+    /// routes through the recovery strategy (retry / precise-category abort);
+    /// `None` is reserved for kinds the executor handles structurally
+    /// (`Cancelled`, gate-shaped `BudgetApprovalRequired`) or that must reach
+    /// the runner as `HostUnavailableWithDiagnostics{Model}` because the
+    /// runner derives their precise category from kind + reason_kind
+    /// (`CredentialUnavailable` -> credits/credentials,
+    /// `BudgetAccountingFailed` -> budget_accounting_failed). See
+    /// `docs/plans/2026-06-28-reborn-error-recoverability-audit.md` §1/§7.
+    #[test]
+    fn every_model_path_host_error_kind_has_a_deliberate_class() {
+        use AgentLoopHostErrorKind as K;
+        use ModelErrorClass as C;
+
+        let class_for = |kind: K| model_error_class(&AgentLoopHostError::new(kind, "test"));
+        let cases: &[(K, Option<C>)] = &[
+            (K::Unavailable, Some(C::Unavailable)),
+            (K::Internal, Some(C::Internal)),
+            (K::InvalidOutput, Some(C::InvalidOutput)),
+            (K::ContentFiltered, Some(C::ContentFiltered)),
+            (K::BudgetExceeded, Some(C::ContextOverflow)),
+            // Model-fixable-by-rebuild: iteration retry refreshes the surface
+            // and prompt bundle; exhaustion -> `model_stale_request`.
+            (K::StaleSurface, Some(C::StaleRequest)),
+            // Precise terminal categories, never silently retried.
+            (K::Unauthorized, Some(C::Unauthorized)),
+            (K::CheckpointRejected, Some(C::CheckpointRejected)),
+            (K::TranscriptWriteFailed, Some(C::TranscriptWriteFailed)),
+            // Structural / runner-categorized kinds stay unclassified.
+            (K::BudgetAccountingFailed, None),
+            (K::BudgetApprovalRequired, None),
+            (K::Cancelled, None),
+            (K::CredentialUnavailable, None),
+            (K::InvalidInvocation, None),
+            (K::Invalid, None),
+            (K::PolicyDenied, None),
+            (K::ScopeMismatch, None),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(
+                class_for(*kind),
+                *expected,
+                "model error class for {kind:?} changed — re-confirm the audit lane \
+                 (recoverable vs precise-terminal vs runner-categorized) is deliberate"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_request_and_precise_terminal_classes_have_precise_categories() {
+        for (class, category) in [
+            (ModelErrorClass::StaleRequest, "model_stale_request"),
+            (
+                ModelErrorClass::Unauthorized,
+                "model_credentials_unavailable",
+            ),
+            (ModelErrorClass::CheckpointRejected, "checkpoint_rejected"),
+            (
+                ModelErrorClass::TranscriptWriteFailed,
+                "transcript_write_failed",
+            ),
+        ] {
+            let failure = model_error_failure_category(class).expect("valid category");
+            assert_eq!(failure.category(), category);
+        }
     }
 
     #[test]
