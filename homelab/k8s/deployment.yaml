@@ -77,7 +77,13 @@ spec:
         - name: ironclaw
           image: git.leopaska.xyz/leo/frick-ironclaw:homelab
           imagePullPolicy: Always
-          command: ["ironclaw"]
+          # No `command:` — the image entrypoint is upstream's
+          # ironclaw-reborn-entrypoint (under tini), which installs a default
+          # config if the PVC has none and refuses to start when the profile's
+          # required sections are missing. Overriding it with `ironclaw`
+          # directly skips that check and turns a bad config into a
+          # half-initialised runtime instead of a clear error.
+          #
           # Reborn runtime (upstream deleted the v1 legacy monolith that
           # `--no-onboard run` belonged to). `serve` is the long-running
           # command; Reborn's `run` only initializes a runtime shell and

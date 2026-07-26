@@ -24,9 +24,24 @@ default_agent = "frick"
 [runner]
 heartbeat_interval_secs = 5
 poll_interval_ms = 200
+# One elected turn-runner authority; let the provider and the storage pool be
+# the bottleneck rather than an in-process semaphore (upstream's guidance for
+# this profile). Per-user and trigger caps still use the compiled defaults.
+worker_count = 0
 
 [skills]
 regex_activation_enabled = true
+
+# Required by the hosted-single-tenant profile — the entrypoint refuses to
+# start without it, and the runtime has no Postgres to reach otherwise. Both
+# env vars are supplied by the Deployment from the frick-secrets SealedSecret
+# (DATABASE_URL and SECRETS_MASTER_KEY respectively); by contract these are
+# variable NAMES, never values.
+[storage]
+backend = "postgres"
+url_env = "IRONCLAW_REBORN_POSTGRES_URL"
+secret_master_key_env = "IRONCLAW_REBORN_SECRET_MASTER_KEY"
+pool_max_size = 32
 
 [webui]
 # Names only — never values. `ironclaw serve` exits before binding the
