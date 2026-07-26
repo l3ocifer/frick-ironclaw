@@ -23,23 +23,23 @@ layer = "substrates"
 test-support = []
 
 [dependencies]
-async-trait = "0.1"
-blake3 = "1"
-deadpool = { version = "0.12", default-features = false, features = ["managed", "rt_tokio_1"] }
-deadpool-postgres = "0.14"
+async-trait = "0.1.91"
+blake3 = "1.8.5"
+deadpool = { version = "0.13.0", default-features = false, features = ["managed", "rt_tokio_1"] }
+deadpool-postgres = "0.14.1"
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_observability = { path = "../ironclaw_observability" }
 ironclaw_safety = { path = "../ironclaw_safety", version = "0.2.2" }
-libsql = { version = "0.9", default-features = false, features = ["core", "replication", "remote", "tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "sync", "time"] }
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-tracing = "0.1"
+libsql = { version = "0.9.30", default-features = false, features = ["core", "replication", "remote", "tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "sync", "time"] }
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
+tracing = "0.1.44"
 
 [dev-dependencies]
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
-tracing-test = { version = "0.2", features = ["no-env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
+uuid = { version = "1.24.0", features = ["v4"] }

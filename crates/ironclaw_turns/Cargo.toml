@@ -23,23 +23,23 @@ test-support = ["ironclaw_host_api/test-support"]
 host-auth-mint = ["ironclaw_host_api/host-auth-mint"]
 
 [dependencies]
-async-trait = "0.1"
-blake3 = "1"
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
-futures-util = "0.3"
+async-trait = "0.1.91"
+blake3 = "1.8.5"
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
+futures-util = "0.3.33"
 ironclaw_filesystem = { path = "../ironclaw_filesystem", version = "0.1.0" }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_observability = { path = "../ironclaw_observability" }
 hex = "0.4.3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 serde_jcs = "0.2"
 sha2 = "0.11"
-thiserror = "2"
-tokio = { version = "1", features = ["rt", "sync", "time"] }
-tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
+tracing = "0.1.44"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
 # Self-reference so the crate's own integration tests see `test_support`.
@@ -51,7 +51,7 @@ ironclaw_filesystem = { path = "../ironclaw_filesystem", version = "0.1.0", feat
 ] }
 # Test-only: the durable-read perf harness (`events_query_stress`) builds a real
 # libSQL-backed store.
-libsql = { version = "0.9", default-features = false, features = [
+libsql = { version = "0.9.30", default-features = false, features = [
     "core",
     "replication",
     "remote",
@@ -59,12 +59,12 @@ libsql = { version = "0.9", default-features = false, features = [
 ] }
 # Optional live-Postgres durable replay contract (skips when no test database
 # URL is configured). Versions match the workspace integration harness.
-deadpool-postgres = "0.14"
-tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
-rand = "0.10"
-static_assertions = "1"
-tempfile = "3"
-tokio = { version = "1", features = [
+deadpool-postgres = "0.14.1"
+tokio-postgres = { version = "0.7.18", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+rand = "0.10.2"
+static_assertions = "1.1.0"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = [
     "macros",
     "rt",
     "rt-multi-thread",

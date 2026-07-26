@@ -36,11 +36,11 @@ test-support = [
     "ironclaw_runner/test-support",
 ]
 [dependencies]
-async-trait = "0.1"
-base64 = "0.22"
-chrono = "0.4"
-deadpool-postgres = "0.14"
-futures = "0.3"
+async-trait = "0.1.91"
+base64 = "0.23.0"
+chrono = "0.4.45"
+deadpool-postgres = "0.14.1"
+futures = "0.3.33"
 ironclaw_auth = { path = "../ironclaw_auth" }
 ironclaw_common = { path = "../ironclaw_common" }
 ironclaw_capabilities = { path = "../ironclaw_capabilities" }
@@ -94,34 +94,34 @@ ironclaw_triggers = { path = "../ironclaw_triggers" }
 ironclaw_projects = { path = "../ironclaw_projects" }
 ironclaw_trust = { path = "../ironclaw_trust" }
 ironclaw_turns = { path = "../ironclaw_turns" }
-nix = { version = "0.30", default-features = false, features = ["process"] }
+nix = { version = "0.31.3", default-features = false, features = ["process"] }
 # WebUI v2 route surface + static SPA bundle merged up into
 # `ironclaw_webui`; no longer a composition dependency.
-libsql = { version = "0.9", default-features = false, features = ["core", "replication", "remote", "tls"] }
-libc = "0.2"
+libsql = { version = "0.9.30", default-features = false, features = ["core", "replication", "remote", "tls"] }
+libc = "0.2.189"
 # axum + tower middleware stack used by the `webui_serve` module. Each
 # entry is feature-gated so non-beta builds carry no HTTP surface code.
-axum = { version = "0.8" }
-tower = { version = "0.5" }
-tower-http = { version = "0.6", features = ["cors", "set-header", "limit", "catch-panic"] }
-lru = { version = "0.18" }
+axum = { version = "0.8.9" }
+tower = { version = "0.5.3" }
+tower-http = { version = "0.7.0", features = ["cors", "set-header", "limit", "catch-panic"] }
+lru = { version = "0.18.1" }
 fs4 = "1.1"
 hex = "0.4.3"
-rand = "0.10"
-rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
-secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+rand = "0.10.2"
+rust_decimal = { version = "1.42.1", features = ["serde", "serde-with-str"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11"
-tempfile = "3"
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-toml = "1.1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-url = "2"
-uuid = { version = "1", features = ["v4"] }
+tempfile = "3.27.0"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+toml = "1.1.3"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+url = "2.5.8"
+uuid = { version = "1.24.0", features = ["v4"] }
 
 [dev-dependencies]
 ironclaw_extension_host = { path = "../ironclaw_extension_host", features = ["test-support"] }
@@ -130,8 +130,8 @@ ironclaw_extension_host = { path = "../ironclaw_extension_host", features = ["te
 # own unit/integration tests (and the test-support inventory helper) can build
 # the catalog and trust policy without the binary.
 ironclaw_first_party_extensions = { path = "../ironclaw_first_party_extensions" }
-async-trait = "0.1"
-chrono = "0.4"
+async-trait = "0.1.91"
+chrono = "0.4.45"
 hmac = "0.13"
 # Enables the in-memory-backed outbound-state store constructor for tests only.
 ironclaw_outbound = { path = "../ironclaw_outbound", features = ["test-support"] }
@@ -148,12 +148,12 @@ ironclaw_resources = { path = "../ironclaw_resources", features = ["test-support
 # Enables the `FaultInjecting` backend decorator so store fault paths are tested
 # through the real filesystem-backed store instead of a whole-trait fake.
 ironclaw_filesystem = { path = "../ironclaw_filesystem", features = ["test-support"] }
-http = "1"
-http-body-util = "0.1"
+http = "1.4.2"
+http-body-util = "0.1.4"
 # Admin-user-management e2e test drives the composed app with a real session
 # authenticator so a minted API token can be validated (login-with-token).
 ironclaw_webui = { path = "../ironclaw_webui" }
-secrecy = { version = "0.10", features = ["serde"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
 ironclaw_common = { path = "../ironclaw_common" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_host_runtime = { path = "../ironclaw_host_runtime", features = ["test-support"] }
@@ -170,20 +170,20 @@ ironclaw_product = { path = "../ironclaw_product", features = ["test-support"] }
 # fixtures; dev-dependency linkage of concrete extension crates is the
 # sanctioned test exception (DEL-7).
 ironclaw_slack_extension = { path = "../ironclaw_slack_extension" }
-rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
-rust_decimal_macros = "1"
+rust_decimal = { version = "1.42.1", features = ["serde", "serde-with-str"] }
+rust_decimal_macros = "1.40.0"
 sha2 = "0.11"
-tempfile = "3"
-testcontainers-modules = { version = "0.12", features = ["postgres"] }
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tempfile = "3.27.0"
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 # Real WebSocket client for the v2 stream-events-ws caller-level test.
 # Oneshot via `tower::ServiceExt::oneshot` cannot complete a true WS
 # upgrade (no underlying TCP stream → axum's WebSocketUpgrade extractor
 # returns 426), so the happy-path test needs a bound listener and a
 # proper WS client.
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
-tower = { version = "0.5", features = ["util"] }
-tracing-test = "0.2"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
+tower = { version = "0.5.3", features = ["util"] }
+tracing-test = "0.2.6"
 
 [[test]]
 name = "production_runtime_automations"

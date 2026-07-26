@@ -14,5 +14,5 @@ publish = false
 layer = "substrates"
 
 [dependencies]
-serde_json = "1"
-tracing = "0.1"
+serde_json = "1.0.151"
+tracing = "0.1.44"

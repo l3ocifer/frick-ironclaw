@@ -14,6 +14,6 @@ publish = false
 layer = "products"
 
 [dependencies]
-axum = "0.8"
+axum = "0.8.9"
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 

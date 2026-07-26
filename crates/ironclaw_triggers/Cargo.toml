@@ -13,26 +13,26 @@ layer = "substrates"
 test-support = []
 
 [dependencies]
-async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
+async-trait = "0.1.91"
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
 cron = "0.17"
-hex = "0.4"
-deadpool-postgres = "0.14"
+hex = "0.4.3"
+deadpool-postgres = "0.14.1"
 ironclaw_common = { path = "../ironclaw_common" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_turns = { path = "../ironclaw_turns" }
-libsql = { version = "0.9", default-features = false, features = ["core", "replication", "remote", "tls"] }
-tokio-postgres = "0.7"
-serde = { version = "1", features = ["derive"] }
+libsql = { version = "0.9.30", default-features = false, features = ["core", "replication", "remote", "tls"] }
+tokio-postgres = "0.7.18"
+serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11"
-thiserror = "2"
-tokio = { version = "1", features = ["sync", "time"] }
-tracing = "0.1"
-ulid = { version = "1", features = ["serde"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["sync", "time"] }
+tracing = "0.1.44"
+ulid = { version = "1.2.1", features = ["serde"] }
 
 [dev-dependencies]
-serde_json = "1"
-tempfile = "3"
-testcontainers-modules = { version = "0.12", features = ["postgres"] }
-tokio = { version = "1", features = ["macros", "rt"] }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+tokio = { version = "1.53.1", features = ["macros", "rt"] }

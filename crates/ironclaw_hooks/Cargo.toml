@@ -30,33 +30,33 @@ test-support = []
 integration = []
 
 [dependencies]
-async-trait = "0.1"
-blake3 = "1"
-chrono = { version = "0.4", features = ["serde"] }
-deadpool-postgres = "0.14"
-libsql = { version = "0.9", default-features = false, features = ["core", "replication", "remote", "tls"] }
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
-futures = "0.3"
+async-trait = "0.1.91"
+blake3 = "1.8.5"
+chrono = { version = "0.4.45", features = ["serde"] }
+deadpool-postgres = "0.14.1"
+libsql = { version = "0.9.30", default-features = false, features = ["core", "replication", "remote", "tls"] }
+tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4"] }
+futures = "0.3.33"
 ironclaw_events = { path = "../ironclaw_events" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_prompt_envelope = { path = "../ironclaw_prompt_envelope" }
 ironclaw_turns = { path = "../ironclaw_turns" }
 ironclaw_wasm_limiter = { path = "../ironclaw_wasm_limiter" }
-lru = "0.18"
-rust_decimal = { version = "1", features = ["serde", "serde-with-str", "db-tokio-postgres"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["time", "rt", "sync"] }
-tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+lru = "0.18.1"
+rust_decimal = { version = "1.42.1", features = ["serde", "serde-with-str", "db-tokio-postgres"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["time", "rt", "sync"] }
+tracing = "0.1.44"
+uuid = { version = "1.24.0", features = ["v4"] }
 wasmtime = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
-tempfile = "3"
-toml = "1.1"
-wat = "1"
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread"] }
+tempfile = "3.27.0"
+toml = "1.1.3"
+wat = "1.254.0"
 
 # Durable-backend test suites folded in from the former
 # `ironclaw_hooks_{postgres,libsql}` / `ironclaw_hooks_parity` crates. The

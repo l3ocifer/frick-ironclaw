@@ -14,21 +14,21 @@ publish = false
 layer = "substrates"
 
 [dependencies]
-async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1.91"
+chrono = { version = "0.4.45", features = ["serde"] }
 ironclaw_filesystem = { path = "../ironclaw_filesystem", version = "0.1.0" }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_safety = { path = "../ironclaw_safety" }
 ironclaw_triggers = { path = "../ironclaw_triggers", version = "0.1.0" }
 ironclaw_turns = { path = "../ironclaw_turns", version = "0.1.0" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
-tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["sync"] }
+tracing = "0.1.44"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
 ironclaw_triggers = { path = "../ironclaw_triggers", version = "0.1.0", features = ["test-support"] }
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt", "sync"] }
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }

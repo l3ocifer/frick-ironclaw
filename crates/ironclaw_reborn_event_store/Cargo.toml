@@ -14,29 +14,29 @@ publish = false
 layer = "substrates"
 
 [dependencies]
-async-trait = "0.1"
-deadpool-postgres = "0.14"
-hex = "0.4"
+async-trait = "0.1.91"
+deadpool-postgres = "0.14.1"
+hex = "0.4.3"
 ironclaw_events = { path = "../ironclaw_events", version = "0.1.0" }
 ironclaw_filesystem = { path = "../ironclaw_filesystem", version = "0.1.0" }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
-libsql = { version = "0.9", default-features = false, features = ["core", "replication", "remote", "tls"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-rustls-native-certs = "0.8"
-secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+libsql = { version = "0.9.30", default-features = false, features = ["core", "replication", "remote", "tls"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8.4"
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11"
-thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "time"] }
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-tokio-postgres-rustls = "0.13"
-tracing = "0.1"
-urlencoding = "2"
-webpki-roots = "1.0"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "rt", "sync", "time"] }
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
+tokio-postgres-rustls = "0.14.0"
+tracing = "0.1.44"
+urlencoding = "2.1.3"
+webpki-roots = "1.0.9"
 
 [dev-dependencies]
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 ironclaw_common = { path = "../ironclaw_common", version = "0.4.2" }
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["macros", "rt"] }

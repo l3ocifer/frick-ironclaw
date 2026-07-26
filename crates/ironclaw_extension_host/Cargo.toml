@@ -23,9 +23,9 @@ test-support = ["dep:ironclaw_first_party_extensions"]
 composition-substrate-tests = []
 
 [dependencies]
-async-trait = "0.1"
-base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+async-trait = "0.1.91"
+base64 = "0.23.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
 hmac = "0.13"
 ironclaw_auth = { path = "../ironclaw_auth" }
 ironclaw_approvals = { path = "../ironclaw_approvals" }
@@ -55,27 +55,27 @@ ironclaw_threads = { path = "../ironclaw_threads" }
 ironclaw_triggers = { path = "../ironclaw_triggers" }
 ironclaw_trust = { path = "../ironclaw_trust" }
 ironclaw_turns = { path = "../ironclaw_turns" }
-axum = { version = "0.8" }
+axum = { version = "0.8.9" }
 fs4 = "1.1"
-futures = "0.3"
-lru = { version = "0.18" }
-rand = "0.10"
-rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
-secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+futures = "0.3.33"
+lru = { version = "0.18.1" }
+rand = "0.10.2"
+rust_decimal = { version = "1.42.1", features = ["serde", "serde-with-str"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11"
-subtle = "2"
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-toml = "1.1"
-tracing = "0.1"
-url = "2"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+subtle = "2.6.1"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
+toml = "1.1.3"
+tracing = "0.1.44"
+url = "2.5.8"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 ironclaw_skills = { path = "../ironclaw_skills" }
-serde_json = "1"
+serde_json = "1.0.151"
 
 [dev-dependencies]
 ironclaw_authorization = { path = "../ironclaw_authorization" }
@@ -89,10 +89,10 @@ ironclaw_product = { path = "../ironclaw_product", features = ["test-support"] }
 ironclaw_resources = { path = "../ironclaw_resources", features = ["test-support"] }
 ironclaw_slack_extension = { path = "../ironclaw_slack_extension" }
 hex = "0.4.3"
-http-body-util = "0.1"
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
-tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1.4"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tower = { version = "0.5.3", features = ["util"] }
 
 [[test]]
 name = "lifecycle_contract"

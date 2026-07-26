@@ -8,15 +8,15 @@ publish = false
 layer = "substrates"
 
 [dependencies]
-async-trait = "0.1"
+async-trait = "0.1.91"
 ironclaw_host_api = { path = "../ironclaw_host_api" }
-percent-encoding = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
-thiserror = "2"
-tokio = { version = "1", features = ["rt"] }
-tracing = "0.1"
-url = "2"
-zeroize = "1"
+percent-encoding = "2.3.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-tls-native-roots"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt"] }
+tracing = "0.1.44"
+url = "2.5.8"
+zeroize = "1.9.0"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "time", "net", "io-util"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "time", "net", "io-util"] }

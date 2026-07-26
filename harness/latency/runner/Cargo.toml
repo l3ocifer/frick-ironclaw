@@ -7,9 +7,9 @@ publish = false
 [workspace]
 
 [dependencies]
-async-trait = "0.1"
-axum = "0.8"
-deadpool-postgres = "0.14"
+async-trait = "0.1.91"
+axum = "0.8.9"
+deadpool-postgres = "0.14.1"
 ironclaw_filesystem = { path = "../../../crates/ironclaw_filesystem" }
 ironclaw_host_runtime = { path = "../../../crates/ironclaw_host_runtime" }
 ironclaw_host_api = { path = "../../../crates/ironclaw_host_api" }
@@ -22,13 +22,13 @@ ironclaw_triggers = { path = "../../../crates/ironclaw_triggers" }
 ironclaw_trust = { path = "../../../crates/ironclaw_trust" }
 ironclaw_turns = { path = "../../../crates/ironclaw_turns" }
 ironclaw_webui = { path = "../../../crates/ironclaw_webui" }
-chrono = "0.4"
-libsql = { version = "0.9", default-features = false, features = ["core", "replication", "remote", "tls"] }
-secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tempfile = "3"
-tokio = { version = "1", features = ["full"] }
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-tower = { version = "0.5", features = ["util"] }
-uuid = { version = "1", features = ["v4"] }
+chrono = "0.4.45"
+libsql = { version = "0.9.30", default-features = false, features = ["core", "replication", "remote", "tls"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
+tower = { version = "0.5.3", features = ["util"] }
+uuid = { version = "1.24.0", features = ["v4"] }

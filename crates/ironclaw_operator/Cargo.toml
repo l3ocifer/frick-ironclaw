@@ -14,9 +14,9 @@ publish = false
 layer = "products"
 
 [dependencies]
-async-trait = "0.1"
-axum = "0.8"
-chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1.91"
+axum = "0.8.9"
+chrono = { version = "0.4.45", features = ["serde"] }
 fs4 = "1.1"
 ironclaw_common = { path = "../ironclaw_common" }
 ironclaw_filesystem = { path = "../ironclaw_filesystem" }
@@ -26,26 +26,26 @@ ironclaw_product = { path = "../ironclaw_product" }
 ironclaw_reborn_config = { path = "../ironclaw_reborn_config" }
 ironclaw_safety = { path = "../ironclaw_safety" }
 ironclaw_secrets = { path = "../ironclaw_secrets" }
-nix = { version = "0.30", default-features = false, features = ["process"] }
-libc = "0.2"
-secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tempfile = "3"
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-toml = "1.1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-url = "2"
-uuid = { version = "1", features = ["v4"] }
+nix = { version = "0.31.3", default-features = false, features = ["process"] }
+libc = "0.2.189"
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
+toml = "1.1.3"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+url = "2.5.8"
+uuid = { version = "1.24.0", features = ["v4"] }
 
 [dev-dependencies]
 ironclaw_filesystem = { path = "../ironclaw_filesystem", features = ["test-support"] }
 ironclaw_secrets = { path = "../ironclaw_secrets" }
-rust_decimal = "1"
-tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
+rust_decimal = "1.42.1"
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
 
 [lints]
 workspace = true
