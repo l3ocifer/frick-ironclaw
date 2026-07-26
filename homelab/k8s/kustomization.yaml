@@ -27,6 +27,13 @@ configMapGenerator:
   - name: frick-ironclaw-config
     files:
       - openclaw.json=../config/openclaw.json
+  # Reborn operator config. Kept alongside openclaw.json rather than
+  # replacing it: openclaw.json still documents the fleet-bus, MCP, A2A and
+  # cron wiring that has no Reborn equivalent wired yet (see PATCHES.md), and
+  # keeping it mounted makes a rollback a pure image/args revert.
+  - name: frick-reborn-config
+    files:
+      - config.toml=../config/reborn-config.toml
 
 generatorOptions:
   disableNameSuffixHash: true

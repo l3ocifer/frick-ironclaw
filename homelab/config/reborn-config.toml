@@ -1,0 +1,47 @@
+# Reborn operator config for Frick (in-cluster, hosted-single-tenant).
+#
+# Read once at startup from $IRONCLAW_REBORN_HOME/config.toml. The container
+# cannot mount a ConfigMap directly into that path because
+# IRONCLAW_REBORN_HOME lives on the writable state PVC, so an initContainer
+# copies this file into place (see homelab/k8s/deployment.yaml).
+#
+# This replaces homelab/config/openclaw.json, which the deleted v1 legacy
+# binary read. See homelab/PATCHES.md for what did NOT carry over.
+api_version = "ironclaw.runtime/v1"
+
+[boot]
+# Postgres-backed single tenant. The database, role and password already
+# exist for this agent (CNPG `ironclaw_frick` on homelab-pg); the URL is
+# supplied as IRONCLAW_REBORN_POSTGRES_URL from the existing DATABASE_URL
+# key in the frick-secrets SealedSecret.
+profile = "hosted-single-tenant"
+
+[identity]
+default_owner = "frick"
+tenant = "frick"
+default_agent = "frick"
+
+[runner]
+heartbeat_interval_secs = 5
+poll_interval_ms = 200
+
+[skills]
+regex_activation_enabled = true
+
+[webui]
+# Names only — never values. `ironclaw serve` exits before binding the
+# listener if either of these resolves empty.
+env_token_var = "IRONCLAW_REBORN_WEBUI_TOKEN"
+env_user_id_var = "IRONCLAW_REBORN_WEBUI_USER_ID"
+
+# Route the agent at the in-cluster LiteLLM rather than NearAI, which is what
+# the bundled config would otherwise select. The built-in `openai_compatible`
+# provider reads LLM_BASE_URL and LLM_API_KEY, which are the same env vars the
+# legacy binary used, so the LiteLLM wiring in the Deployment is unchanged.
+# `api_key_env` is an env-var NAME by contract; an inline secret here is
+# rejected at validation.
+[llm.default]
+provider_id = "openai_compatible"
+model = "chat"
+api_key_env = "LLM_API_KEY"
+base_url = "http://litellm.inference.svc.cluster.local:4000/v1"

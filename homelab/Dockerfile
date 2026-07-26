@@ -117,8 +117,13 @@ WORKDIR /home/ironclaw
 
 EXPOSE 3000 9100
 
+# Reborn serves /api/health (and binds it before Postgres-backed runtime
+# assembly finishes, so this goes healthy while migrations still run).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD curl -fsS http://localhost:3000/health || exit 1
+  CMD curl -fsS http://localhost:3000/api/health || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/usr/local/bin/ironclaw", "--bind", "0.0.0.0:3000"]
+# `--bind` was a v1 legacy flag and no longer exists. `--bin ironclaw` now
+# builds crates/ironclaw_reborn_cli, which upstream renamed to the `ironclaw`
+# package after deleting the legacy monolith, so the binary path is unchanged.
+CMD ["/usr/local/bin/ironclaw", "serve", "--host", "0.0.0.0", "--port", "3000"]

@@ -56,12 +56,33 @@ spec:
           command: ["sh", "-c", "mkdir -p /data/graphs/frick/pages/world"]
           volumeMounts:
             - { name: graph-frick, mountPath: /data/graphs/frick }
+        # Reborn reads $IRONCLAW_REBORN_HOME/config.toml and needs that home
+        # writable, so the ConfigMap cannot be mounted there directly. Copy it
+        # in on every start (same seed-a-writable-copy pattern frack/puck
+        # use). Overwrites unconditionally so the ConfigMap stays the source
+        # of truth; because disableNameSuffixHash is set, editing the config
+        # does not roll the Deployment by itself — restart it to pick up a
+        # change.
+        - name: seed-reborn-config
+          image: busybox:1.37
+          securityContext: { runAsUser: 1000, runAsGroup: 0 }
+          command:
+            - sh
+            - -c
+            - mkdir -p /data/reborn && cp /etc/ironclaw/reborn/config.toml /data/reborn/config.toml
+          volumeMounts:
+            - { name: state, mountPath: /data }
+            - { name: reborn-config, mountPath: /etc/ironclaw/reborn, readOnly: true }
       containers:
         - name: ironclaw
           image: git.leopaska.xyz/leo/frick-ironclaw:homelab
           imagePullPolicy: Always
           command: ["ironclaw"]
-          args: ["--no-onboard", "run"]
+          # Reborn runtime (upstream deleted the v1 legacy monolith that
+          # `--no-onboard run` belonged to). `serve` is the long-running
+          # command; Reborn's `run` only initializes a runtime shell and
+          # exits, which would crashloop here.
+          args: ["serve", "--host", "0.0.0.0", "--port", "3000"]
           # Root the process cwd at the Logseq graph's pages dir so the
           # agent's filesystem write tool persists workspace-relative
           # deliverables (e.g. `world/cluster-state.md`) into the RWX graph the
@@ -95,6 +116,31 @@ spec:
                   name: frick-secrets
                   key: LITELLM_API_KEY
             - { name: IRONCLAW_PERSONA_DIR, value: "/etc/ironclaw/persona" }
+            # ── Reborn runtime ──────────────────────────────────────────
+            # Home must be writable: Reborn keeps its config, state and
+            # first-run marker here, so it sits on the state PVC.
+            - { name: IRONCLAW_REBORN_HOME, value: "/data/reborn" }
+            - { name: IRONCLAW_REBORN_PROFILE, value: "hosted-single-tenant" }
+            # Reuses the CNPG database this agent already owns. DATABASE_URL
+            # is the same key the legacy binary consumed via envFrom.
+            - name: IRONCLAW_REBORN_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: frick-secrets
+                  key: DATABASE_URL
+            - name: IRONCLAW_REBORN_SECRET_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: frick-secrets
+                  key: SECRETS_MASTER_KEY
+            # Same M2M token the agent-bus and A2A callers already present,
+            # so existing callers keep working against the Reborn WebUI.
+            - name: IRONCLAW_REBORN_WEBUI_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: frick-secrets
+                  key: A2A_BEARER_TOKEN
+            - { name: IRONCLAW_REBORN_WEBUI_USER_ID, value: "frick" }
             # Mission deliverables are real files on the RWX graph, not the
             # Postgres-backed `memory_write` workspace. Enable the local
             # filesystem/shell tools (write_file, shell) and auto-approve them
@@ -133,6 +179,7 @@ spec:
         - { name: state,            persistentVolumeClaim: { claimName: frick-state } }
         - { name: persona,          configMap: { name: frick-persona } }
         - { name: ironclaw-config,  configMap: { name: frick-ironclaw-config } }
+        - { name: reborn-config,    configMap: { name: frick-reborn-config } }
         - { name: graph-frick,      persistentVolumeClaim: { claimName: frick-graph } }
         - { name: graph-frack,      persistentVolumeClaim: { claimName: frack-graph } }
         - { name: graph-sancho,     persistentVolumeClaim: { claimName: sancho-graph } }
