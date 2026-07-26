@@ -102,6 +102,30 @@ fix would have covered on its own:
   `[storage]` check. Removed; `args:` alone now flows through to
   `exec ironclaw "$@"`, and tini is back as PID 1.
 
+### What the first real Reborn boot demanded
+
+Neither of these is discoverable from the config schema — the runtime only
+rejects them while assembling, so they cost a crash-loop each:
+
+- `IRONCLAW_REBORN_POSTGRES_RESOURCE_GOVERNOR_SINGLETON=true`. A required
+  operator assertion that this process is the only resource-governor for its
+  database. Setting it to `false` is also an error; the runtime wants the
+  affirmative statement. True here because frick owns `ironclaw_frick` alone
+  and `replicas: 1` + `strategy: Recreate` means no second pod overlaps —
+  **scaling this Deployment past 1, or switching to RollingUpdate, silently
+  invalidates it.**
+- `DATABASE_SSLMODE=disable` plus
+  `IRONCLAW_REBORN_ALLOW_REMOTE_POSTGRES_CLEAR_TEXT=true`. Reborn refuses a
+  remote Postgres that is neither TLS-verified nor explicitly waived. TLS was
+  attempted first: Reborn's `require` *verifies* the chain against rustls
+  native roots and exposes no CA-file setting, CNPG signs with a per-cluster CA
+  that lives in `homelab-pg-ca` in the `databases` namespace, and a Pod in
+  `agents-shared` cannot mount it. Pinning the CA in git is worse than useless
+  — CNPG rotates it every 90 days. The hostname itself was never the problem
+  (`homelab-pg-rw.databases.svc.cluster.local` is in the cert SANs), so the day
+  that CA is replicated into `agents-shared` automatically, flipping this back
+  to `require` is the whole change.
+
 ### Not carried over — verify before trusting these
 
 `openclaw.json` also configured things with no Reborn equivalent wired up
