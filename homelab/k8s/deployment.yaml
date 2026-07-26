@@ -139,6 +139,14 @@ spec:
                 secretKeyRef:
                   name: frick-secrets
                   key: SECRETS_MASTER_KEY
+            # Required opt-in: the runtime refuses to start unless the operator
+            # asserts that this process is the only resource-governor for its
+            # Postgres database. That holds here — frick owns `ironclaw_frick`
+            # alone, and replicas:1 with strategy Recreate means no second pod
+            # ever overlaps. If this Deployment is ever scaled past 1, or the
+            # strategy changes to RollingUpdate, this assertion becomes false
+            # and two governors will race over the same tables.
+            - { name: IRONCLAW_REBORN_POSTGRES_RESOURCE_GOVERNOR_SINGLETON, value: "true" }
             # Same M2M token the agent-bus and A2A callers already present,
             # so existing callers keep working against the Reborn WebUI.
             - name: IRONCLAW_REBORN_WEBUI_TOKEN
