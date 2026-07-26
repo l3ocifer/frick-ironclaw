@@ -147,13 +147,24 @@ spec:
             # strategy changes to RollingUpdate, this assertion becomes false
             # and two governors will race over the same tables.
             - { name: IRONCLAW_REBORN_POSTGRES_RESOURCE_GOVERNOR_SINGLETON, value: "true" }
-            # The DATABASE_URL in frick-secrets carries `sslmode=disable`,
-            # which Reborn rejects for a non-local Postgres. CNPG serves TLS on
-            # the -rw service, so require it rather than opting into
-            # IRONCLAW_REBORN_ALLOW_REMOTE_POSTGRES_CLEAR_TEXT. This env wins
-            # over the URL, which keeps the shared secret untouched for the
-            # other consumers that still read it.
-            - { name: DATABASE_SSLMODE, value: "require" }
+            # Reborn rejects a non-local Postgres without one of these two
+            # opt-ins. TLS was tried first and does not currently work:
+            # `require` in Reborn *verifies* the chain (rustls native roots,
+            # no CA-file knob), CNPG signs with its own per-cluster CA, and
+            # that CA lives in secret homelab-pg-ca in the `databases`
+            # namespace — unreachable from a Pod in agents-shared. Copying it
+            # into git is not an option either: CNPG rotates it every 90 days
+            # (currently 2026-07-19 → 2026-10-17), so a pinned copy would break
+            # the agent every quarter. The hostname would otherwise be fine —
+            # homelab-pg-rw.databases.svc.cluster.local is in the cert's SANs.
+            #
+            # So: cleartext over the cluster CNI, which is what every other
+            # consumer of this database already does. To turn TLS on properly,
+            # the CA has to be replicated into agents-shared automatically
+            # (a sync CronJob or a replicator controller) — see homelab
+            # docs/status/STATUS.md.
+            - { name: DATABASE_SSLMODE, value: "disable" }
+            - { name: IRONCLAW_REBORN_ALLOW_REMOTE_POSTGRES_CLEAR_TEXT, value: "true" }
             # Same M2M token the agent-bus and A2A callers already present,
             # so existing callers keep working against the Reborn WebUI.
             - name: IRONCLAW_REBORN_WEBUI_TOKEN
