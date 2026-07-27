@@ -12,15 +12,15 @@ repository = "https://github.com/nearai/ironclaw"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
-rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-thiserror = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1.91"
+chrono = { version = "0.4.45", features = ["serde"] }
+rust_decimal = { version = "1.42.1", features = ["serde", "serde-with-str"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.19"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
-rust_decimal_macros = "1"
-static_assertions = "1"
+rust_decimal_macros = "1.40.0"
+static_assertions = "1.1.0"

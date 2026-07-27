@@ -5,11 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
+async-trait = "0.1.91"
 ironclaw_host_api = { path = "../ironclaw_host_api" }
-secrecy = "0.10"
-thiserror = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+secrecy = "0.10.3"
+thiserror = "2.0.19"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1.53.1", features = ["macros", "rt"] }

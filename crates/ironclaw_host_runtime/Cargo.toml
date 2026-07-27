@@ -5,8 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+async-trait = "0.1.91"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 ironclaw_approvals = { path = "../ironclaw_approvals" }
 ironclaw_authorization = { path = "../ironclaw_authorization" }
 ironclaw_capabilities = { path = "../ironclaw_capabilities" }
@@ -25,17 +25,17 @@ ironclaw_scripts = { path = "../ironclaw_scripts" }
 ironclaw_secrets = { path = "../ironclaw_secrets" }
 ironclaw_trust = { path = "../ironclaw_trust" }
 ironclaw_wasm = { path = "../ironclaw_wasm" }
-rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
-secrecy = "0.10"
-serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["rt", "time"] }
-tracing = "0.1"
-url = "2"
+rust_decimal = { version = "1.42.1", features = ["serde", "serde-with-str"] }
+secrecy = "0.10.3"
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt", "time"] }
+tracing = "0.1.44"
+url = "2.5.8"
 
 [dev-dependencies]
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt", "time"] }
-wat = "1.245.1"
-wit-component = "0.245.1"
-wit-parser = "0.245.1"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["macros", "rt", "time"] }
+wat = "1.254.0"
+wit-component = "0.254.0"
+wit-parser = "0.254.0"

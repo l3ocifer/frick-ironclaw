@@ -5,11 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
-async-trait = "0.1"
+async-trait = "0.1.91"
 ironclaw_host_api = { path = "../ironclaw_host_api" }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
-thiserror = "2"
-url = "2"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+thiserror = "2.0.19"
+url = "2.5.8"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1.53.1", features = ["macros", "rt"] }
