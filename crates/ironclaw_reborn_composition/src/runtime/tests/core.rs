@@ -1572,6 +1572,7 @@ fn nearai_gateway_test_request() -> HostManagedModelRequest {
         }],
         surface_version: None,
         resolved_model_route: None,
+        fallback_index: 0,
         run_id: TurnRunId::new(),
         turn_id: TurnId::new(),
     }
