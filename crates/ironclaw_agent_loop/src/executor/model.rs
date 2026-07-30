@@ -3,7 +3,7 @@ use ironclaw_turns::{
     LoopBlocked, LoopBlockedKind, LoopExit, LoopFailureKind,
     run_profile::{
         AgentLoopHostErrorKind, LoopDriverNoteKind, LoopModelCapabilityView, LoopModelRequest,
-        LoopProgressEvent, LoopSafeSummary,
+        LoopProgressEvent, LoopRecoveryDisposition, LoopRecoveryStage, LoopSafeSummary,
     },
 };
 use tracing::debug;
@@ -19,8 +19,8 @@ use crate::{
 use super::prompt::build_prompt_bundle_for_surface;
 use super::{
     AgentLoopExecutorError, CancelCheck, CheckpointStage, ExecutorStage, FailedExitDetails,
-    HostStage, StageContext, exit_id, failed_exit, honor_retry_alteration, loop_gate_kind,
-    model_error_class, model_error_failure_summary, model_preference_to_host,
+    HostStage, StageContext, exit_id, failed_exit, loop_gate_kind, model_error_class,
+    model_error_failure_summary, model_preference_to_host, model_recovery_class,
     sanitized_strategy_summary_or_fallback,
 };
 
@@ -65,7 +65,7 @@ impl ExecutorStage<ModelInput> for ModelStage {
             CancelCheck::Exit(exit) => return Ok(ModelStep::Exit(exit)),
         };
 
-        let model_preference =
+        let (model_preference, fallback_index) =
             model_preference_to_host(ctx.planner.model().preference(&state).await)?;
         state = match CheckpointStage.cancel_if_requested(ctx, state).await? {
             CancelCheck::Continue(state) => *state,
@@ -78,6 +78,7 @@ impl ExecutorStage<ModelInput> for ModelStage {
             inline_messages: input.inline_messages,
             surface_version: Some(surface_version.clone()),
             model_preference,
+            fallback_index,
             capability_view: Some(capability_view.clone()),
         };
         let visible_capability_count = capability_view.visible_capability_ids.len();
@@ -104,15 +105,16 @@ impl ExecutorStage<ModelInput> for ModelStage {
         let mut last_error_detail: Option<String> = None;
         for _ in 0..max_model_attempts {
             let model_result = ctx.host.stream_model(request.clone()).await;
-            // Pending controls have now crossed the model gateway boundary.
-            // Keep them through prompt construction and the BeforeModel
-            // checkpoint, then consume them only after issuing the request.
-            // A crash before this in-memory clear may replay the same control
-            // once, which is safer than losing a consumed recovery budget.
-            state.pending_model_error_observation = None;
-            state.pending_model_retry_directive = None;
             match model_result {
                 Ok(response) => {
+                    state.model_state.fallback_index = request.fallback_index;
+                    // A successful response proves the provider saw this
+                    // request. Consume the pending controls only now; a
+                    // gate-shaped error below happens before provider dispatch
+                    // and must preserve them for the approved retry.
+                    state.pending_model_error_observation = None;
+                    state.pending_model_retry_directive = None;
+                    state.terminal_warning_state.mark_delivered();
                     match &response.output {
                         ironclaw_turns::run_profile::ParentLoopOutput::AssistantReply(reply) => {
                             debug!(
@@ -143,6 +145,13 @@ impl ExecutorStage<ModelInput> for ModelStage {
                     {
                         return budget_approval_blocked_exit(ctx, state, gate_ref).await;
                     }
+                    // Non-gate errors were returned after the request crossed
+                    // the model boundary. Do not leave stale model-error
+                    // controls pending in a later prompt. A terminal warning,
+                    // however, remains pending until a successful response
+                    // proves the model received its recovery turn.
+                    state.pending_model_error_observation = None;
+                    state.pending_model_retry_directive = None;
                     let Some(class) = model_error_class(&error) else {
                         let raw_summary = error.safe_summary;
                         let (safe_summary, rejected_summary_detail) =
@@ -167,7 +176,6 @@ impl ExecutorStage<ModelInput> for ModelStage {
                             kind: error.kind,
                             safe_summary,
                             reason_kind: error.reason_kind,
-                            diagnostic_ref: error.diagnostic_ref,
                             detail,
                         });
                     };
@@ -187,7 +195,8 @@ impl ExecutorStage<ModelInput> for ModelStage {
                     let summary = ModelErrorSummary {
                         class,
                         safe_summary,
-                        diagnostic_ref: error.diagnostic_ref,
+                        retry_after_ms: error.retry_after_ms,
+                        next_fallback_index: error.next_fallback_index,
                     };
                     last_error_summary = Some(summary.clone());
                     last_error_detail.clone_from(&model_failure_detail);
@@ -196,18 +205,31 @@ impl ExecutorStage<ModelInput> for ModelStage {
                         .recovery()
                         .on_model_error(&state, &summary)
                         .await;
-                    let (recovery, scope, alter, observation) = match recovery_outcome {
+                    let (recovery, scope, alter, observation, disposition) = match recovery_outcome
+                    {
                         RecoveryOutcome::Retry {
                             recovery,
                             scope,
                             alter,
-                        } => (recovery, scope, alter, None),
+                        } => (
+                            recovery,
+                            scope,
+                            alter,
+                            None,
+                            LoopRecoveryDisposition::Retried,
+                        ),
                         RecoveryOutcome::ModelErrorObservation {
                             recovery,
                             scope,
                             alter,
                             observation,
-                        } => (recovery, scope, alter, Some(observation)),
+                        } => (
+                            recovery,
+                            scope,
+                            alter,
+                            Some(observation),
+                            LoopRecoveryDisposition::ModelVisible,
+                        ),
                         RecoveryOutcome::ToolErrorResult { .. } => {
                             return Err(AgentLoopExecutorError::PlannerContract {
                                 detail: "ToolErrorResult on model error",
@@ -236,21 +258,30 @@ impl ExecutorStage<ModelInput> for ModelStage {
                                 failure_kind,
                                 Some(checked.checkpoint_id),
                                 FailedExitDetails {
-                                    diagnostic_ref: summary.diagnostic_ref.clone(),
                                     safe_summary: Some(safe_failure),
                                     explanation_message_ref: None,
                                 },
                             )?));
                         }
                     };
-                    state.recovery_state = recovery;
-                    state.pending_model_error_observation = observation;
                     match CheckpointStage.cancel_if_requested(ctx, state).await? {
                         CancelCheck::Continue(next) => state = *next,
                         CancelCheck::Exit(exit) => return Ok(ModelStep::Exit(exit)),
                     }
                     let retry_action =
                         prepare_model_retry_alteration(&mut state, scope, alter.as_ref())?;
+                    request.fallback_index = state.model_state.fallback_index;
+                    state.recovery_state = recovery;
+                    state.pending_model_error_observation = observation;
+                    CheckpointStage
+                        .emit_recovery(
+                            ctx,
+                            &mut state,
+                            LoopRecoveryStage::Model,
+                            model_recovery_class(class),
+                            disposition,
+                        )
+                        .await?;
                     // Persist the consumed retry/observation budget before the
                     // next model attempt. Otherwise a worker restart reloads
                     // the pre-error BeforeModel checkpoint and grants the
@@ -314,7 +345,6 @@ impl ExecutorStage<ModelInput> for ModelStage {
                     safe_failure = safe_failure.with_detail(detail);
                 }
                 FailedExitDetails {
-                    diagnostic_ref: summary.diagnostic_ref.clone(),
                     safe_summary: Some(safe_failure),
                     explanation_message_ref: None,
                 }
@@ -372,7 +402,6 @@ fn prepare_model_retry_alteration(
     scope: RetryScope,
     alteration: Option<&RetryAlteration>,
 ) -> Result<ModelRetryAction, AgentLoopExecutorError> {
-    honor_retry_alteration(alteration)?;
     state.pending_model_retry_directive = None;
     match alteration {
         Some(RetryAlteration::Backoff { .. }) => {}
@@ -394,7 +423,20 @@ fn prepare_model_retry_alteration(
             state.pending_model_retry_directive =
                 Some(PendingModelRetryDirective::RepairInvalidOutput);
         }
-        Some(RetryAlteration::AdvanceFallback) | None => {}
+        Some(RetryAlteration::AdvanceFallback) => {
+            if scope != RetryScope::Call {
+                return Err(AgentLoopExecutorError::PlannerContract {
+                    detail: "fallback advancement requires call scope",
+                });
+            }
+            state.model_state.fallback_index =
+                state.model_state.fallback_index.checked_add(1).ok_or(
+                    AgentLoopExecutorError::PlannerContract {
+                        detail: "fallback model route index overflowed",
+                    },
+                )?;
+        }
+        None => {}
     }
 
     Ok(match scope {

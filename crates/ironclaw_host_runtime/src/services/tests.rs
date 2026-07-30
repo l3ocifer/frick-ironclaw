@@ -13,7 +13,7 @@ use ironclaw_capabilities::{
     CapabilityObligationRequest,
 };
 use ironclaw_extensions::{ExtensionManifest, ExtensionPackage, ExtensionRegistry, ManifestSource};
-use ironclaw_filesystem::{DiskFilesystem, InMemoryBackend};
+use ironclaw_filesystem::DiskFilesystem;
 use ironclaw_host_api::{
     AgentId, CapabilityDescriptor, CapabilityDispatchResult, CapabilityId, CapabilitySet,
     CorrelationId, DispatchError, EffectKind, ExecutionContext, ExtensionId, HostPortCatalog,
@@ -27,7 +27,6 @@ use ironclaw_host_api::{
 use ironclaw_network::{
     NetworkHttpEgress, NetworkHttpError, NetworkHttpRequest, NetworkHttpResponse, NetworkUsage,
 };
-use ironclaw_processes::{ProcessResultStore, ProcessStore};
 use ironclaw_resources::{
     InMemoryResourceGovernor, ResourceAccount, ResourceGovernor, ResourceTally,
 };
@@ -41,10 +40,10 @@ use super::{
     CapabilitySurfaceVersion, ConfiguredInvocationServicesResolver, DeploymentMode,
     EffectiveRuntimePolicy, FilesystemBackendKind, FirstPartyCapabilityRegistry,
     FirstPartyRuntimeAdapter, HostProcessPort, HostRuntimeHttpEgressPort, HostRuntimeServices,
-    McpRuntimeAdapter, NetworkMode, ProcessBackendKind, ProcessResultStorePort, ProcessStorePort,
-    ProductionWiringComponent, ProductionWiringConfig, ProductionWiringIssueKind, RootFilesystem,
-    RuntimeAdapter, RuntimeAdapterResult, RuntimeLaneExecutor, RuntimeLaneRequest, RuntimeProfile,
-    SecretMode, ServiceResolvedRuntimeAdapter,
+    McpRuntimeAdapter, NetworkMode, ProcessBackendKind, ProductionWiringComponent,
+    ProductionWiringConfig, ProductionWiringIssueKind, RootFilesystem, RuntimeAdapter,
+    RuntimeAdapterResult, RuntimeLaneExecutor, RuntimeLaneRequest, RuntimeProfile, SecretMode,
+    ServiceResolvedRuntimeAdapter,
 };
 #[cfg(unix)]
 use crate::CommandExecutionRequest;
@@ -95,6 +94,23 @@ async fn production_wiring_reports_local_only_persistent_approval_policies() {
     assert!(report.contains(
         ProductionWiringComponent::PersistentApprovalPolicies,
         ProductionWiringIssueKind::LocalOnlyImplementation
+    ));
+}
+
+// `registered_runtime_backends()` has no Sandbox backend field: there is no
+// production Sandbox runtime to wire up yet. A `RuntimeKind::Sandbox` entry in
+// `required_runtime_backends` must therefore surface as `UnsupportedRequirement`
+// — exactly like `RuntimeKind::System` — rather than being silently accepted by
+// the safe-runtimes catch-all arm.
+#[tokio::test]
+async fn production_wiring_reports_unsupported_sandbox_runtime_requirement() {
+    let report = test_services()
+        .validate_production_wiring(&ProductionWiringConfig::new([RuntimeKind::Sandbox]))
+        .expect_err("Sandbox runtime requirement is not production-wired");
+
+    assert!(report.contains(
+        ProductionWiringComponent::RuntimeBackend,
+        ProductionWiringIssueKind::UnsupportedRequirement
     ));
 }
 
@@ -1172,12 +1188,7 @@ async fn first_party_adapter_releases_reservation_when_planner_denies() {
     );
 }
 
-fn test_services() -> HostRuntimeServices<
-    DiskFilesystem,
-    InMemoryResourceGovernor,
-    ProcessStore<InMemoryBackend>,
-    ProcessResultStore<InMemoryBackend>,
-> {
+fn test_services() -> HostRuntimeServices<DiskFilesystem, InMemoryResourceGovernor> {
     HostRuntimeServices::new(
         Arc::new(ExtensionRegistry::new()),
         Arc::new(DiskFilesystem::new()),
@@ -1188,13 +1199,8 @@ fn test_services() -> HostRuntimeServices<
     )
 }
 
-fn configured_egress<
-    F: RootFilesystem + 'static,
-    G: ResourceGovernor + 'static,
-    S: ProcessStorePort + 'static,
-    R: ProcessResultStorePort + 'static,
->(
-    services: &HostRuntimeServices<F, G, S, R>,
+fn configured_egress<F: RootFilesystem + 'static, G: ResourceGovernor + 'static>(
+    services: &HostRuntimeServices<F, G>,
 ) -> Arc<dyn RuntimeHttpEgress> {
     services
         .runtime_http_egress
@@ -1246,8 +1252,8 @@ fn policy_with(
 ) -> EffectiveRuntimePolicy {
     EffectiveRuntimePolicy {
         deployment: DeploymentMode::LocalSingleUser,
-        requested_profile: RuntimeProfile::LocalDev,
-        resolved_profile: RuntimeProfile::LocalDev,
+        requested_profile: RuntimeProfile::LocalHost,
+        resolved_profile: RuntimeProfile::LocalHost,
         filesystem_backend,
         process_backend,
         network_mode,

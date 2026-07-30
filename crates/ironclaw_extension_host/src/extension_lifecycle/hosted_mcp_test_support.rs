@@ -13,8 +13,6 @@ use ironclaw_host_api::{
 pub struct HostedMcpDiscoveryEgress {
     tool_name: String,
     read_only: bool,
-    methods: std::sync::Mutex<Vec<String>>,
-    credential_counts: std::sync::Mutex<Vec<usize>>,
 }
 
 impl Default for HostedMcpDiscoveryEgress {
@@ -30,8 +28,6 @@ impl HostedMcpDiscoveryEgress {
         Self {
             tool_name: tool_name.to_string(),
             read_only: false,
-            methods: std::sync::Mutex::new(Vec::new()),
-            credential_counts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -41,22 +37,6 @@ impl HostedMcpDiscoveryEgress {
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
         self
-    }
-
-    #[allow(dead_code)]
-    pub fn methods(&self) -> Vec<String> {
-        self.methods
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    #[allow(dead_code)]
-    pub fn credential_counts(&self) -> Vec<usize> {
-        self.credential_counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 }
 
@@ -87,14 +67,6 @@ impl RuntimeHttpEgress for HostedMcpDiscoveryEgress {
                 request_bytes: request.body.len() as u64,
                 response_bytes: 0,
             })?;
-        self.methods
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(method.to_string());
-        self.credential_counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(request.credential_injections.len());
         match method {
             "initialize" => runtime_json_response(
                 body["id"].as_u64(),
@@ -173,6 +145,7 @@ fn runtime_json_response(
 pub struct HostedMcpDiscoveryNetworkScript {
     tool_name: String,
     tool_description: String,
+    destructive_hint: bool,
     authorized_methods: std::sync::Mutex<Vec<(String, bool)>>,
 }
 
@@ -181,12 +154,25 @@ impl HostedMcpDiscoveryNetworkScript {
         Self {
             tool_name: tool_name.to_string(),
             tool_description: format!("Scripted hosted MCP tool {tool_name}"),
+            destructive_hint: false,
             authorized_methods: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     pub fn with_tool_description(mut self, tool_description: impl Into<String>) -> Self {
         self.tool_description = tool_description.into();
+        self
+    }
+
+    /// Annotate the scripted tool `destructiveHint: true` instead of the
+    /// default `readOnlyHint: true`, so discovery derives
+    /// `EffectKind::ExternalWrite` for the discovered capability even when
+    /// the provider's bundled/static manifest declares no `external_write`
+    /// effect at all. Used to prove the authority ceiling published at
+    /// activation reflects live discovery output, not just the seed
+    /// manifest's declared effects.
+    pub fn with_destructive_hint(mut self) -> Self {
+        self.destructive_hint = true;
         self
     }
 
@@ -241,7 +227,11 @@ impl ironclaw_network::NetworkHttpEgress for HostedMcpDiscoveryNetworkScript {
                         "properties": {"query": {"type": "string"}},
                         "required": ["query"]
                     },
-                    "annotations": {"readOnlyHint": true}
+                    "annotations": if self.destructive_hint {
+                        serde_json::json!({"destructiveHint": true})
+                    } else {
+                        serde_json::json!({"readOnlyHint": true})
+                    }
                 }]
             }),
             _ => return Err(invalid("unexpected_json_rpc_method")),

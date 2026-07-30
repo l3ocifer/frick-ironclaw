@@ -18,7 +18,7 @@
 //!   `ironclaw_conversations` using trusted installation configuration for
 //!   tenant/default scope selection.
 //! - [`IdempotencyLedger`] — durable action deduplication port.
-//! - [`InMemoryIdempotencyLedger`] — local-dev/test ledger with in-flight lease
+//! - [`InMemoryIdempotencyLedger`] — standalone/test ledger with in-flight lease
 //!   recovery semantics.
 //! - [`ProductInboundAction`] — durable ledger record for inbound actions.
 
@@ -31,11 +31,14 @@ mod approval_prompt;
 mod auth_continuation;
 mod auth_interaction;
 mod auth_prompt;
+mod automation_product_service;
 mod automation_thread_metadata;
 mod binding;
 mod binding_ref;
+mod command_admission;
 mod command_dispatch;
 mod commands;
+mod communication_context;
 mod conversation_binding;
 mod error;
 mod extension_account_setup;
@@ -52,11 +55,18 @@ mod ledger;
 mod lifecycle;
 mod outbound_delivery;
 mod policy;
+mod product_auth_prompt;
 mod product_surface_inbound;
+mod project_create_capability;
+mod project_service;
 pub mod projection;
 mod reborn_services;
 mod run_delivery;
 mod workflow;
+
+pub use product_auth_prompt::{blocked_auth_flow_canceller, product_auth_challenge_provider};
+pub use project_create_capability::{PROJECT_CREATE_CAPABILITY_ID, project_create_capability};
+pub use project_service::RebornProjectService;
 
 pub use action::{
     ActionDispatchKind, ActionFingerprintKey, ActionPhase, AuthRequestRef, LinkedThreadActionId,
@@ -93,8 +103,9 @@ pub use auth_interaction::{
 };
 pub use auth_prompt::{
     AuthChallengeProvider, AuthChallengeView, BlockedAuthFlowCanceller, BlockedAuthPromptRequest,
-    auth_prompt_view_for_blocked_auth,
+    PairingAuthChallengeView, auth_prompt_view_for_blocked_auth,
 };
+pub use automation_product_service::RebornAutomationProductService;
 pub use automation_thread_metadata::{
     AUTOMATION_TRIGGER_THREAD_SOURCE_TAG, automation_trigger_thread_metadata_json,
     thread_metadata_is_automation_trigger,
@@ -103,15 +114,20 @@ pub use binding::{
     ConversationBindingService, ProductConversationRouteKind, ResolveBindingRequest,
     ResolvedBinding, route_kind_for_inbound_payload,
 };
+pub use command_admission::{CommandActorRoleResolver, DirectConversationCommandAdmission};
 pub use command_dispatch::{
     ProductCommandAdmission, ProductCommandAdmissionService, ProductCommandContext,
     RejectingProductCommandAdmissionService,
 };
 pub use commands::{
-    PRODUCT_LIFECYCLE_COMMAND_OPERATION_ID, PRODUCT_MODEL_COMMAND_OPERATION_ID, ProductCommand,
+    CommandAudience, CommandResultField, CommandResultView, PRODUCT_LIFECYCLE_COMMAND_OPERATION_ID,
+    PRODUCT_MODEL_COMMAND_OPERATION_ID, PRODUCT_STATUS_COMMAND_OPERATION_ID, ProductCommand,
     ProductCommandDescriptor, ProductLifecycleCommandInput, ProductModelCommand,
-    ProductModelCommandInput, product_command_descriptors,
+    ProductModelCommandInput, ProductStatusCommandInput, UnknownProductCommandName,
+    declared_command_help_text, product_command_descriptors, render_command_result_text,
+    required_audience, validate_declared_product_command,
 };
+pub use communication_context::RuntimeCommunicationContextProvider;
 pub use conversation_binding::{
     ProductActorBindingPolicy, ProductActorUserResolutionRequest, ProductActorUserResolver,
     ProductConversationBindingService, ProductConversationRouteKey,
@@ -173,7 +189,8 @@ pub use ironclaw_host_api::product_adapter::{
     ProtocolAuthFailure, ProtocolHttpEgress, ProtocolHttpEgressError, REDACTED_PLACEHOLDER,
     RedactedDebug, RedactedString, ScopedApprovalResolutionPayload, TargetCandidate, TargetQuery,
     TrustedInboundContext, UserMessagePayload, VerifiedAuthClaim, VerifiedInbound,
-    parse_interaction_resolution_text, parse_product_slash_command, strip_wrapping_inline_code,
+    classify_channel_inbound_text, parse_interaction_resolution_text, parse_product_slash_command,
+    strip_wrapping_inline_code,
 };
 #[cfg(feature = "host-auth-mint")]
 pub use ironclaw_host_api::product_adapter::{
