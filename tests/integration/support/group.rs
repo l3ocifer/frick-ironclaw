@@ -383,7 +383,7 @@ impl GroupCapability {
             }
         };
         let store =
-            ironclaw_reborn_composition::test_support::open_local_dev_extension_installation_store_for_test(
+            ironclaw_reborn_composition::test_support::open_standalone_extension_installation_store_for_test(
                 &harness.storage_root_for_test(),
             )
             .await?;
@@ -1527,7 +1527,7 @@ impl<'g> RebornThreadBuilder<'g> {
                 "with_real_gate_dispatch_services requires a harness built via new_with_options",
             )?;
             let approval_interaction_service = reborn_services
-                .local_dev_approval_interaction_service_with_process_gates_for_test(
+                .standalone_approval_interaction_service_with_turn_state_for_test(
                     Arc::clone(&shared.coordinator),
                     shared.process_system.gates(),
                 )?
@@ -1535,7 +1535,7 @@ impl<'g> RebornThreadBuilder<'g> {
                     "local-dev approval interaction service unavailable (harness has no local runtime)",
                 )?;
             let auth_interaction_service = reborn_services
-                .local_dev_auth_interaction_service_with_process_gates_for_test(
+                .standalone_auth_interaction_service_with_turn_state_for_test(
                     Arc::clone(&shared.coordinator),
                     shared.process_system.gates(),
                 )

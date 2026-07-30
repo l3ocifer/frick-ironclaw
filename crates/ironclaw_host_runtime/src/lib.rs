@@ -549,7 +549,7 @@ pub enum RuntimeBlockedReason {
 ///
 /// Raw transport errors can contain URLs, query strings, host paths, proxy
 /// details, or credential-shaped text. Keep this disabled unless debugging a
-/// trusted `LocalDev` or `LocalYolo` run. Hosted and enterprise deployments
+/// trusted `Standalone` or `LocalYolo` run. Hosted and enterprise deployments
 /// never enable raw diagnostics from this environment variable alone.
 pub(crate) const UNSAFE_RAW_HTTP_EGRESS_ERRORS_ENV: &str = "IRONCLAW_UNSAFE_RAW_HTTP_EGRESS_ERRORS";
 
@@ -568,7 +568,7 @@ pub(crate) fn local_runtime_allows_unsafe_raw_http_diagnostics(
     matches!(deployment, DeploymentMode::LocalSingleUser)
         && matches!(
             profile,
-            RuntimeProfile::LocalDev | RuntimeProfile::LocalYolo
+            RuntimeProfile::LocalHost | RuntimeProfile::LocalYolo
         )
 }
 
@@ -581,10 +581,10 @@ mod raw_http_diagnostic_policy_tests {
     use super::*;
 
     #[test]
-    fn raw_http_diagnostics_are_limited_to_local_dev_and_yolo_profiles() {
+    fn raw_http_diagnostics_are_limited_to_standalone_and_yolo_profiles() {
         assert!(local_runtime_allows_unsafe_raw_http_diagnostics(
             DeploymentMode::LocalSingleUser,
-            RuntimeProfile::LocalDev,
+            RuntimeProfile::LocalHost,
         ));
         assert!(local_runtime_allows_unsafe_raw_http_diagnostics(
             DeploymentMode::LocalSingleUser,

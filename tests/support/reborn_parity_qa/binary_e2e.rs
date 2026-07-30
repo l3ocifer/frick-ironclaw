@@ -1070,7 +1070,7 @@ impl RebornBinaryE2EHarness {
         self.resume_with_gate(run_id, blocked).await
     }
 
-    pub async fn approve_and_resume_local_dev_gate(
+    pub async fn approve_and_resume_standalone_gate(
         &self,
         run_id: TurnRunId,
     ) -> HarnessResult<GateRef> {
@@ -1080,7 +1080,7 @@ impl RebornBinaryE2EHarness {
             .gate_ref
             .ok_or("blocked run missing gate ref")?;
         self.capability_recorder
-            .approve_local_dev_gate(&blocked)
+            .approve_standalone_gate(&blocked)
             .await?;
         self.resume_with_gate(run_id, blocked.clone()).await?;
         Ok(blocked)
