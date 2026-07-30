@@ -22,13 +22,14 @@ use ironclaw_filesystem::{
     DirEntry, DiskFilesystem, FileStat, FileType, FilesystemError, FilesystemOperation,
     RootFilesystem,
 };
+use ironclaw_host_api::FailureKind;
 use ironclaw_host_api::dispatch_test_support::TestDispatcher;
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
     CapabilitySurfacePolicy, CapabilitySurfaceVersion, DefaultHostRuntime, HTTP_CAPABILITY_ID,
-    HostRuntime, MAX_HOT_PROMPT_BYTES, MAX_HOT_SCHEMA_BYTES, RuntimeCapabilityOutcome,
-    RuntimeFailureKind, SurfaceKind, VisibleCapabilityAccess, VisibleCapabilityRequest,
-    VisibleCapabilitySurface, builtin_first_party_package, publish_hot_capability_catalog,
+    HostRuntime, MAX_HOT_PROMPT_BYTES, MAX_HOT_SCHEMA_BYTES, RuntimeCapabilityOutcome, SurfaceKind,
+    VisibleCapabilityAccess, VisibleCapabilityRequest, VisibleCapabilitySurface,
+    builtin_first_party_package, publish_hot_capability_catalog,
 };
 use ironclaw_trust::{
     AdminConfig, AdminEntry, AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment,
@@ -1061,7 +1062,7 @@ async fn hidden_capability_direct_invoke_still_fails_closed_through_authorizatio
         dispatcher.clone(),
         Arc::new(GrantAuthorizer),
         CapabilitySurfaceVersion::new("surface-v1").unwrap(),
-        local_dev_runtime_policy(),
+        standalone_runtime_policy(),
     )
     .with_trust_policy(Arc::new(trust_policy_for([(
         "echo",
@@ -1587,7 +1588,7 @@ async fn runtime_policy_denied_extension_invoke_does_not_dispatch() {
     let RuntimeCapabilityOutcome::Failed(failure) = outcome else {
         panic!("expected runtime-policy failure, got {outcome:?}");
     };
-    assert_eq!(failure.kind, RuntimeFailureKind::Authorization);
+    assert_eq!(failure.kind, FailureKind::Authorization);
     assert_eq!(failure.capability_id, capability_id("echo.say"));
     // Message is the sanitized `DenyReason::PolicyDenied` form the kernel produces
     // (see #6386): it conveys a policy denial and must not leak the internal
@@ -1633,7 +1634,7 @@ async fn runtime_policy_denied_secret_invoke_does_not_dispatch() {
     let RuntimeCapabilityOutcome::Failed(failure) = outcome else {
         panic!("expected runtime-policy failure, got {outcome:?}");
     };
-    assert_eq!(failure.kind, RuntimeFailureKind::Authorization);
+    assert_eq!(failure.kind, FailureKind::Authorization);
     assert_eq!(failure.capability_id, capability_id("secret-tool.read"));
     // Sanitized `DenyReason::PolicyDenied` message (see #6386): conveys a policy
     // denial without leaking the internal `SecretMode::` planner enum token.
@@ -1681,7 +1682,7 @@ async fn runtime_policy_denied_mcp_http_invoke_does_not_dispatch_when_effect_und
     let RuntimeCapabilityOutcome::Failed(failure) = outcome else {
         panic!("expected runtime-policy failure, got {outcome:?}");
     };
-    assert_eq!(failure.kind, RuntimeFailureKind::Authorization);
+    assert_eq!(failure.kind, FailureKind::Authorization);
     assert_eq!(failure.capability_id, capability_id("mcp.search"));
     // Sanitized `DenyReason::PolicyDenied` message (see #6386): conveys a policy
     // denial without leaking the internal `NetworkMode::` planner enum token.
@@ -1835,11 +1836,11 @@ fn visible_ids(surface: &VisibleCapabilitySurface) -> Vec<CapabilityId> {
         .collect()
 }
 
-fn local_dev_runtime_policy() -> EffectiveRuntimePolicy {
+fn standalone_runtime_policy() -> EffectiveRuntimePolicy {
     EffectiveRuntimePolicy {
         deployment: DeploymentMode::LocalSingleUser,
-        requested_profile: RuntimeProfile::LocalDev,
-        resolved_profile: RuntimeProfile::LocalDev,
+        requested_profile: RuntimeProfile::LocalHost,
+        resolved_profile: RuntimeProfile::LocalHost,
         filesystem_backend: FilesystemBackendKind::HostWorkspace,
         process_backend: ProcessBackendKind::LocalHost,
         network_mode: NetworkMode::DirectLogged,
@@ -2018,7 +2019,7 @@ fn runtime_with_dispatcher(
         dispatcher,
         authorizer,
         CapabilitySurfaceVersion::new("surface-v1").unwrap(),
-        local_dev_runtime_policy(),
+        standalone_runtime_policy(),
     )
 }
 

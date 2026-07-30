@@ -25,7 +25,12 @@ from emulate_provider import (
     slack_post,
 )
 from helpers import EMULATE_GITHUB_BEARER, EMULATE_SLACK_BEARER
-from journey_cases import PROVIDER_JOURNEY_RUN_IDS, PROVIDER_JOURNEY_RUNS
+from journey_cases import (
+    PROVIDER_JOURNEY_RUN_IDS,
+    PROVIDER_JOURNEY_RUNS,
+    journey_order_is_reversed,
+    shared_world_provider_journey_runs,
+)
 from provider_capability_inventory import (
     EMULATE_SUPPORTED_TOOLS,
     capability_id_to_wire_name,
@@ -575,8 +580,13 @@ def _provider_leg(trace: dict, provider_tools: frozenset[str]) -> dict:
     }
 
 
-def _result_binding(tool: str, *fields: str) -> dict:
-    return {"$trace_result": {"tool": tool, "fields": list(fields)}}
+def _result_binding(tool_call_id: str, pointer: str) -> dict:
+    return {
+        "$trace_result": {
+            "tool_call_id": tool_call_id,
+            "pointer": pointer,
+        }
+    }
 
 
 def _inject_deferred_tool_disclosure(trace: dict) -> None:
@@ -604,14 +614,47 @@ def _inject_deferred_tool_disclosure(trace: dict) -> None:
                 "type": "tool_calls",
                 "tool_calls": [
                     {
+                        "id": f"call_disclose_{index}",
                         "name": "capability_info",
                         "arguments": {"name": name.replace("__", ".")},
                     }
-                    for name in provider_names
+                    for index, name in enumerate(provider_names)
                 ],
             }
         },
     )
+
+
+def test_injected_deferred_tool_disclosures_have_stable_ids():
+    trace = {
+        "steps": [
+            {"response": {"type": "user_input", "content": "inspect Slack"}},
+            {
+                "response": {
+                    "type": "tool_calls",
+                    "tool_calls": [
+                        {
+                            "id": "call_whoami",
+                            "name": "slack__whoami",
+                            "arguments": {},
+                        }
+                    ],
+                }
+            },
+            {"response": {"type": "text", "content": "done"}},
+        ]
+    }
+
+    _inject_deferred_tool_disclosure(trace)
+
+    disclosure_calls = trace["steps"][1]["response"]["tool_calls"]
+    assert disclosure_calls == [
+        {
+            "id": "call_disclose_0",
+            "name": "capability_info",
+            "arguments": {"name": "slack.whoami"},
+        }
+    ]
 
 
 def _coalesce_independent_provider_reads(trace: dict, batch_size: int = 25) -> None:
@@ -648,8 +691,8 @@ def _coalesce_independent_provider_reads(trace: dict, batch_size: int = 25) -> N
 
 
 def _normalize_google_arguments(trace: dict, case: str) -> None:
-    created_document = False
-    created_spreadsheet = False
+    created_document_call_id = None
+    created_spreadsheet_call_id = None
     document_upload_contents = []
     for step in trace["steps"]:
         for call in step["response"].get("tool_calls", []):
@@ -664,6 +707,7 @@ def _normalize_google_arguments(trace: dict, case: str) -> None:
     seeded_spreadsheet = (
         "sheet_reborn_bug_tracker" if case.startswith("qa_7") else "sheet_reborn_abc"
     )
+    seeded_sheet_id = 0
 
     for step in trace["steps"]:
         if "tool_calls" not in step["response"]:
@@ -675,7 +719,7 @@ def _normalize_google_arguments(trace: dict, case: str) -> None:
             _replace_value(arguments, "EMAIL_REDACTED", "e2e.google@example.com")
 
             if name == "google-docs__create_document":
-                created_document = True
+                created_document_call_id = call.get("id")
                 call["name"] = "google-drive__upload_file"
                 content = (
                     document_upload_contents[document_upload_index]
@@ -694,29 +738,31 @@ def _normalize_google_arguments(trace: dict, case: str) -> None:
                 call["name"] = "google-drive__download_file"
                 call["arguments"] = {
                     "file_id": (
-                        _result_binding("google-drive__upload_file", "id", "file_id")
-                        if created_document
+                        _result_binding(created_document_call_id, "/file/id")
+                        if created_document_call_id
                         else "drv_near_ai_strategy"
                     )
                 }
 
             if name == "google-sheets__create_spreadsheet":
-                created_spreadsheet = True
+                created_spreadsheet_call_id = call.get("id")
             elif name.startswith("google-sheets__"):
                 if "spreadsheet_id" in arguments:
                     arguments["spreadsheet_id"] = (
                         _result_binding(
-                            "google-sheets__create_spreadsheet",
-                            "spreadsheetId",
-                            "spreadsheet_id",
-                            "id",
+                            created_spreadsheet_call_id, "/spreadsheet_id"
                         )
-                        if created_spreadsheet
+                        if created_spreadsheet_call_id
                         else seeded_spreadsheet
                     )
-                if created_spreadsheet and "sheet_id" in arguments:
-                    arguments["sheet_id"] = _result_binding(
-                        "google-sheets__create_spreadsheet", "sheetId", "sheet_id"
+                if "sheet_id" in arguments:
+                    arguments["sheet_id"] = (
+                        _result_binding(
+                            created_spreadsheet_call_id,
+                            "/sheets/0/sheet_id",
+                        )
+                        if created_spreadsheet_call_id
+                        else seeded_sheet_id
                     )
 
             if name == "gmail__get_message":
@@ -731,6 +777,35 @@ def _normalize_google_arguments(trace: dict, case: str) -> None:
         if step["response"].get("type") != "tool_calls"
         or step["response"].get("tool_calls")
     ]
+
+
+def test_google_normalization_seeds_consistent_spreadsheet_and_sheet_ids():
+    trace = {
+        "steps": [
+            {
+                "response": {
+                    "type": "tool_calls",
+                    "tool_calls": [
+                        {
+                            "id": "call_format",
+                            "name": "google-sheets__format_cells",
+                            "arguments": {
+                                "spreadsheet_id": "harvested-spreadsheet",
+                                "sheet_id": 123,
+                            },
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+
+    _normalize_google_arguments(trace, "qa_7c_slack_bug_logger_routine")
+
+    assert trace["steps"][0]["response"]["tool_calls"][0]["arguments"] == {
+        "spreadsheet_id": "sheet_reborn_bug_tracker",
+        "sheet_id": 0,
+    }
 
 
 def _normalize_slack_arguments(
@@ -1284,26 +1359,33 @@ async def test_qa_journey_provider_leg_replays_through_emulate(
     journey_case,
 ):
     """Every harvested provider journey executes through standalone Reborn."""
+    await _replay_qa_journey_provider_leg(
+        reborn_qa_emulate_provider_server,
+        mock_llm_server,
+        journey_case,
+    )
+
+
+async def _replay_qa_journey_provider_leg(
+    provider_server,
+    mock_llm_server,
+    journey_case,
+) -> None:
+    """Replay one provider leg against the caller-selected provider lifecycle."""
     case = journey_case.case_id
-    server = reborn_qa_emulate_provider_server["base_url"]
+    server = provider_server["base_url"]
     trace_path = ROOT / journey_case.trace
-    if _raw_trace_uses_tool_prefix(
-        trace_path, "google-sheets__"
-    ):
+    if _raw_trace_uses_tool_prefix(trace_path, "google-sheets__"):
         async with httpx.AsyncClient(headers=google_headers(), timeout=15) as client:
-            emulate_google_url = reborn_qa_emulate_provider_server[
-                "emulate_google_url"
-            ]
+            emulate_google_url = provider_server["emulate_google_url"]
             response = await client.get(
                 f"{emulate_google_url}/v4/spreadsheets/sheet_reborn_abc"
             )
         if response.status_code == 404:
             pytest.skip("Emulate 0.7.0 does not expose the Google Sheets API")
-    if _raw_trace_uses_tool_prefix(
-        trace_path, "slack__"
-    ):
+    if _raw_trace_uses_tool_prefix(trace_path, "slack__"):
         async with httpx.AsyncClient(headers=slack_headers(), timeout=15) as client:
-            emulate_slack_url = reborn_qa_emulate_provider_server["emulate_slack_url"]
+            emulate_slack_url = provider_server["emulate_slack_url"]
             response = await client.get(f"{emulate_slack_url}/api/auth.test")
         if response.status_code == 404:
             pytest.skip("Emulate 0.7.0 does not expose Slack Web API GET routes")
@@ -1311,17 +1393,17 @@ async def test_qa_journey_provider_leg_replays_through_emulate(
         mock_llm_server,
         trace_path,
         provider_tools=PROVIDER_TOOL_NAMES,
-        slack_state=reborn_qa_emulate_provider_server["slack_state"],
+        slack_state=provider_server["slack_state"],
     )
     user_input = trace["steps"][0]["response"]["content"]
     expected_calls = _recorded_provider_calls(trace)
 
     await _assert_google_provider_baseline(
-        reborn_qa_emulate_provider_server["emulate_google_url"], case, trace
+        provider_server["emulate_google_url"], case, trace
     )
     await _assert_slack_provider_baseline(
-        reborn_qa_emulate_provider_server["emulate_slack_url"],
-        reborn_qa_emulate_provider_server["slack_state"],
+        provider_server["emulate_slack_url"],
+        provider_server["slack_state"],
         case,
         trace,
     )
@@ -1372,11 +1454,11 @@ async def test_qa_journey_provider_leg_replays_through_emulate(
             assert "channel_not_found" in assistant["content"]
 
     await _assert_google_provider_outcome(
-        reborn_qa_emulate_provider_server["emulate_google_url"], case, trace
+        provider_server["emulate_google_url"], case, trace
     )
     await _assert_slack_provider_outcome(
-        reborn_qa_emulate_provider_server["emulate_slack_url"],
-        reborn_qa_emulate_provider_server["slack_state"],
+        provider_server["emulate_slack_url"],
+        provider_server["slack_state"],
         trace,
     )
 
@@ -1387,6 +1469,51 @@ async def test_qa_journey_provider_leg_replays_through_emulate(
         "complete": True,
         "error": None,
     }
+
+
+@pytest.mark.shared_world
+async def test_mutating_qa_journeys_replay_in_reverse_against_shared_provider_world(
+    reborn_qa_emulate_runtime,
+    resettable_emulate_provider_world,
+    mock_llm_server,
+):
+    """Reverse mutating journeys while preserving every prior provider effect."""
+    # CI sets the switch explicitly. Failing closed prevents a workflow edit
+    # from silently turning this expensive proof into another forward replay.
+    assert journey_order_is_reversed(), (
+        "shared-world reverse replay requires IRONCLAW_JOURNEY_ORDER=reverse"
+    )
+    journeys, _ = shared_world_provider_journey_runs(reverse=True)
+    mutable_services = {
+        str(world) for case in journeys for world in case.mutable_provider_worlds
+    }
+    reset_services = mutable_services - {"slack"}
+    try:
+        for journey_case in journeys:
+            await _replay_qa_journey_provider_leg(
+                reborn_qa_emulate_runtime,
+                mock_llm_server,
+                journey_case,
+            )
+    finally:
+        # Cleanup belongs after the sequence: doing any of it inside the loop
+        # would restore isolation and make reversed order unable to expose
+        # cross-journey state leakage.
+        try:
+            if "slack" in mutable_services:
+                for journey_case in journeys:
+                    if any(
+                        str(world) == "slack"
+                        for world in journey_case.mutable_provider_worlds
+                    ):
+                        await _cleanup_slack_provider_mutations(
+                            reborn_qa_emulate_runtime["emulate_slack_url"],
+                            reborn_qa_emulate_runtime["slack_state"],
+                            journey_case.case_id,
+                        )
+        finally:
+            if reset_services:
+                await resettable_emulate_provider_world.reset(reset_services)
 
 
 @pytest.mark.parametrize(
