@@ -8,6 +8,7 @@
 //! slice). It exists to prove the cross-module shapes fit together.
 
 use async_trait::async_trait;
+use chrono::Utc;
 use ironclaw_hooks::{
     dispatch::HookDispatcherBuilder,
     identity::{ExtensionId, HookId, HookLocalId, HookVersion},
@@ -15,11 +16,15 @@ use ironclaw_hooks::{
     points::BeforeCapabilityHookContext,
     predicate::{CapabilityPredicate, HookPredicateSpec, OnExceededAction, ValueOrRateBound},
     registry::{HookBindingScope, HookRegistry},
+    self_authored::{
+        GenerationTraceRef, SelfAuthoredBeforeCapabilityHook, SelfAuthoredHookSink,
+        SelfAuthoredHookSpec, SelfAuthoredReason, SelfAuthorshipProvenance,
+    },
     sink::{RestrictedBeforeCapabilityHook, RestrictedGateSink},
 };
 
-fn tenant() -> ironclaw_host_api::TenantId {
-    ironclaw_host_api::TenantId::new("alpha").expect("valid tenant")
+fn tenant() -> ironclaw_host_api::ids::TenantId {
+    ironclaw_host_api::ids::TenantId::new("alpha").expect("valid tenant")
 }
 
 /// Stand-in for the host's eventual predicate evaluator. In production the
@@ -80,7 +85,7 @@ async fn manifest_to_dispatch_pipeline() {
         .install_installed_before_capability(
             hook_id,
             manifest_entry.phase,
-            ironclaw_host_api::ExtensionId::new("polymarket-trader").expect("valid ext id"),
+            ironclaw_host_api::ids::ExtensionId::new("polymarket-trader").expect("valid ext id"),
             // Use Global so the dispatcher fires the hook regardless of the
             // ctx's `provider` field (the dispatch ctx in this test has no
             // provider configured). Scope filtering itself is covered by
@@ -100,4 +105,82 @@ async fn manifest_to_dispatch_pipeline() {
     let outcome = dispatcher.dispatch_before_capability(&ctx).await;
     assert!(!outcome.decision.permits());
     assert!(outcome.failures.is_empty());
+}
+
+struct SelfAuthoredDispatcherAdapter(SelfAuthoredBeforeCapabilityHook);
+
+#[async_trait]
+impl RestrictedBeforeCapabilityHook for SelfAuthoredDispatcherAdapter {
+    async fn evaluate(&self, ctx: &BeforeCapabilityHookContext, sink: &mut dyn RestrictedGateSink) {
+        struct SinkBridge<'a> {
+            sink: &'a mut dyn RestrictedGateSink,
+        }
+
+        impl SelfAuthoredHookSink for SinkBridge<'_> {
+            fn deny(&mut self, reason: SelfAuthoredReason) {
+                self.sink.deny(reason.label());
+            }
+
+            fn pause_approval(&mut self, reason: SelfAuthoredReason) {
+                self.sink.pause_approval(reason.label());
+            }
+
+            fn pause_auth(&mut self, reason: SelfAuthoredReason) {
+                self.sink.pause_auth(reason.label());
+            }
+
+            fn pass(&mut self) {
+                self.sink.pass();
+            }
+        }
+
+        let mut bridge = SinkBridge { sink };
+        self.0.evaluate(ctx, &mut bridge);
+    }
+}
+
+#[tokio::test]
+async fn self_authored_deny_flows_through_dispatcher() {
+    let extension = ExtensionId::new("self-authored").expect("valid extension id");
+    let hook_local_id = HookLocalId::new("deny-shell").expect("valid hook local id");
+    let hook_id = HookId::derive(&extension, "1.0.0", &hook_local_id, HookVersion::ONE);
+    let spec = SelfAuthoredHookSpec::DenyCapability {
+        when: CapabilityPredicate::NameEquals {
+            name: "shell.exec".to_string(),
+        },
+        reason: SelfAuthoredReason::AgentObservedNearMiss,
+    };
+    let hook = SelfAuthoredBeforeCapabilityHook::new(
+        hook_id,
+        spec.clone(),
+        SelfAuthorshipProvenance {
+            authored_by_run: ironclaw_turns::TurnRunId::new(),
+            authored_by_turn: ironclaw_turns::TurnId::new(),
+            authored_at: Utc::now(),
+            spec_digest: spec.digest(),
+            user_ratification: None,
+            generation_trace_ref: GenerationTraceRef::new("trace://test".to_string()),
+        },
+    );
+    let dispatcher = HookDispatcherBuilder::new(HookRegistry::new())
+        .install_installed_before_capability(
+            hook_id,
+            ironclaw_hooks::HookPhase::Policy,
+            ironclaw_host_api::ids::ExtensionId::new("self-authored")
+                .expect("valid host extension id"),
+            HookBindingScope::Global,
+            Box::new(SelfAuthoredDispatcherAdapter(hook)),
+        )
+        .expect("self-authored adapter installs through dispatcher")
+        .build_arc();
+
+    let denied = dispatcher
+        .dispatch_before_capability(&BeforeCapabilityHookContext::new_unresolved(
+            tenant(),
+            "shell.exec".to_string(),
+            [7u8; 32],
+        ))
+        .await;
+    assert!(!denied.decision.permits());
+    assert!(denied.failures.is_empty());
 }
