@@ -1310,6 +1310,9 @@ registerPack("en", {
   "logs.entryCount": "{count} entries",
   "logs.pausedBadge": "● paused",
   "logs.empty": "Waiting for log entries…",
+  "logs.loadOlder": "Load older logs",
+  "logs.retentionLimitReached":
+    "Showing the most recent {count} log entries. Pause live updates or narrow the filters to inspect a stable range.",
   "common.recent": "Recent",
   "common.searchChats": "Search chats...",
   "common.gatewaySession": "Gateway session",

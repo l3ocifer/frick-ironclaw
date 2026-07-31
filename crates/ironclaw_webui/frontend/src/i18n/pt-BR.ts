@@ -1207,6 +1207,9 @@ registerPack("pt-BR", {
   "logs.entryCount": "{count} entradas",
   "logs.pausedBadge": "● pausado",
   "logs.empty": "Aguardando entradas de log…",
+  "logs.loadOlder": "Carregar logs mais antigos",
+  "logs.retentionLimitReached":
+    "Mostrando as {count} entradas de log mais recentes. Pause as atualizações ao vivo ou restrinja os filtros para inspecionar um intervalo estável.",
   "common.recent": "Recente",
   "common.searchChats": "Pesquisar conversas...",
   "common.gatewaySession": "Sessão de gateway",
