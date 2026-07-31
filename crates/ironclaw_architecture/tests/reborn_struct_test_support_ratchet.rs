@@ -433,13 +433,7 @@ const FROZEN_PATH_COUNTS: &[FrozenPathCount] = &[
     FrozenPathCount {
         category: "test-support",
         item_kind: "method",
-        path: "crates/ironclaw_reborn_composition/src/support/fs/attachment_landing.rs",
-        count: 1,
-    },
-    FrozenPathCount {
-        category: "test-support",
-        item_kind: "method",
-        path: "crates/ironclaw_reborn_composition/src/support/fs/project_filesystem_reader.rs",
+        path: "crates/ironclaw_product/src/scoped_fs/attachment_landing.rs",
         count: 1,
     },
     FrozenPathCount {
