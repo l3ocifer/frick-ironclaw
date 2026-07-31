@@ -9,6 +9,8 @@ use ironclaw_auth::{
     AuthProductScope, AuthProviderId, AuthSurface, SecretCleanupAction, SecretCleanupReport,
     SecretCleanupRequest,
 };
+use ironclaw_extension_contracts::hosted_mcp::RegisterHostedMcpRequest;
+use ironclaw_extension_contracts::{state::InstallationState, surface::CapabilitySurfaceKind};
 use ironclaw_extensions::{
     CapabilityVisibility, ExtensionError, ExtensionInstallation, ExtensionInstallationError,
     ExtensionInstallationId, ExtensionLifecycleService, ExtensionManifestRecord, ExtensionPackage,
@@ -17,12 +19,9 @@ use ironclaw_extensions::{
 use ironclaw_filesystem::{FilesystemError, RootFilesystem};
 use ironclaw_host_api::{
     decision::RuntimeCredentialAuthRequirement,
-    hosted_mcp::RegisterHostedMcpRequest,
     ids::{ExtensionId, UserId, VendorId},
     product_surface::{ProductSurfaceCaller, ProductSurfaceError},
     resource::ResourceScope,
-    state::InstallationState,
-    surface::CapabilitySurfaceKind,
 };
 use ironclaw_product::{
     ChannelConnectionService, ExtensionAccountSetupDescriptor, ExtensionAccountSetupError,
@@ -356,7 +355,7 @@ impl ExtensionLifecycleManager {
         let record = crate::InstallationRecord {
             extension_id: extension_id.as_str().to_string(),
             installation_id: installation_id.as_str().to_string(),
-            state: crate::InstallationState::Installed,
+            state: ironclaw_extension_contracts::state::InstallationState::Installed,
             resolved: Arc::new(effective),
             config,
             last_error: None,
@@ -445,7 +444,7 @@ impl ExtensionLifecycleManager {
         host.install(crate::InstallationRecord {
             extension_id: package.id.as_str().to_string(),
             installation_id: format!("{}-test-install", package.id.as_str()),
-            state: crate::InstallationState::Installed,
+            state: ironclaw_extension_contracts::state::InstallationState::Installed,
             resolved: Arc::new(effective),
             config,
             last_error: None,
@@ -3623,17 +3622,19 @@ output_schema_ref = "schemas/run.output.json"
             },
         ));
 
-        let register_request = ironclaw_host_api::hosted_mcp::RegisterHostedMcpRequest {
-            desired_id: ironclaw_host_api::package_lifecycle::LifecyclePackageId::new(
+        let register_request = ironclaw_extension_contracts::hosted_mcp::RegisterHostedMcpRequest {
+            desired_id: ironclaw_extension_contracts::package_lifecycle::LifecyclePackageId::new(
                 "lock-order-register",
             )
             .expect("package id"),
             desired_name: "Lock order register fixture".to_string(),
-            endpoint: ironclaw_host_api::hosted_mcp::HostedMcpEndpoint::new(
+            endpoint: ironclaw_extension_contracts::hosted_mcp::HostedMcpEndpoint::new(
                 "https://mcp.example.test/mcp",
             )
             .expect("public fixture endpoint"),
-            auth_selection: Some(ironclaw_host_api::hosted_mcp::HostedMcpAuthSelection::Auto),
+            auth_selection: Some(
+                ironclaw_extension_contracts::hosted_mcp::HostedMcpAuthSelection::Auto,
+            ),
         };
         let register_manager = Arc::clone(&manager);
         let register_task =

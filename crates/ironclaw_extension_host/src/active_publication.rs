@@ -184,12 +184,9 @@ fn compensation_failure(
 mod tests {
     use std::sync::Arc;
 
+    use ironclaw_extension_contracts::hosted_mcp::{HostedMcpAuthSelection, HostedMcpEndpoint};
     use ironclaw_extensions::{ExtensionRegistry, SharedExtensionRegistry};
-    use ironclaw_host_api::{
-        hosted_mcp::{HostedMcpAuthSelection, HostedMcpEndpoint},
-        ids::ExtensionId,
-        runtime::TrustClass,
-    };
+    use ironclaw_host_api::{ids::ExtensionId, runtime::TrustClass};
     use ironclaw_trust::{
         AdminConfig, HostTrustPolicy, InvalidationBus, TrustPolicy, TrustProvenance,
     };

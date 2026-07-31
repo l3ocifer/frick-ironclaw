@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use ironclaw_auth::RuntimeCredentialAccountSelectionService;
-use ironclaw_host_api::{
-    hosted_mcp::RegisterHostedMcpRequest, product_surface::ProductSurfaceError,
-    state::InstallationState,
-};
+use ironclaw_extension_contracts::hosted_mcp::RegisterHostedMcpRequest;
+use ironclaw_extension_contracts::state::InstallationState;
+use ironclaw_host_api::product_surface::ProductSurfaceError;
 use ironclaw_product::{
     LifecycleExtensionSource, LifecyclePackageKind, LifecyclePackageRef, LifecycleProductAction,
     LifecycleProductContext, LifecycleProductPayload, LifecycleProductResponse,
@@ -253,10 +252,10 @@ mod tests {
     use ironclaw_auth::{
         AuthContinuationRef, AuthProductScope, AuthProviderId, AuthSurface, CredentialAccountLabel,
     };
+    use ironclaw_extension_contracts::state::InstallationState;
     use ironclaw_host_api::{
         ids::{AgentId, InvocationId, TenantId, UserId},
         resource::ResourceScope,
-        state::InstallationState,
     };
     use ironclaw_product::LifecycleExtensionSummary;
     use secrecy::SecretString;

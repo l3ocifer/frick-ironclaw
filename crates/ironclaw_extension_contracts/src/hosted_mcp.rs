@@ -6,8 +6,9 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::error::HostApiError;
-use crate::ids::ExtensionId;
+use ironclaw_host_api::error::HostApiError;
+use ironclaw_host_api::ids::ExtensionId;
+
 use crate::package_lifecycle::LifecyclePackageId;
 
 /// A bounded, redacted location advertised by a hosted MCP server while
@@ -256,7 +257,7 @@ mod tests {
 
     #[test]
     fn direct_remote_source_serializes_with_exact_endpoint() {
-        let source = crate::trust::PackageSource::DirectRemote {
+        let source = ironclaw_host_api::trust::PackageSource::DirectRemote {
             endpoint: "https://mcp.example.test/rpc?tenant=one".to_string(),
         };
         let json = serde_json::to_value(&source).expect("serialize source");
@@ -268,7 +269,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::from_value::<crate::trust::PackageSource>(json)
+            serde_json::from_value::<ironclaw_host_api::trust::PackageSource>(json)
                 .expect("deserialize source"),
             source
         );

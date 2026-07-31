@@ -44,7 +44,7 @@ use crate::builtin_capability_policy::{BuiltinApprovalPolicyAction, BuiltinCapab
 use crate::{
     RebornReadinessDiagnostic, RebornReadinessState, runtime::SKILL_ACTIVATE_CAPABILITY_ID,
 };
-use ironclaw_host_api::state::InstallationState;
+use ironclaw_extension_contracts::state::InstallationState;
 
 #[test]
 fn libsql_build_resource_governor_guard_requires_singleton_authority() {

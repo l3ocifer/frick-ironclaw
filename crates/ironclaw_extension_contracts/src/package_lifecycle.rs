@@ -10,9 +10,10 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
 
+use ironclaw_host_api::error::HostApiError;
+
 use crate::{
     channel::ChannelPresentation,
-    error::HostApiError,
     hosted_mcp::RegisterHostedMcpRequest,
     state::{InstallationState, LifecyclePublicState},
     surface::CapabilitySurfaceKind,

@@ -105,21 +105,20 @@ use secrecy::ExposeSecret;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use ironclaw_extension_contracts::hosted_mcp::{
+    HostedMcpAuthSelection, HostedMcpEndpoint, RegisterHostedMcpRequest, hosted_mcp_extension_id,
+};
+use ironclaw_extension_contracts::package_lifecycle::LifecyclePackageId;
+use ironclaw_extension_contracts::state::LifecyclePublicState;
 use ironclaw_host_api::turn::IdempotencyKey;
 use ironclaw_host_api::{
-    hosted_mcp::{
-        HostedMcpAuthSelection, HostedMcpEndpoint, RegisterHostedMcpRequest,
-        hosted_mcp_extension_id,
-    },
     ids::{ActivityId, SecretHandle, ThreadId, UserId},
-    package_lifecycle::LifecyclePackageId,
     product_surface::{
         ProductSurface, ProductSurfaceCaller, ProductSurfaceError, ProductSurfaceErrorCode,
         ProductSurfaceErrorKind, ProductSurfaceValidationCode,
     },
     resolution::{Blocked, Resolution},
     result_meta::FailureKind,
-    state::LifecyclePublicState,
 };
 use uuid::Uuid;
 

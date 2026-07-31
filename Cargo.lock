@@ -3462,6 +3462,7 @@ dependencies = [
  "hex",
  "ironclaw_auth",
  "ironclaw_common",
+ "ironclaw_extension_contracts",
  "ironclaw_extension_host",
  "ironclaw_filesystem",
  "ironclaw_first_party_extensions",
@@ -3569,6 +3570,7 @@ dependencies = [
  "ironclaw_auth",
  "ironclaw_common",
  "ironclaw_events",
+ "ironclaw_extension_contracts",
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_secrets",
@@ -3612,6 +3614,7 @@ dependencies = [
  "ironclaw_approvals",
  "ironclaw_authorization",
  "ironclaw_events",
+ "ironclaw_extension_contracts",
  "ironclaw_extensions",
  "ironclaw_filesystem",
  "ironclaw_host_api",
@@ -3720,6 +3723,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironclaw_extension_contracts"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ironclaw_host_api",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "toml 1.1.3+spec-1.1.0",
+]
+
+[[package]]
 name = "ironclaw_extension_host"
 version = "0.1.0"
 dependencies = [
@@ -3739,6 +3754,7 @@ dependencies = [
  "ironclaw_capabilities",
  "ironclaw_common",
  "ironclaw_conversations",
+ "ironclaw_extension_contracts",
  "ironclaw_extensions",
  "ironclaw_filesystem",
  "ironclaw_first_party_extensions",
@@ -3789,6 +3805,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "deadpool-postgres",
+ "ironclaw_extension_contracts",
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_trust",
@@ -3967,6 +3984,7 @@ dependencies = [
  "ironclaw_common",
  "ironclaw_event_projections",
  "ironclaw_events",
+ "ironclaw_extension_contracts",
  "ironclaw_extensions",
  "ironclaw_extractors",
  "ironclaw_filesystem",
@@ -4085,6 +4103,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "hex",
+ "ironclaw_extension_contracts",
  "ironclaw_host_api",
  "serde",
  "serde_jcs",
@@ -4141,6 +4160,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "ironclaw_extension_contracts",
  "ironclaw_extensions",
  "ironclaw_host_api",
  "ironclaw_resources",
@@ -4339,6 +4359,7 @@ dependencies = [
  "ironclaw_event_projections",
  "ironclaw_event_streams",
  "ironclaw_events",
+ "ironclaw_extension_contracts",
  "ironclaw_extensions",
  "ironclaw_filesystem",
  "ironclaw_first_party_extension_ports",
@@ -4424,6 +4445,7 @@ dependencies = [
  "ironclaw_conversations",
  "ironclaw_event_projections",
  "ironclaw_events",
+ "ironclaw_extension_contracts",
  "ironclaw_extension_host",
  "ironclaw_extensions",
  "ironclaw_filesystem",
@@ -4574,6 +4596,7 @@ dependencies = [
  "ironclaw_conversations",
  "ironclaw_event_projections",
  "ironclaw_events",
+ "ironclaw_extension_contracts",
  "ironclaw_extension_host",
  "ironclaw_extensions",
  "ironclaw_filesystem",
@@ -4865,6 +4888,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ironclaw_attachments",
+ "ironclaw_extension_contracts",
  "ironclaw_host_api",
  "proptest",
  "serde",
@@ -4912,8 +4936,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "ironclaw_attachments",
+ "ironclaw_extension_contracts",
  "ironclaw_host_api",
- "ironclaw_product",
  "ironclaw_telegram_v2_adapter",
  "serde",
  "serde_json",
@@ -5080,6 +5104,7 @@ dependencies = [
  "http-body-util",
  "ironclaw_auth",
  "ironclaw_common",
+ "ironclaw_extension_contracts",
  "ironclaw_host_api",
  "ironclaw_host_ingress",
  "ironclaw_loop_host",

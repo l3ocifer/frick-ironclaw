@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use ironclaw_extension_contracts::state::InstallationState;
 use ironclaw_host_api::{
     ids::{ExtensionId, InvocationId, UserId},
     product_surface::ProductSurfaceError,
     resource::ResourceScope,
-    state::InstallationState,
 };
 use ironclaw_product::{
     LifecyclePackageId, LifecyclePackageKind, LifecyclePackageRef, LifecycleProductAction,

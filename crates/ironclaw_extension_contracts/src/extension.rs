@@ -11,14 +11,15 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use ironclaw_host_api::{
     capability::CapabilityDescriptor,
-    channel::ChannelDescriptor,
     error::HostApiError,
     ids::{CapabilityId, ExtensionId},
     product_adapter::ChannelAdapter,
     tool_adapter::ToolAdapter,
 };
+
+use crate::channel::ChannelDescriptor;
 
 /// One loaded extension instance.
 ///
@@ -106,7 +107,7 @@ pub struct ExtensionContract {
 impl ExtensionContract {
     pub fn capability(
         &self,
-        capability_id: &crate::ids::CapabilityId,
+        capability_id: &ironclaw_host_api::ids::CapabilityId,
     ) -> Option<&CapabilityDescriptor> {
         self.capabilities
             .iter()
@@ -162,6 +163,49 @@ mod tests {
     fn extension_instance_id_accepts_installation_like_values() {
         let id = ExtensionInstanceId::new("slack:tenant-install_1").expect("valid id");
         assert_eq!(id.as_str(), "slack:tenant-install_1");
+    }
+
+    /// `CapabilityDescriptor` is a wide record; building it from its own wire
+    /// form keeps this test about the lookup rule rather than about fields the
+    /// rule never reads.
+    fn capability_descriptor(id: &str) -> CapabilityDescriptor {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "provider": "vendor",
+            "runtime": "wasm",
+            "trust_ceiling": "sandbox",
+            "description": "",
+            "parameters_schema": {},
+            "effects": [],
+            "default_permission": "ask",
+            "runtime_credentials": [],
+            "resource_profile": null,
+        }))
+        .expect("capability descriptor wire form")
+    }
+
+    #[test]
+    fn extension_contract_resolves_capabilities_by_id() {
+        let wanted = ironclaw_host_api::ids::CapabilityId::new("vendor.send").expect("capability");
+        let absent = ironclaw_host_api::ids::CapabilityId::new("vendor.read").expect("capability");
+        let contract = ExtensionContract {
+            identity: ExtensionRuntimeIdentity {
+                extension_id: ironclaw_host_api::ids::ExtensionId::new("vendor").expect("id"),
+                instance_id: ExtensionInstanceId::new("vendor:install").expect("instance"),
+            },
+            display_name: "Vendor".to_string(),
+            capabilities: vec![capability_descriptor("vendor.send")],
+            channel: None,
+        };
+
+        assert_eq!(
+            contract.capability(&wanted).map(|d| d.id.clone()),
+            Some(wanted)
+        );
+        assert!(
+            contract.capability(&absent).is_none(),
+            "lookup must discriminate, not return the first descriptor"
+        );
     }
 
     #[test]

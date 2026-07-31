@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use ironclaw_extension_contracts::hosted_mcp::{HostedMcpAuthSelection, HostedMcpEndpoint};
 use ironclaw_extensions::{
     ExtensionManifestRecord, ExtensionPackage, ManifestSource, PackageDefinitionRetention,
     PackageRootBinding,
@@ -17,7 +18,6 @@ use ironclaw_host_api::{
         CapabilityDescriptor, RuntimeCredentialAccountSetup, RuntimeCredentialRequirement,
         RuntimeCredentialRequirementSource,
     },
-    hosted_mcp::{HostedMcpAuthSelection, HostedMcpEndpoint},
     http::RuntimeCredentialTarget,
     ids::{ExtensionId, SecretHandle, VendorId},
 };
@@ -36,7 +36,7 @@ use crate::{
 pub(crate) fn registration_response(package_ref: LifecyclePackageRef) -> LifecycleProductResponse {
     LifecycleProductResponse {
         package_ref: Some(package_ref),
-        phase: ironclaw_host_api::state::InstallationState::Installed,
+        phase: ironclaw_extension_contracts::state::InstallationState::Installed,
         blockers: Vec::new(),
         message: Some("Hosted MCP registration accepted.".to_string()),
         payload: Some(LifecycleProductPayload::ExtensionInstall {
