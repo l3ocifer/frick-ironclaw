@@ -820,7 +820,6 @@ mod tests {
                 extension_management
                     .activate_with_prechecked_credentials_for_user_for_test(
                         package_ref,
-                        ironclaw_extension_host::ExtensionActivationMode::Static,
                         surface_user,
                     )
                     .await
@@ -5366,11 +5365,7 @@ mod tests {
                 .await
                 .expect("install github extension");
             extension_management
-                .activate_with_prechecked_credentials_for_user_for_test(
-                    package_ref,
-                    ironclaw_extension_host::ExtensionActivationMode::Static,
-                    &surface_user,
-                )
+                .activate_with_prechecked_credentials_for_user_for_test(package_ref, &surface_user)
                 .await
                 .expect("activate github extension");
         }
@@ -5469,11 +5464,7 @@ mod tests {
             .await
             .expect("install github extension");
         extension_management
-            .activate_with_prechecked_credentials_for_user_for_test(
-                package_ref,
-                ironclaw_extension_host::ExtensionActivationMode::Static,
-                &surface_user,
-            )
+            .activate_with_prechecked_credentials_for_user_for_test(package_ref, &surface_user)
             .await
             .expect("activate github extension");
 
@@ -5678,11 +5669,7 @@ mod tests {
             .await
             .expect("install github extension");
         extension_management
-            .activate_with_prechecked_credentials_for_user_for_test(
-                package_ref,
-                ironclaw_extension_host::ExtensionActivationMode::Static,
-                &surface_user,
-            )
+            .activate_with_prechecked_credentials_for_user_for_test(package_ref, &surface_user)
             .await
             .expect("activate github extension");
 
