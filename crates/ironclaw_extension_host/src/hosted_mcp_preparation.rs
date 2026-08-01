@@ -17,13 +17,17 @@ use ironclaw_host_api::{
     ids::{CapabilityId, UserId},
     resource::ResourceScope,
 };
-use ironclaw_product::{LifecyclePackageRef, LifecycleProductResponse, ProductSurfaceFailure};
+use ironclaw_product::ProductSurfaceFailure;
+use ironclaw_product_contracts::package_lifecycle::{
+    LifecyclePackageRef, LifecycleProductResponse,
+};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     AvailableExtensionCatalog, ExtensionActivationCredentialGate,
     ExtensionActivationCredentialReadiness, package_runtime_credential_auth_requirements,
 };
+use ironclaw_product_contracts::package_lifecycle::LifecyclePackageKind;
 
 pub struct HostedMcpPreparationService {
     installation_store: Arc<dyn ExtensionInstallationStorePort>,
@@ -76,8 +80,8 @@ impl HostedMcpPreparationService {
                     tracing::debug!(%error, "hosted MCP registration rejected: invalid desired id");
                     crate::hosted_mcp_manifest::name_unavailable()
                 })?;
-        let package_ref = ironclaw_product::LifecyclePackageRef::new(
-            ironclaw_product::LifecyclePackageKind::Extension,
+        let package_ref = ironclaw_product_contracts::package_lifecycle::LifecyclePackageRef::new(
+            LifecyclePackageKind::Extension,
             extension_id.as_str(),
         )?;
         // Lock order invariant: catalog write guard BEFORE operation_lock,
