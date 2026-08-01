@@ -51,7 +51,7 @@ const MODULE_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(128) {
 /// Runtime-visible request for a hook WASM module.
 #[derive(Debug)]
 pub struct WasmHookModuleRequest<'a> {
-    pub extension_id: &'a ironclaw_host_api::ExtensionId,
+    pub extension_id: &'a ironclaw_host_api::ids::ExtensionId,
     pub extension_version: &'a str,
     pub hook_local_id: &'a HookLocalId,
     pub kind: HookManifestKind,
@@ -194,8 +194,7 @@ pub struct WasmHookRuntime {
     /// Held for its `Drop` impl: signals the background epoch ticker to
     /// stop and joins the thread so the engine clone the ticker carried is
     /// released alongside this runtime.
-    #[allow(dead_code)]
-    epoch_ticker: EpochTickerHandle,
+    _epoch_ticker: EpochTickerHandle,
 }
 
 impl WasmHookRuntime {
@@ -212,7 +211,7 @@ impl WasmHookRuntime {
             engine,
             resolver,
             modules: Mutex::new(LruCache::new(MODULE_CACHE_CAPACITY)),
-            epoch_ticker,
+            _epoch_ticker: epoch_ticker,
         })
     }
 

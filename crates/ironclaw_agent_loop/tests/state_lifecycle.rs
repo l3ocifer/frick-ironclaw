@@ -12,7 +12,7 @@ use ironclaw_agent_loop::{
         test_run_context,
     },
 };
-use ironclaw_turns::{LoopExit, LoopFailureKind, run_profile::LoopRunInfoPort};
+use ironclaw_loop_contracts::{LoopExit, LoopFailureKind, LoopRunInfoPort};
 use serde_json::json;
 
 #[test]
@@ -122,6 +122,73 @@ fn legacy_checkpoint_without_model_error_observation_fields_decodes_to_defaults(
             .recovery_state
             .observation_attempted_for(ModelErrorObservationClass::InvalidOutput)
     );
+}
+
+#[test]
+fn terminal_warning_attempt_and_pending_observation_survive_checkpoint_reload() {
+    let context = test_run_context("terminal-warning-round-trip");
+    let state = LoopExecutionState::initial_for_run(&context);
+    let mut value = serde_json::to_value(&state).expect("state should serialize");
+    value
+        .as_object_mut()
+        .expect("state serializes as object")
+        .insert(
+            "terminal_warning_state".to_string(),
+            json!({
+                "attempted": ["no_progress_detected"],
+                "pending": {
+                    "schema_version": 1,
+                    "detail": {
+                        "kind": "no_progress_detected",
+                        "repeated_call_count": 4,
+                        "last_failure": "policy_denied"
+                    }
+                }
+            }),
+        );
+    let state: LoopExecutionState =
+        serde_json::from_value(value).expect("warning checkpoint state should deserialize");
+
+    let payload = serde_json::to_vec(&state).expect("state should serialize");
+    let restored =
+        LoopExecutionState::from_checkpoint_payload(&payload, CheckpointKind::BeforeModel)
+            .expect("checkpoint payload should reload");
+
+    assert_eq!(
+        restored.terminal_warning_state,
+        state.terminal_warning_state
+    );
+    assert_eq!(
+        serde_json::to_value(restored.terminal_warning_state)
+            .expect("warning state should serialize"),
+        json!({
+            "attempted": ["no_progress_detected"],
+            "pending": {
+                "schema_version": 1,
+                "detail": {
+                    "kind": "no_progress_detected",
+                    "repeated_call_count": 4,
+                    "last_failure": "policy_denied"
+                }
+            }
+        })
+    );
+}
+
+#[test]
+fn legacy_checkpoint_without_terminal_warning_state_decodes_to_default() {
+    let context = test_run_context("legacy-terminal-warning-checkpoint");
+    let state = LoopExecutionState::initial_for_run(&context);
+    let mut value = serde_json::to_value(&state).expect("state should serialize");
+    value
+        .as_object_mut()
+        .expect("state serializes as object")
+        .remove("terminal_warning_state");
+
+    let restored: LoopExecutionState =
+        serde_json::from_value(value).expect("legacy checkpoint should deserialize");
+
+    assert_eq!(restored.terminal_warning_state, Default::default());
 }
 
 #[test]

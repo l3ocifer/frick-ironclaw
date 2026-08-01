@@ -1,6 +1,6 @@
-use ironclaw_host_api::{ProductSurfaceError, ProductSurfaceErrorCode};
 use ironclaw_product::{ProductAdapterError, ProductSurfaceRejectionKind};
 use ironclaw_product::{ProductRejection, ProductRejectionKind};
+use ironclaw_product_contracts::surface::{ProductSurfaceError, ProductSurfaceErrorCode};
 use serde::{Deserialize, Serialize};
 
 use crate::OpenAiCompatRefError;

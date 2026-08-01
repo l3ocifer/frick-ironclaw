@@ -53,6 +53,15 @@ const AMBIGUOUS_RUN_ID = Symbol("ambiguous-run-id");
 //
 // The typed branches are still handled for forwards-compat if the
 // runtime starts emitting them.
+/**
+ * Builds the WebChat event handler.
+ *
+ * `t` is a required translator injected by `useChat` from `useT()`. Validate it
+ * here so a missing provider fails at hook construction instead of only when a
+ * later failure event attempts to render localized copy.
+ *
+ * @throws {TypeError} When `t` is not a translation function.
+ */
 export function useChatEvents({
   threadId,
   setMessages,
@@ -66,7 +75,11 @@ export function useChatEvents({
   connectionContextForRunFailure = emptyConnectionContext,
   onStreamError = noop,
   onRunSettled,
+  t,
 }) {
+  if (typeof t !== "function") {
+    throw new TypeError("useChatEvents requires a translation function");
+  }
   // Track which runIds we've already settled so that SSE replays
   // (reconnect with `last-event-id`, repeated snapshots) don't trigger
   // duplicate timeline refetches. A run settles on ANY terminal status,
@@ -229,6 +242,7 @@ export function useChatEvents({
             failureCategory: failureCategoryFromRunState(runState),
             failureSummary: null,
             connectionContextForRunFailure,
+            t,
           });
           settleRun(settledRunsRef, onRunSettled, runId, false);
           return;
@@ -255,6 +269,7 @@ export function useChatEvents({
             error: frame.error,
             kind: frame.kind,
             retryable: false,
+            t,
           });
           return;
         }
@@ -278,6 +293,7 @@ export function useChatEvents({
             toolActivityStateRef,
             noteConnectionInterruptedRunId,
             connectionContextForRunFailure,
+            t,
           });
           return;
         }
@@ -299,6 +315,7 @@ export function useChatEvents({
       noteConnectionInterruptedRunId,
       connectionContextForRunFailure,
       onRunSettled,
+      t,
     ],
   );
 }
@@ -407,6 +424,7 @@ function applyProjectionItems({
   toolActivityStateRef,
   noteConnectionInterruptedRunId,
   connectionContextForRunFailure,
+  t,
 }) {
   // Snapshot the most recent run id so stale terminal run_status frames can
   // be filtered while a locally resolved gate is resuming a newer run.
@@ -493,6 +511,7 @@ function applyProjectionItems({
             promptRunIdRef,
             locallyResolvedGatesRef,
             connectionContextForRunFailure,
+            t,
           });
           activeRunId = null;
         }
@@ -572,6 +591,7 @@ function applyProjectionItems({
             failureCategory,
             failureSummary,
             connectionContextForRunFailure,
+            t,
           });
         }
       } else if (!PROMPT_RUN_STATUSES.has(status)) {
@@ -592,31 +612,42 @@ function applyProjectionItems({
       const messageId = `text-${item.text.id}`;
       const textRunId = item.text.run_id || null;
       setMessages((prev) => {
+        const phaseAware = textRunId
+          ? prev.map((message) =>
+              message?.role === "assistant" &&
+              message.turnRunId === textRunId &&
+              message.isFinalReply === false &&
+              message.id !== messageId
+                ? { ...message, isStreaming: false }
+                : message,
+            )
+          : prev;
         if (
           textRunId &&
-          prev.some((m) => isFinalAssistantForRun(m, textRunId))
+          phaseAware.some((m) => isFinalAssistantForRun(m, textRunId))
         ) {
-          return prev;
+          return phaseAware;
         }
         const timelineMessageId = item.text.id ? `msg-${item.text.id}` : null;
-        const existing = prev.findIndex(
+        const existing = phaseAware.findIndex(
           (m) => m.id === messageId || (timelineMessageId && m.id === timelineMessageId),
         );
         const next = {
-          ...(existing >= 0 ? prev[existing] : {}),
+          ...(existing >= 0 ? phaseAware[existing] : {}),
           id: messageId,
           role: "assistant",
           content: item.text.body || "",
-          timestamp: prev[existing]?.timestamp || new Date().toISOString(),
-          turnRunId: prev[existing]?.turnRunId || textRunId,
+          timestamp: phaseAware[existing]?.timestamp || new Date().toISOString(),
+          turnRunId: phaseAware[existing]?.turnRunId || textRunId,
           isFinalReply: false,
+          isStreaming: true,
         };
         if (existing >= 0) {
-          const copy = [...prev];
+          const copy = [...phaseAware];
           copy[existing] = next;
           return copy;
         }
-        return [...prev, next];
+        return [...phaseAware, next];
       });
     }
 
@@ -748,6 +779,7 @@ function settleTerminalRunAfterResolvedPrompt({
   promptRunIdRef,
   locallyResolvedGatesRef,
   connectionContextForRunFailure,
+  t,
 }) {
   setIsProcessing(false);
   setPendingGate(null);
@@ -765,6 +797,7 @@ function settleTerminalRunAfterResolvedPrompt({
       failureCategory,
       failureSummary,
       connectionContextForRunFailure,
+      t,
     });
   }
 }
@@ -791,6 +824,7 @@ function appendRunFailureMessage(
     failureCategory,
     failureSummary,
     connectionContextForRunFailure,
+    t,
   },
 ) {
   // Dedup by `err-<runId>` so replays of the same projection
@@ -810,7 +844,7 @@ function appendRunFailureMessage(
       failureCategory,
       failureSummary,
       ...connectionContext,
-    });
+    }, t);
     if (existing >= 0) {
       const hasUsefulUpdate = Boolean(failureSummary || failureCategory);
       if (!hasUsefulUpdate || prev[existing].content === content) return prev;
@@ -864,7 +898,7 @@ function promotedRunFailureMessage(message, messageId) {
     : message;
 }
 
-function appendStreamFailureMessage(setMessages, { error, kind, retryable }) {
+function appendStreamFailureMessage(setMessages, { error, kind, retryable, t }) {
   const baseMessageId = streamFailureMessageId({ error, kind, retryable });
   setMessages((prev) => {
     const lastMessage = prev[prev.length - 1];
@@ -874,7 +908,7 @@ function appendStreamFailureMessage(setMessages, { error, kind, retryable }) {
       ...prev,
       createErrorChatMessage({
         id: messageId,
-        content: failureMessageForStreamError({ error, kind, retryable }),
+        content: failureMessageForStreamError({ error, kind, retryable }, t),
         timestamp: new Date().toISOString(),
       }),
     ];
