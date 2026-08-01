@@ -126,12 +126,14 @@ pub use commands::{
     required_audience, validate_declared_product_command,
 };
 pub use communication_context::RuntimeCommunicationContextProvider;
+// `ProductConversationRouteKey`, `ProductConversationSubjectRouteResolutionRequest`,
+// and `ProductConversationSubjectRouteResolver` are deliberately absent: they
+// moved to `ironclaw_product_contracts::subject_route` (WS2.2), and that crate
+// grants no second import path (`reborn_product_contract_location_scan.rs`).
 pub use conversation_binding::{
     ProductActorBindingPolicy, ProductActorUserResolutionRequest, ProductActorUserResolver,
-    ProductConversationBindingService, ProductConversationRouteKey,
-    ProductConversationSubjectRouteResolutionRequest, ProductConversationSubjectRouteResolver,
-    ProductInstallationKey, ProductInstallationScope, ResolvedProductActorUser,
-    StaticProductActorUserResolver, StaticProductInstallationResolver,
+    ProductConversationBindingService, ProductInstallationKey, ProductInstallationScope,
+    ResolvedProductActorUser, StaticProductActorUserResolver, StaticProductInstallationResolver,
 };
 pub use error::{
     AuthContinuationRejectionKind, ProductSurfaceFailure, lifecycle_product_surface_error,
@@ -434,11 +436,14 @@ pub use reborn_services::{
     set_outbound_delivery_target_for_model,
 };
 
+pub use ironclaw_product_contracts::inbound_requests::{
+    ProductCancelReason, ProductCancelRunRequest, ProductCreateThreadRequest,
+    ProductGateResolution, ProductInboundAttachment, ProductListAutomationsRequest,
+    ProductListThreadsRequest, ProductRenameAutomationRequest, ProductResolveGateRequest,
+    ProductRetryRunRequest, ProductSetupExtensionRequest, ProductSubmitTurnRequest,
+};
 pub use product_surface_inbound::{
-    ProductAttachmentCapabilities, ProductCancelReason, ProductCancelRunRequest,
-    ProductCreateThreadRequest, ProductGateResolution, ProductInboundAttachment,
-    ProductInboundCommand, ProductListAutomationsRequest, ProductListThreadsRequest,
-    ProductRenameAutomationRequest, ProductResolveGateRequest, ProductRetryRunRequest,
-    ProductSetupExtensionRequest, ProductSubmitTurnRequest, product_attachment_capabilities,
+    DecodeInboundAttachments, IntoProductInboundCommand, ProductAttachmentCapabilities,
+    ProductInboundCommand, product_attachment_capabilities,
 };
 pub use workflow::DefaultProductSurface;

@@ -397,8 +397,8 @@ pub(crate) use capability_host::RESULT_READ_CAPABILITY_ID_FOR_TEST;
 pub(crate) use capability_host::SKILL_ACTIVATE_CAPABILITY_ID;
 
 pub use skills::{
-    RebornSkillActivation, RebornSkillActivationMode, RebornSkillAsset, RebornSkillBundle,
-    RebornSkillExecutionPlan, RebornSkillExecutionResult, RebornSkillSourceKind,
+    RebornSkillActivation, RebornSkillActivationMode, RebornSkillActivationSource,
+    RebornSkillAsset, RebornSkillBundle, RebornSkillExecutionPlan, RebornSkillExecutionResult,
 };
 
 use skills::skill_asset_error;
@@ -881,6 +881,7 @@ impl RebornRuntime {
         self.extension_management
             .install(package_ref, &self.actor_user_id)
             .await
+            .map_err(ironclaw_product::ProductSurfaceFailure::from)
     }
 
     /// Test-only caller for the production static activation path with the
@@ -897,6 +898,7 @@ impl RebornRuntime {
         self.extension_management
             .activate_with_prechecked_credentials_for_test(package_ref)
             .await
+            .map_err(ironclaw_product::ProductSurfaceFailure::from)
     }
 
     /// Test-support handles onto the approval/lease/gate stores the integration
@@ -1294,7 +1296,8 @@ impl RebornRuntime {
         Some(
             self.extension_management
                 .publish_bundled_package_for_test(package, resolved)
-                .await,
+                .await
+                .map_err(ironclaw_product::ProductSurfaceFailure::from),
         )
     }
 
