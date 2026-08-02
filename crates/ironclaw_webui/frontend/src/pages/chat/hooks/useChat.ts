@@ -2,10 +2,12 @@
 import {
   cancelRun as cancelRunRequest,
   createThread as createThreadRequest,
+  executeChatCommand,
   resolveGate as resolveGateRequest,
   sendMessage,
   submitManualToken,
 } from "../../../lib/api";
+import { renderCommandResultMarkdown } from "../lib/chat-commands";
 import {
   completionMatchesGate,
   readLatestProductAuthOAuthCompletion,
@@ -47,6 +49,7 @@ import {
 } from "../lib/connection-status";
 import { toRenderAttachment, toWireAttachment } from "../lib/attachments";
 import { failureMessageForRequestError } from "../lib/failureMessages";
+import { useT } from "../../../lib/i18n";
 import { useHistory } from "./useHistory";
 import { useSSE } from "./useSSE";
 
@@ -119,6 +122,7 @@ function isPendingOAuthGate(gate) {
 //   a v1-style `requestId`.
 // - cancelRun is a first-class action and posts to the v2 cancel route.
 export function useChat(threadId) {
+  const t = useT();
   const threadIdRef = React.useRef(threadId);
   const pendingMessagesRef = React.useRef(new Map());
   const pendingSeqRef = React.useRef(1);
@@ -408,6 +412,7 @@ export function useChat(threadId) {
     noteConnectionInterruptedRunId,
     connectionContextForRunFailure,
     onStreamError: handleStreamError,
+    t,
     // Reborn's projection bridge does not yet emit `Text` items for
     // assistant replies, and never emits `capability_display_preview`
     // items in the projection state — the assistant reply and the rich
@@ -447,6 +452,7 @@ export function useChat(threadId) {
     threadId,
     onEvent: handleEvent,
     enabled: Boolean(threadId),
+    activityExpected: isProcessing,
   });
 
   React.useEffect(() => {
@@ -473,11 +479,11 @@ export function useChat(threadId) {
     }
     setMessages((prev) =>
       upsertConnectionLostRunFailure(
-        runId ? rewriteConnectionLostRunFailures(prev, { runId }) : prev,
-        { runId },
+        runId ? rewriteConnectionLostRunFailures(prev, { runId, t }) : prev,
+        { runId, t },
       ),
     );
-  }, [sseStatus, setMessages, setIsProcessing, setActiveRun, threadId]);
+  }, [sseStatus, setMessages, setIsProcessing, setActiveRun, threadId, t]);
 
   // Accepts the composer call shape `{ attachments, threadId }`. The
   // `attachments` are staged objects from `lib/attachments.ts`
@@ -563,6 +569,7 @@ export function useChat(threadId) {
           appendRequestFailureMessage(setMessages, {
             id: requestFailureIdForMessage(`create-${pendingSeqRef.current++}`),
             error: err,
+            t,
           });
           throw err;
         }
@@ -653,7 +660,10 @@ export function useChat(threadId) {
           if (connectionInterruptedUnknownRef.current) {
             noteConnectionInterruptedRunId(response.run_id);
             setMessages((prev) =>
-              rewriteConnectionLostRunFailures(prev, { runId: response.run_id }),
+              rewriteConnectionLostRunFailures(prev, {
+                runId: response.run_id,
+                t,
+              }),
             );
           }
           if (streamErrorClosedAdmission) {
@@ -775,7 +785,7 @@ export function useChat(threadId) {
         if (err.status === 429) {
           setCooldownUntil(Date.now() + retryAfterMs(err));
         }
-        const failureContent = failureMessageForRequestError(err);
+        const failureContent = failureMessageForRequestError(err, t);
         // Mark the optimistic user bubble as retryable and append a separate
         // assistant-side error bubble. Apply each updater to both stores because
         // the rendered current thread and seeded target thread are distinct caches.
@@ -833,6 +843,7 @@ export function useChat(threadId) {
       setPendingGate,
       setActiveRun,
       noteConnectionInterruptedRunId,
+      t,
     ],
   );
   sendRef.current = send;
@@ -1083,6 +1094,67 @@ export function useChat(threadId) {
     [send, seedThreadMessages, setMessages, threadId],
   );
 
+  // Execute composer slash text server-side and append the rendered outcome
+  // as a local SYSTEM notice. Commands are not turns: no optimistic user
+  // bubble, no run, no SSE — the response is the whole exchange.
+  //
+  // Commands are thread-scoped: chat.tsx only calls this when
+  // `activeThreadId` is set (the landing composer intentionally does not
+  // offer commands — see the interception guard there), so `threadId` is
+  // always a real id here and this never needs to create one.
+  //
+  // Identity fence: a thread switch mid-flight must not paint the
+  // destination conversation with this command's result. `threadIdRef`
+  // reflects whichever thread is on screen *right now* (kept current by
+  // the layout effect above), so the notice renders locally only when
+  // we're still viewing the thread the command executed against;
+  // otherwise it's seeded into that thread's own cache instead of being
+  // lost, exactly like `send`'s busy-notice handling below.
+  const runCommand = React.useCallback(
+    async (text) => {
+      const appendNotice = (content, executedThreadId, meta) => {
+        const notice = {
+          id: `system-command-${pendingSeqRef.current++}`,
+          role: CHAT_MESSAGE_ROLES.SYSTEM,
+          content,
+          timestamp: new Date().toISOString(),
+          isOptimistic: false,
+          ...meta,
+        };
+        const appendToPrev = (prev) => [...prev, notice];
+        if (
+          !threadIdRef.current ||
+          threadIdRef.current === executedThreadId
+        ) {
+          setMessages(appendToPrev);
+        } else {
+          seedThreadMessages(executedThreadId, appendToPrev);
+        }
+      };
+      try {
+        const response = await executeChatCommand({ threadId, text });
+        // `commandResult` is the raw server response — the ephemeral,
+        // client-only structured payload `CommandResult`
+        // (components/command-result.tsx) reads to render the rich
+        // title/fields/lines (or command-list/denial) presentation.
+        // `content` keeps rendering the legacy markdown string, unchanged, as
+        // the fallback for any consumer that only reads plain text.
+        appendNotice(renderCommandResultMarkdown(response), threadId, {
+          commandResult: response,
+        });
+        return { ...response, thread_id: threadId };
+      } catch {
+        // A thrown error here has no server-shaped `result`/`rejection` to
+        // render (network failure, timeout, or an unexpected client-side
+        // exception) — show one generic, localized notice instead of a raw
+        // (and potentially unlocalized) error message.
+        appendNotice(t("chat.commandFailed"), threadId);
+        return null;
+      }
+    },
+    [threadId, setMessages, seedThreadMessages, t],
+  );
+
   return {
     // v2-native
     messages,
@@ -1097,6 +1169,7 @@ export function useChat(threadId) {
     hasMore,
     cooldownSeconds,
     send,
+    runCommand,
     resolveGate,
     submitAuthToken,
     startOnboardingOAuth,
@@ -1124,10 +1197,10 @@ function retryAfterMs(err) {
   return 2000;
 }
 
-function requestFailureMessageForError(messageId, error) {
+function requestFailureMessageForError(messageId, error, t) {
   return requestFailureMessageForContent(
     messageId,
-    failureMessageForRequestError(error),
+    failureMessageForRequestError(error, t),
   );
 }
 
@@ -1139,8 +1212,8 @@ function requestFailureMessageForContent(messageId, content) {
   });
 }
 
-function appendRequestFailureMessage(setMessages, { id, error }) {
-  const content = failureMessageForRequestError(error);
+function appendRequestFailureMessage(setMessages, { id, error, t }) {
+  const content = failureMessageForRequestError(error, t);
   setMessages((prev) => [
     ...prev,
     createErrorChatMessage({

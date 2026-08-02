@@ -2,29 +2,36 @@
 use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
+use ironclaw_extension_contracts::state::InstallationState;
 use ironclaw_extensions::{
     CapabilityManifest, CapabilityVisibility, ExtensionError, ExtensionPackage,
 };
 use ironclaw_host_api::{
-    CapabilityDisplayOutputPreview, CapabilityId, CapabilityProfileSchemaRef, CredentialStageError,
-    DispatchInputIssue, DispatchInputIssueCode, EffectKind, HostApiError, InstallationState,
-    OriginGateMatrix, OriginGatePolicy, PermissionMode, ResourceEstimate, ResourceProfile,
-    ResourceUsage, RuntimeDispatchErrorKind, RuntimeHttpEgress,
+    capability::{EffectKind, OriginGateMatrix, OriginGatePolicy, PermissionMode},
+    capability_profile::CapabilityProfileSchemaRef,
+    dispatch::{
+        CapabilityDisplayOutputPreview, CredentialStageError, DispatchInputIssue,
+        DispatchInputIssueCode, RuntimeDispatchErrorKind,
+    },
+    error::HostApiError,
+    ids::CapabilityId,
+    resource::{ResourceEstimate, ResourceProfile, ResourceUsage},
 };
 use ironclaw_host_runtime::{
     FirstPartyCapabilityError, FirstPartyCapabilityHandler, FirstPartyCapabilityRegistry,
     FirstPartyCapabilityRequest, FirstPartyCapabilityResult,
 };
-use ironclaw_product::{
+use ironclaw_product::RebornChannelConnectStrategy;
+use ironclaw_product_contracts::error::ProductOperationFailure;
+use ironclaw_product_contracts::package_lifecycle::{
     LifecyclePackageKind, LifecyclePackageRef, LifecycleProductPayload, LifecycleProductResponse,
-    ProductSurfaceFailure, RebornChannelConnectStrategy,
 };
 use serde::Deserialize;
 
 use crate::extension_activation_credentials::RuntimeExtensionActivationCredentialGate;
 use crate::extension_lifecycle::RebornLocalExtensionManagementPort;
 use ironclaw_auth::RuntimeCredentialAccountSelectionService;
-use ironclaw_extension_host::ExtensionActivationMode;
+use ironclaw_product_contracts::package_lifecycle::public_lifecycle_response_json;
 
 pub const EXTENSION_SEARCH_CAPABILITY_ID: &str = "builtin.extension_search";
 pub const EXTENSION_INSTALL_CAPABILITY_ID: &str = "builtin.extension_install";
@@ -48,19 +55,23 @@ pub fn extend_builtin_first_party_package(
     mut package: ExtensionPackage,
 ) -> Result<ExtensionPackage, ExtensionError> {
     package.manifest.capabilities.extend(manifests()?);
-    ExtensionPackage::from_manifest(package.manifest, package.root)
+    let root = package
+        .materialized_root()
+        .map_err(|error| ExtensionError::InvalidManifest {
+            reason: format!("built-in package requires a materialized root: {error}"),
+        })?
+        .clone();
+    ExtensionPackage::from_manifest(package.manifest, root)
 }
 
 pub fn insert_handlers(
     registry: &mut FirstPartyCapabilityRegistry,
     extension_management: Arc<RebornLocalExtensionManagementPort>,
     credential_accounts: Arc<dyn RuntimeCredentialAccountSelectionService>,
-    runtime_http_egress: Option<Arc<dyn RuntimeHttpEgress>>,
 ) -> Result<(), HostApiError> {
     let handler = Arc::new(ExtensionLifecycleToolHandler {
         extension_management,
         credential_accounts,
-        runtime_http_egress,
     });
     for capability_id in EXTENSION_LIFECYCLE_HANDLER_IDS {
         registry.insert_handler(CapabilityId::new(capability_id)?, handler.clone());
@@ -78,7 +89,7 @@ fn manifests() -> Result<Vec<CapabilityManifest>, ExtensionError> {
         )?,
         lifecycle_manifest(
             EXTENSION_INSTALL_CAPABILITY_ID,
-            "Install a searched Reborn extension into durable local-dev lifecycle state. Installation also attempts activation: when an extension does not require credentials or credentials are already available it publishes tools immediately, and when credentials are missing it raises the auth gate. If install reports the extension is already installed, report the installed state or credential gate it returns instead of calling a separate activation tool.",
+            "Install a searched Reborn extension into durable standalone lifecycle state. Installation also attempts activation: when an extension does not require credentials or credentials are already available it publishes tools immediately, and when credentials are missing it raises the auth gate. If install reports the extension is already installed, report the installed state or credential gate it returns instead of calling a separate activation tool.",
             vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
             PermissionMode::Ask,
         )?,
@@ -92,7 +103,7 @@ fn manifests() -> Result<Vec<CapabilityManifest>, ExtensionError> {
         )?,
         lifecycle_manifest(
             EXTENSION_REMOVE_CAPABILITY_ID,
-            "Remove an installed Reborn extension from durable local-dev lifecycle state. Use this when the user asks to uninstall, remove, disable, disconnect, unpair, unlink, or revoke access for an extension, integration, app, account, external channel, or the current external chat. Pass the extension's registry id as extension_id; removal also performs extension-owned cleanup such as authentication, identity, and channel bindings when supported.",
+            "Remove an installed Reborn extension from durable standalone lifecycle state. Use this when the user asks to uninstall, remove, disable, disconnect, unpair, unlink, or revoke access for an extension, integration, app, account, external channel, or the current external chat. Pass the extension's registry id as extension_id; removal also performs extension-owned cleanup such as authentication, identity, and channel bindings when supported.",
             vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
             PermissionMode::Ask,
         )?,
@@ -179,7 +190,6 @@ fn lifecycle_origin_gate_matrix(id: &str) -> OriginGateMatrix {
 struct ExtensionLifecycleToolHandler {
     extension_management: Arc<RebornLocalExtensionManagementPort>,
     credential_accounts: Arc<dyn RuntimeCredentialAccountSelectionService>,
-    runtime_http_egress: Option<Arc<dyn RuntimeHttpEgress>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +201,23 @@ struct SearchInput {
 #[derive(Debug, Deserialize)]
 struct ExtensionIdInput {
     extension_id: String,
+}
+
+/// Sanitizes a lifecycle-projection serialization failure into the capability
+/// error the model sees.
+///
+/// Extracted from an inline closure so the mapping is reachable from a test:
+/// the failure itself is a defensive guard (a well-formed
+/// [`LifecycleProductResponse`] does not fail `serde_json`), but *what it maps
+/// to* is a live contract — the model must get `OutputDecode`, and the serde
+/// error, which can quote projection contents, must stay in the debug log.
+fn lifecycle_output_decode_error(error: impl std::fmt::Debug) -> FirstPartyCapabilityError {
+    tracing::debug!(
+        target: "ironclaw::reborn::extension_lifecycle",
+        ?error,
+        "extension lifecycle output serialization failed"
+    );
+    FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OutputDecode)
 }
 
 #[async_trait]
@@ -231,39 +258,33 @@ impl FirstPartyCapabilityHandler for ExtensionLifecycleToolHandler {
                     .install(package_ref.clone(), &request.scope.user_id)
                     .await
                     .map_err(lifecycle_error)?;
+                // Pre-check activation requirements (package-declared runtime
+                // credentials PLUS any per-user account-setup requirement,
+                // e.g. a channel pairing step) before attempting activation.
+                // Without
+                // this, an extension whose only outstanding requirement is an
+                // account-setup step (not a package-level runtime credential)
+                // sails through `activate_with_credential_gate`'s internal
+                // package-only check straight to Active, never raising the
+                // auth gate.
                 let requirements = self
                     .extension_management
                     .activation_credential_requirements(&package_ref, &request.scope.user_id)
                     .await
                     .map_err(install_activation_readiness_error)?;
-                let credential_gate = RuntimeExtensionActivationCredentialGate::new(
-                    request.scope.clone(),
-                    Arc::clone(&self.credential_accounts),
-                );
-                let missing_requirements = credential_gate
-                    .missing_requirements(requirements)
-                    .await
-                    .map_err(credential_stage_error)?;
-                if !missing_requirements.is_empty() {
-                    return Err(FirstPartyCapabilityError::auth_required_for_credentials(
-                        missing_requirements,
-                    )
-                    .with_usage(resource_usage(started)));
-                }
-                let mode = ExtensionActivationMode::from_dispatch_context(
-                    request.scope.clone(),
-                    request
-                        .services
-                        .runtime_http_egress
-                        .clone()
-                        .or_else(|| self.runtime_http_egress.clone()),
-                );
+                let credential_gate = activation_credential_gate(
+                    &request.scope,
+                    &self.credential_accounts,
+                    requirements,
+                    started,
+                )
+                .await?;
                 match self
                     .extension_management
                     .activate_with_credential_gate(
                         package_ref.clone(),
-                        mode,
-                        credential_gate,
+                        request.scope.clone(),
+                        &credential_gate,
                         &request.scope.user_id,
                     )
                     .await
@@ -280,22 +301,16 @@ impl FirstPartyCapabilityHandler for ExtensionLifecycleToolHandler {
                     Ok(activation_response)
                         if activation_response_has_credential_blocker(&activation_response) =>
                     {
-                        let requirements = self
-                            .extension_management
-                            .activation_credential_requirements(
-                                &package_ref,
-                                &request.scope.user_id,
-                            )
-                            .await
-                            .map_err(install_activation_readiness_error)?;
-                        if requirements.is_empty() {
-                            Ok(install_response)
-                        } else {
-                            Err(FirstPartyCapabilityError::auth_required_for_credentials(
-                                requirements,
-                            )
-                            .with_usage(resource_usage(started)))
-                        }
+                        // Requirements the caller must satisfy are gated by the
+                        // pre-check above, before activation runs. A blocker
+                        // that only appears *after* activation is discovered
+                        // state (e.g. a hosted MCP package whose catalog
+                        // preparation could not reach its server), so the
+                        // install reports `setup_needed` and the turn
+                        // completes. Raising an auth gate here instead hangs
+                        // the turn on a requirement the caller was never asked
+                        // for and cannot resolve from this prompt.
+                        Ok(install_response)
                     }
                     Ok(_) => Ok(install_response),
                     Err(error) => install_activation_error(error, install_response),
@@ -309,29 +324,18 @@ impl FirstPartyCapabilityHandler for ExtensionLifecycleToolHandler {
                     .activation_credential_requirements(&package_ref, &request.scope.user_id)
                     .await
                     .map_err(lifecycle_error)?;
-                let credential_gate = RuntimeExtensionActivationCredentialGate::new(
-                    request.scope.clone(),
-                    Arc::clone(&self.credential_accounts),
-                );
-                let missing_requirements = credential_gate
-                    .missing_requirements(requirements)
-                    .await
-                    .map_err(credential_stage_error)?;
-                if !missing_requirements.is_empty() {
-                    return Err(FirstPartyCapabilityError::auth_required_for_credentials(
-                        missing_requirements,
-                    )
-                    .with_usage(resource_usage(started)));
-                }
-                let mode = ExtensionActivationMode::from_dispatch_context(
-                    request.scope.clone(),
-                    request.services.runtime_http_egress.clone(),
-                );
+                let credential_gate = activation_credential_gate(
+                    &request.scope,
+                    &self.credential_accounts,
+                    requirements,
+                    started,
+                )
+                .await?;
                 self.extension_management
                     .activate_with_credential_gate(
                         package_ref,
-                        mode,
-                        credential_gate,
+                        request.scope.clone(),
+                        &credential_gate,
                         &request.scope.user_id,
                     )
                     .await
@@ -363,14 +367,7 @@ impl FirstPartyCapabilityHandler for ExtensionLifecycleToolHandler {
         );
         let response = without_model_visible_connection_chrome(response);
         let output =
-            ironclaw_product::public_lifecycle_response_json(&response).map_err(|error| {
-                tracing::debug!(
-                    target: "ironclaw::reborn::extension_lifecycle",
-                    ?error,
-                    "extension lifecycle output serialization failed"
-                );
-                FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OutputDecode)
-            })?;
+            public_lifecycle_response_json(&response).map_err(lifecycle_output_decode_error)?;
         Ok(
             FirstPartyCapabilityResult::new(output, resource_usage(started))
                 .with_display_preview(connection_preview),
@@ -499,9 +496,9 @@ fn activation_response_has_credential_blocker(response: &LifecycleProductRespons
     )
 }
 
-fn install_activation_readiness_error(error: ProductSurfaceFailure) -> FirstPartyCapabilityError {
+fn install_activation_readiness_error(error: ProductOperationFailure) -> FirstPartyCapabilityError {
     match error {
-        ProductSurfaceFailure::ProviderInstanceNotConfigured { .. } => {
+        ProductOperationFailure::ProviderInstanceNotConfigured { .. } => {
             provider_instance_unavailable_error()
         }
         error => lifecycle_error(error),
@@ -509,14 +506,14 @@ fn install_activation_readiness_error(error: ProductSurfaceFailure) -> FirstPart
 }
 
 fn install_activation_error(
-    error: ProductSurfaceFailure,
+    error: ProductOperationFailure,
     install_response: LifecycleProductResponse,
 ) -> Result<LifecycleProductResponse, FirstPartyCapabilityError> {
     match error {
-        ProductSurfaceFailure::ProviderInstanceNotConfigured { .. } => {
+        ProductOperationFailure::ProviderInstanceNotConfigured { .. } => {
             Err(provider_instance_unavailable_error())
         }
-        ProductSurfaceFailure::Transient { reason } => {
+        ProductOperationFailure::Transient { reason } => {
             tracing::debug!(
                 target: "ironclaw::reborn::extension_lifecycle",
                 %reason,
@@ -524,8 +521,8 @@ fn install_activation_error(
             );
             Ok(install_response)
         }
-        ProductSurfaceFailure::InvalidBindingRequest { reason }
-            if reason.starts_with("hosted MCP discovery failed:")
+        ProductOperationFailure::InvalidBindingRequest { reason }
+            if reason.starts_with("hosted MCP catalog preparation failed:")
                 || reason
                     == "generic extension host rejected the activation: hosted MCP discovery published no callable tools" =>
         {
@@ -538,6 +535,40 @@ fn install_activation_error(
         }
         error => Err(lifecycle_error(error)),
     }
+}
+
+/// Build the activation credential gate, refusing to proceed while the caller
+/// still has unmet requirements.
+///
+/// Both the install and activate capability arms must pre-check this *before*
+/// activation. `activate_with_credential_gate`'s own check only considers
+/// package-declared runtime credentials, so an extension whose only
+/// outstanding requirement is a per-user account setup would otherwise reach
+/// Active without ever raising the auth gate.
+///
+/// The two arms differ only in how they map the requirements-fetch error, so
+/// each fetches its own `requirements` and shares everything after it.
+async fn activation_credential_gate(
+    scope: &ironclaw_host_api::resource::ResourceScope,
+    credential_accounts: &Arc<dyn RuntimeCredentialAccountSelectionService>,
+    requirements: Vec<ironclaw_host_api::decision::RuntimeCredentialAuthRequirement>,
+    started: Instant,
+) -> Result<RuntimeExtensionActivationCredentialGate, FirstPartyCapabilityError> {
+    let credential_gate = RuntimeExtensionActivationCredentialGate::new(
+        scope.clone(),
+        Arc::clone(credential_accounts),
+    );
+    let missing_requirements = credential_gate
+        .missing_requirements(requirements)
+        .await
+        .map_err(credential_stage_error)?;
+    if !missing_requirements.is_empty() {
+        return Err(
+            FirstPartyCapabilityError::auth_required_for_credentials(missing_requirements)
+                .with_usage(resource_usage(started)),
+        );
+    }
+    Ok(credential_gate)
 }
 
 fn resource_usage(started: Instant) -> ResourceUsage {
@@ -601,7 +632,7 @@ fn provider_instance_unavailable_error() -> FirstPartyCapabilityError {
     )
 }
 
-fn lifecycle_error(error: ProductSurfaceFailure) -> FirstPartyCapabilityError {
+fn lifecycle_error(error: ProductOperationFailure) -> FirstPartyCapabilityError {
     match error {
         // UNTRUSTED on purpose. `InvalidBindingRequest` has ~40 construction
         // sites and several interpolate externally-influenced text: a hosted
@@ -617,7 +648,7 @@ fn lifecycle_error(error: ProductSurfaceFailure) -> FirstPartyCapabilityError {
         // `ironclaw_threads` applies to untrusted output. The trusted channel
         // is reserved for reasons built entirely from host-authored constants
         // (the `ProviderInstanceNotConfigured` arm below).
-        ProductSurfaceFailure::InvalidBindingRequest { reason } => {
+        ProductOperationFailure::InvalidBindingRequest { reason } => {
             FirstPartyCapabilityError::dispatch_with_diagnostic(
                 RuntimeDispatchErrorKind::InputEncode,
                 None,
@@ -636,17 +667,17 @@ fn lifecycle_error(error: ProductSurfaceFailure) -> FirstPartyCapabilityError {
         // arm is the one exception routed onto the TRUSTED channel
         // (`dispatch_with_host_remediation`), because its `reason` is built
         // entirely from host-authored constants.
-        ProductSurfaceFailure::ProviderInstanceNotConfigured { reason } => {
+        ProductOperationFailure::ProviderInstanceNotConfigured { reason } => {
             FirstPartyCapabilityError::dispatch_with_host_remediation(
                 RuntimeDispatchErrorKind::OperationFailed,
                 Some(PROVIDER_INSTANCE_NOT_CONFIGURED_SAFE_SUMMARY.to_string()),
                 reason,
             )
         }
-        ProductSurfaceFailure::UnsupportedActionKind { .. } => {
+        ProductOperationFailure::UnsupportedActionKind { .. } => {
             FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::InputEncode)
         }
-        ProductSurfaceFailure::Transient { .. } => {
+        ProductOperationFailure::Transient { .. } => {
             FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::Backend)
         }
         _ => FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OperationFailed),
@@ -655,21 +686,97 @@ fn lifecycle_error(error: ProductSurfaceFailure) -> FirstPartyCapabilityError {
 
 #[cfg(test)]
 mod tests {
+    /// The serialization guard is defensive — a well-formed projection does
+    /// not fail `serde_json` — but the mapping is a live contract with two
+    /// halves, and this asserts both: the model sees `OutputDecode` and never
+    /// the serde error (which can quote the projection contents it failed on),
+    /// *and* the detail is not simply discarded — it reaches the debug log,
+    /// which is where an operator diagnoses it from.
+    ///
+    /// The DEBUG subscriber is load-bearing, not decoration: with no
+    /// subscriber installed `tracing` short-circuits on the null dispatcher
+    /// and the macro body never runs, so a test without one cannot tell
+    /// "logged the detail" from "dropped it".
+    #[test]
+    fn output_serialization_failure_maps_to_output_decode_and_logs_the_detail() {
+        use std::io::Write as _;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct SharedLog(Arc<Mutex<Vec<u8>>>);
+        struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedLogGuard {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log lock").extend(buffer);
+                Ok(buffer.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
+            type Writer = SharedLogGuard;
+            fn make_writer(&'a self) -> Self::Writer {
+                SharedLogGuard(Arc::clone(&self.0))
+            }
+        }
+
+        let logs = SharedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .finish();
+
+        let error = tracing::subscriber::with_default(subscriber, || {
+            super::lifecycle_output_decode_error("key must be a string")
+        });
+
+        assert_eq!(error.kind(), Some(RuntimeDispatchErrorKind::OutputDecode));
+        assert!(
+            !format!("{error:?}").contains("key must be a string"),
+            "the serde detail must not ride out on the capability error"
+        );
+
+        let rendered = String::from_utf8(logs.0.lock().expect("log lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(
+            rendered.contains("extension lifecycle output serialization failed"),
+            "the guard must leave a diagnosable trace: {rendered}"
+        );
+        assert!(
+            rendered.contains("key must be a string"),
+            "the detail belongs in the debug log, not nowhere: {rendered}"
+        );
+        let _ = std::io::sink().flush();
+    }
+
     use ironclaw_auth::{
         AuthProductScope, AuthProviderId, AuthSurface, CredentialAccountLabel,
         CredentialAccountStatus, CredentialOwnership, NewCredentialAccount, ProviderScope,
     };
     use ironclaw_host_api::{
-        CapabilityDescriptor, CapabilityGrant, CapabilityGrantId, CapabilitySet, ExecutionContext,
-        ExtensionId, GrantConstraints, MountView, NetworkPolicy, NetworkTargetPattern,
-        OriginGatePolicy, PermissionMode, Principal, ResourceScope, RuntimeKind, SecretHandle,
-        TrustClass, UNGATED_LOOP_RUN_CAPABILITIES, UserId,
+        action::{NetworkPolicy, NetworkTargetPattern},
+        capability::{
+            CapabilityDescriptor, CapabilityGrant, CapabilitySet, GrantConstraints,
+            OriginGatePolicy, PermissionMode, UNGATED_LOOP_RUN_CAPABILITIES,
+        },
+        ids::{CapabilityGrantId, ExtensionId, SecretHandle, UserId},
+        mount::MountView,
+        resource::ResourceScope,
+        result_meta::FailureKind,
+        runtime::{RuntimeKind, TrustClass},
+        scope::{ExecutionContext, Principal},
     };
     use ironclaw_host_runtime::{
-        CapabilitySurfacePolicy, RuntimeCapabilityOutcome, RuntimeFailureKind, SurfaceKind,
-        VisibleCapabilityRequest, VisibleCapabilitySurface,
+        CapabilitySurfacePolicy, RuntimeCapabilityOutcome, SurfaceKind, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     };
-    use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
+    use ironclaw_trust::{
+        AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustPolicy, TrustProvenance,
+    };
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::Arc,
@@ -678,13 +785,14 @@ mod tests {
     use super::*;
     use crate::lifecycle_test_support::{
         ExtensionLifecycleTestServices, build_lifecycle_test_services,
-        invoke_json_with_local_dev_approval, invoke_with_local_dev_approval,
+        invoke_json_with_standalone_approval, invoke_with_standalone_approval,
     };
-    use ironclaw_host_api::InstallationState;
-    use ironclaw_product::{
+    use ironclaw_extension_contracts::state::InstallationState;
+    use ironclaw_product::RebornChannelConnectStrategy;
+    use ironclaw_product_contracts::package_lifecycle::{
         ChannelConnectionRequirement, LifecycleExtensionRuntimeKind, LifecycleExtensionSource,
         LifecycleExtensionSummary, LifecyclePackageKind, LifecyclePackageRef,
-        LifecycleSearchExtensionSummary, RebornChannelConnectStrategy,
+        LifecycleSearchExtensionSummary,
     };
 
     const TEST_OWNER_ID: &str = "extension-tool-test-user";
@@ -852,7 +960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_dev_agent_surface_exposes_extension_lifecycle_tools() {
+    async fn standalone_agent_surface_exposes_extension_lifecycle_tools() {
         let services = test_services("extension-tools-surface-owner", None, false).await;
         let runtime = services.host_runtime.as_ref();
 
@@ -1019,6 +1127,14 @@ mod tests {
         id: &str,
         strategy: RebornChannelConnectStrategy,
     ) -> LifecycleSearchExtensionSummary {
+        search_summary_with_phase(id, strategy, None)
+    }
+
+    fn search_summary_with_phase(
+        id: &str,
+        strategy: RebornChannelConnectStrategy,
+        installation_phase: Option<InstallationState>,
+    ) -> LifecycleSearchExtensionSummary {
         LifecycleSearchExtensionSummary {
             summary: LifecycleExtensionSummary {
                 package_ref: LifecyclePackageRef::new(LifecyclePackageKind::Extension, id)
@@ -1045,12 +1161,12 @@ mod tests {
                 credential_requirements: Vec::new(),
                 onboarding: None,
             },
-            installation_phase: None,
+            installation_phase,
         }
     }
 
     #[tokio::test]
-    async fn local_dev_extension_lifecycle_tools_manage_visible_extension_surface() {
+    async fn standalone_extension_lifecycle_tools_manage_visible_extension_surface() {
         let services = test_services("extension-tools-owner", None, false).await;
         let runtime = services.host_runtime.as_ref();
         let extension_management = services.extension_management.clone();
@@ -1133,8 +1249,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_dev_extension_remove_revokes_exclusive_credential_so_reactivation_requires_auth()
-    {
+    async fn standalone_extension_remove_revokes_exclusive_credential_so_reactivation_requires_auth()
+     {
         // Regression (#slack model-B): before the pairing->OAuth swap, removing an
         // extension cleared its credentials, so the agent could not silently
         // re-add it. OAuth personal credentials are stored `UserReusable` and are
@@ -1183,7 +1299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_dev_extension_remove_preserves_shared_credential_used_by_another_extension() {
+    async fn standalone_extension_remove_preserves_shared_credential_used_by_another_extension() {
         // Exclusivity guard: removing one extension must NOT revoke a credential
         // still used by another installed extension. Gmail and Google Calendar
         // share the `google` provider; removing Gmail must leave the Google
@@ -1244,7 +1360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_dev_extension_activate_returns_auth_gate_for_missing_extension_credentials() {
+    async fn standalone_extension_activate_returns_auth_gate_for_missing_extension_credentials() {
         let services = test_services("extension-tools-auth-gate-owner", None, false).await;
         let extension_management = services.extension_management.clone();
 
@@ -1276,7 +1392,7 @@ mod tests {
         // install exists and leaks its credential requirement shape. Ownership
         // masks before the credential preflight, so the non-owner sees the
         // same failure a missing installation would produce.
-        let outcome = invoke_with_local_dev_approval(
+        let outcome = invoke_with_standalone_approval(
             &services,
             EXTENSION_ACTIVATE_CAPABILITY_ID,
             execution_context_for_user(
@@ -1289,11 +1405,11 @@ mod tests {
         let RuntimeCapabilityOutcome::Failed(failure) = outcome else {
             panic!("foreign caller must get the masked failure, not an auth gate: {outcome:?}");
         };
-        assert_eq!(failure.kind, RuntimeFailureKind::InvalidInput);
+        assert_eq!(failure.kind, FailureKind::InputEncode);
     }
 
     #[tokio::test]
-    async fn local_dev_extension_search_distinguishes_configured_from_active() {
+    async fn standalone_extension_search_distinguishes_configured_from_active() {
         let services = test_services("extension-tools-active-search-owner", None, false).await;
 
         let available_search = invoke_json(
@@ -1431,7 +1547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_dev_extension_activate_returns_auth_gate_when_account_lacks_required_scope() {
+    async fn standalone_extension_activate_returns_auth_gate_when_account_lacks_required_scope() {
         let services = test_services("extension-tools-scope-gate-owner", None, true).await;
         let extension_management = services.extension_management.clone();
 
@@ -1476,7 +1592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_dev_extension_activate_coalesces_gmail_oauth_scopes_into_one_auth_gate() {
+    async fn standalone_extension_activate_coalesces_gmail_oauth_scopes_into_one_auth_gate() {
         let services = test_services("extension-tools-gmail-scope-union-owner", None, true).await;
         let extension_management = services.extension_management.clone();
 
@@ -1521,7 +1637,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_dev_extension_activate_maps_corrupt_configured_account_to_backend() {
+    async fn standalone_extension_activate_maps_corrupt_configured_account_to_backend() {
         let services = test_services("extension-tools-corrupt-auth-owner", None, false).await;
         let extension_management = services.extension_management.clone();
 
@@ -1545,7 +1661,7 @@ mod tests {
         let RuntimeCapabilityOutcome::Failed(failure) = outcome else {
             panic!("expected corrupt configured account to fail, got {outcome:?}");
         };
-        assert_eq!(failure.kind, RuntimeFailureKind::Backend);
+        assert_eq!(failure.kind, FailureKind::Backend);
 
         let active = active_extension_capability_ids(&extension_management).await;
         assert!(!active.iter().any(|id| id == "github.search_issues"));
@@ -1562,13 +1678,13 @@ mod tests {
     /// invocation scope found no policy/credential, failed transient, and
     /// fell back to the bundled manifest with zero model-visible tools.
     #[tokio::test]
-    async fn local_dev_extension_activate_hosted_mcp_stages_discovery_and_publishes_tools() {
+    async fn standalone_extension_activate_hosted_mcp_stages_discovery_and_publishes_tools() {
         let discovery_script = std::sync::Arc::new(
             crate::extension_lifecycle::hosted_mcp_test_support::HostedMcpDiscoveryNetworkScript::with_tool_name("notion-search")
                 // Real hosted MCP providers may return verbose prose. The
-                // generic MCP boundary must bound it without dropping the
-                // entire catalog or preventing activation.
-                .with_tool_description("provider documentation ".repeat(320)),
+                // fixture stays near the generic MCP boundary while remaining
+                // valid, so verbose accepted prose cannot prevent activation.
+                .with_tool_description("provider documentation ".repeat(80)),
         );
         let services = test_services(
             "extension-tools-hosted-mcp-owner",
@@ -1628,8 +1744,109 @@ mod tests {
         );
     }
 
+    /// Pins the ordering the test above assumes but never checks: activation
+    /// must run hosted-MCP discovery BEFORE `commit_activation` publishes,
+    /// because the published `AuthorityCeiling` (`extension_allowed_effects`
+    /// in `active_publication.rs`) is computed from whatever
+    /// `ExtensionPackage` publish() is handed — the DISCOVERED package if
+    /// discovery ran first, the pre-discovery SEED package if not. If
+    /// activation is ever reordered to publish before discovery (or a new
+    /// activation path publishes the seed package), an effect a live MCP
+    /// server only reveals at discovery time silently drops out of the
+    /// ceiling and every tool needing it gets denied at authorization with
+    /// no error at the publish site.
+    ///
+    /// `notion`'s bundled manifest already declares every effect
+    /// (`network`, `use_secret`, `external_write`) its discovered tools can
+    /// ever produce, so swapping seed for discovered there changes nothing
+    /// observable — it cannot discriminate this regression. `nearai` is the
+    /// only other bundled hosted-MCP package, and its static manifest
+    /// declares only `network` + `use_secret`: scripting a discovered tool
+    /// with a `destructiveHint` annotation (see
+    /// `discovered_tool_requires_external_write` in
+    /// `ironclaw_extensions::hosted_mcp_discovery`) makes the DISCOVERED
+    /// package carry `ExternalWrite` while the SEED package never does —
+    /// exactly the shape needed to fail if publish ever ran on the wrong
+    /// package.
     #[tokio::test]
-    async fn local_dev_extension_lifecycle_tool_lists_all_and_rejects_malformed_inputs() {
+    async fn local_dev_extension_activate_hosted_mcp_authority_ceiling_reflects_discovered_effects()
+    {
+        let discovery_script = std::sync::Arc::new(
+            crate::extension_lifecycle::hosted_mcp_test_support::HostedMcpDiscoveryNetworkScript::with_tool_name("nearai-destructive-action")
+                .with_destructive_hint(),
+        );
+        let services = test_services(
+            "extension-tools-hosted-mcp-ceiling-owner",
+            Some(discovery_script.clone()),
+            false,
+        )
+        .await;
+
+        let activate_context = execution_context([EXTENSION_ACTIVATE_CAPABILITY_ID]);
+        seed_configured_account(&services, &activate_context.resource_scope, "nearai").await;
+        // Real access-token material: discovery stages it from the secret
+        // store into the one-shot injection store for the live egress call.
+        let owner_scope = ironclaw_auth::AuthProductScope::credential_owner(
+            &activate_context.resource_scope,
+            ironclaw_auth::AuthSurface::Api,
+        );
+        services
+            .secret_store()
+            .put(
+                owner_scope.resource.clone(),
+                SecretHandle::new("nearai-test-token").expect("handle"),
+                ironclaw_secrets::SecretMaterial::from("nearai-access-token"),
+                None,
+            )
+            .await
+            .expect("seed access-token material");
+
+        let activate = invoke_json(
+            &services,
+            EXTENSION_INSTALL_CAPABILITY_ID,
+            serde_json::json!({"extension_id": "nearai"}),
+        )
+        .await;
+        let activate = activate.expect("install-driven hosted MCP activation succeeds");
+        assert_eq!(activate["phase"], "active");
+
+        // Read back the published trust entry through the SAME seam
+        // authorization consumes (`ironclaw_authorization::effects_are_covered`
+        // reads `AuthorityCeiling::allowed_effects`), not an internal exposed
+        // solely for this test: `ActiveExtensionPublisher::publish` writes the
+        // ceiling through `HostTrustPolicy::mutate_with` /
+        // `AdminEntry::for_local_manifest`, and `TrustPolicy::evaluate` is the
+        // policy's own public read path back to that decision.
+        let extension_id = ExtensionId::new("nearai").expect("valid extension id");
+        let published_package = services
+            .extension_management
+            .active_extensions_for_test()
+            .snapshot()
+            .get_extension(&extension_id)
+            .cloned()
+            .expect("nearai package published after activation");
+        let trust_input = crate::extension_trust_policy_input(&published_package)
+            .expect("trust policy input derives from the published package");
+        let decision = services
+            .trust_policy
+            .evaluate(&trust_input)
+            .expect("trust policy evaluates the published package identity");
+
+        assert!(
+            decision
+                .authority_ceiling
+                .allowed_effects
+                .contains(&EffectKind::ExternalWrite),
+            "published authority ceiling must include the discovery-only ExternalWrite \
+             effect (destructiveHint tool absent from nearai's static manifest); got {:?}. \
+             Missing here means publish() ran on the pre-discovery seed package instead of \
+             the live-discovered one.",
+            decision.authority_ceiling.allowed_effects
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_extension_lifecycle_tool_lists_all_and_rejects_malformed_inputs() {
         let services = test_services("extension-tools-invalid-owner", None, false).await;
         let list_all = invoke_json(
             &services,
@@ -1641,7 +1858,7 @@ mod tests {
         assert_eq!(list_all["payload"]["kind"], "extension_search");
         assert!(
             list_all["payload"]["count"].as_u64().unwrap_or_default() > 0,
-            "list-all extension search should return the bundled local-dev packages"
+            "list-all extension search should return the bundled standalone packages"
         );
         assert_eq!(
             invoke_json(
@@ -1650,7 +1867,7 @@ mod tests {
                 serde_json::json!({})
             )
             .await,
-            Err(RuntimeFailureKind::InvalidInput)
+            Err(FailureKind::InputEncode)
         );
         assert_eq!(
             invoke_json(
@@ -1659,7 +1876,7 @@ mod tests {
                 serde_json::json!({"extension_id": "unknown-extension"})
             )
             .await,
-            Err(RuntimeFailureKind::InvalidInput)
+            Err(FailureKind::InputEncode)
         );
         let outcome = invoke_outcome(
             &services,
@@ -1670,15 +1887,15 @@ mod tests {
         let RuntimeCapabilityOutcome::Failed(failure) = outcome else {
             panic!("expected uninstalled extension activation to fail, got {outcome:?}");
         };
-        assert_eq!(failure.kind, RuntimeFailureKind::InvalidInput);
+        assert_eq!(failure.kind, FailureKind::InputEncode);
     }
 
     async fn invoke_json(
         services: &ExtensionLifecycleTestServices,
         capability_id: &str,
         input: serde_json::Value,
-    ) -> Result<serde_json::Value, RuntimeFailureKind> {
-        invoke_json_with_local_dev_approval(
+    ) -> Result<serde_json::Value, FailureKind> {
+        invoke_json_with_standalone_approval(
             services,
             capability_id,
             execution_context([capability_id]),
@@ -1692,7 +1909,7 @@ mod tests {
         capability_id: &str,
         input: serde_json::Value,
     ) -> RuntimeCapabilityOutcome {
-        invoke_with_local_dev_approval(
+        invoke_with_standalone_approval(
             services,
             capability_id,
             execution_context([capability_id]),
@@ -1814,7 +2031,7 @@ mod tests {
         )
         .expect("valid execution context");
         context.authenticated_actor_user_id = Some(user_id);
-        context.run_id = Some(ironclaw_host_api::RunId::new());
+        context.run_id = Some(ironclaw_host_api::ids::RunId::new());
         context
     }
 
@@ -1894,7 +2111,7 @@ mod tests {
     /// `config set` command verbatim.
     #[test]
     fn provider_instance_not_configured_safe_summary_validates_and_diagnostic_names_config_set() {
-        ironclaw_turns::run_profile::LoopSafeSummary::new(
+        ironclaw_loop_contracts::LoopSafeSummary::new(
             PROVIDER_INSTANCE_NOT_CONFIGURED_SAFE_SUMMARY,
         )
         .expect("fixed safe_summary must pass the strict LoopSafeSummary validator");
@@ -1904,7 +2121,7 @@ mod tests {
             ironclaw_reborn_config::google_remediation_text(),
             ironclaw_reborn_config::apply_step_text()
         );
-        let mapped = lifecycle_error(ProductSurfaceFailure::ProviderInstanceNotConfigured {
+        let mapped = lifecycle_error(ProductOperationFailure::ProviderInstanceNotConfigured {
             reason: reason.clone(),
         });
 
@@ -1926,7 +2143,8 @@ mod tests {
         // The TRUSTED channel, not the untrusted diagnostic one: this reason is
         // host-authored, and the untrusted channel collapses it to the
         // safe-summary placeholder at the host_api boundary (#6299).
-        let ironclaw_host_api::DispatchFailureDetail::HostRemediation { text } = *detail else {
+        let ironclaw_host_api::dispatch::DispatchFailureDetail::HostRemediation { text } = *detail
+        else {
             panic!("expected a HostRemediation detail, got {detail:?}");
         };
         assert!(text.as_str().contains("config set google.client_id"));
@@ -1941,7 +2159,7 @@ mod tests {
     /// entirely from host-authored constants may ride the trusted channel.
     #[test]
     fn invalid_binding_request_carries_reason_on_the_untrusted_diagnostic_channel() {
-        let mapped = lifecycle_error(ProductSurfaceFailure::InvalidBindingRequest {
+        let mapped = lifecycle_error(ProductOperationFailure::InvalidBindingRequest {
             reason: "telegram account setup was declared without a mounted host".to_string(),
         });
 
@@ -1950,7 +2168,8 @@ mod tests {
         };
         assert_eq!(kind, RuntimeDispatchErrorKind::InputEncode);
         let detail = detail.expect("diagnostic detail must be present");
-        let ironclaw_host_api::DispatchFailureDetail::Diagnostic { text } = *detail else {
+        let ironclaw_host_api::dispatch::DispatchFailureDetail::Diagnostic { text } = *detail
+        else {
             panic!("expected a Diagnostic detail, got {detail:?}");
         };
         assert!(text.contains("mounted host"));
@@ -1958,7 +2177,7 @@ mod tests {
 
     #[test]
     fn transient_lifecycle_errors_map_to_retryable_backend_failure() {
-        let mapped = lifecycle_error(ProductSurfaceFailure::Transient {
+        let mapped = lifecycle_error(ProductOperationFailure::Transient {
             reason: "temporary lifecycle store outage".to_string(),
         });
 
@@ -1975,7 +2194,7 @@ mod tests {
     /// credential-vocabulary scan.
     #[test]
     fn model_influenced_invalid_binding_reason_never_reaches_the_trusted_channel() {
-        let mapped = lifecycle_error(ProductSurfaceFailure::InvalidBindingRequest {
+        let mapped = lifecycle_error(ProductOperationFailure::InvalidBindingRequest {
             reason: "extension api_key is not installed".to_string(),
         });
 
@@ -1985,7 +2204,7 @@ mod tests {
         assert!(
             matches!(
                 detail.as_deref(),
-                Some(ironclaw_host_api::DispatchFailureDetail::Diagnostic { .. })
+                Some(ironclaw_host_api::dispatch::DispatchFailureDetail::Diagnostic { .. })
             ),
             "externally-influenced text must stay on the scanned channel, got {detail:?}"
         );

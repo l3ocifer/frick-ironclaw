@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ironclaw_host_api::TenantId;
-use ironclaw_turns::run_profile::{
+use ironclaw_host_api::ids::TenantId;
+use ironclaw_loop_contracts::{
     AgentLoopHostError, LoopModelPort, LoopModelRequest, LoopModelResponse,
 };
 
@@ -33,10 +33,8 @@ pub struct HookedLoopModelPort {
     /// Kept for future point-specific observers (e.g., `model-response-
     /// observed` at the pre-durable boundary). Currently unused — the
     /// model port is a no-op wrapper.
-    #[allow(dead_code)]
-    dispatcher: Arc<HookDispatcher>,
-    #[allow(dead_code)]
-    tenant_id: TenantId,
+    _dispatcher: Arc<HookDispatcher>,
+    _tenant_id: TenantId,
 }
 
 impl HookedLoopModelPort {
@@ -47,8 +45,8 @@ impl HookedLoopModelPort {
     ) -> Self {
         Self {
             inner,
-            dispatcher,
-            tenant_id,
+            _dispatcher: dispatcher,
+            _tenant_id: tenant_id,
         }
     }
 }
@@ -80,7 +78,7 @@ mod tests {
     use crate::sink::{ObserverHook, ObserverSink};
     use crate::trust::HookTrustClass;
     use async_trait::async_trait;
-    use ironclaw_turns::run_profile::{
+    use ironclaw_loop_contracts::{
         AssistantReply, LoopModelRequest, LoopModelResponse, ModelProfileId, ParentLoopOutput,
     };
     use std::sync::Mutex;
@@ -123,7 +121,7 @@ mod tests {
             *self.calls.lock().expect("not poisoned") += 1;
             if self.fail {
                 return Err(AgentLoopHostError::new(
-                    ironclaw_turns::run_profile::AgentLoopHostErrorKind::Unavailable,
+                    ironclaw_loop_contracts::AgentLoopHostErrorKind::Unavailable,
                     "stub failure",
                 ));
             }
@@ -166,6 +164,7 @@ mod tests {
             messages: Vec::new(),
             surface_version: None,
             model_preference: None,
+            fallback_index: 0,
             capability_view: None,
         }
     }
@@ -253,7 +252,7 @@ mod tests {
         let err = wrapped.stream_model(request()).await.expect_err("must err");
         assert_eq!(
             err.kind,
-            ironclaw_turns::run_profile::AgentLoopHostErrorKind::Unavailable
+            ironclaw_loop_contracts::AgentLoopHostErrorKind::Unavailable
         );
         assert_eq!(*seen.lock().expect("not poisoned"), 0);
     }
