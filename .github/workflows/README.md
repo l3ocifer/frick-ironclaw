@@ -31,6 +31,27 @@ changes. Root `Cargo.toml` and `Cargo.lock` changes are broader workspace risk:
 they run the lane in the merge queue, before landing, without adding the full
 WASM build to ordinary PR feedback. Push and deep-CI runs remain exhaustive.
 
+`reborn-tests.yml` follows the same PR-versus-queue contract. Pull requests use
+`reborn_pr_test_plan.py` to run affected crate buckets and exact changed root,
+integration, and frontend suites without LLVM instrumentation. Recorded QA
+replay remains a baseline on every pull request because it detects ordering
+and cross-surface regressions that cannot be inferred from changed paths. The
+full transitive reverse workspace dependency closure is included in PR crate
+selection. Foundational-crate changes that span more than three canonical
+buckets coalesce every changed and dependent package into at most three PR
+jobs instead of omitting consumer tests. The merge queue and pushes to `main`
+still run every crate bucket, root
+partition, group suite, integration lane, frontend test, recorded replay, and
+coverage gate. Unknown paths, empty diffs, and recognized test-topology or
+workspace-topology changes fail closed to that same full plan on the pull
+request. A planner execution or schema failure also fails the required check
+loudly.
+The queue therefore preserves exhaustive deterministic evidence while
+ordinary PRs avoid consuming 20-plus runners for unrelated lanes. Pull-request
+parallelism is capped at three crate buckets, one root partition, and one
+integration lane; merge queue and main retain full matrix parallelism so this
+feedback optimization does not serialize the production gate.
+
 History: the slim-vs-full clippy matrix violated this — the queue linted only
 `--all-features` while push linted a broader matrix, so feature-gated dead code
 could pass the queue and turn main red post-merge.
@@ -232,6 +253,11 @@ channel. This keeps post-merge CI alerts in their dedicated channels while
 making queue bounces visible alongside live-canary failures.
 When adding a new workflow that runs on `push` to `main`, add its workflow
 `name:` to the watched list in `main-ci-slack-alerts.yml`.
+
+Code Coverage uses same-ref concurrency with cancellation. When merges land
+faster than coverage completes, only the newest cumulative `main` commit keeps
+running; superseded post-merge coverage runs do not consume runners needed by
+pull requests.
 
 ## Reborn-only release policy
 
