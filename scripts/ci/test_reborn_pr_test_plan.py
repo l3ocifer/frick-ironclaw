@@ -191,6 +191,48 @@ class RebornPrTestPlanTests(unittest.TestCase):
         self.assertTrue(plan["run_qa_replay"])
         self.assertEqual(plan["crate_buckets"], [])
 
+    def test_reborn_e2e_scenario_change_is_owned_by_e2e_workflow(self) -> None:
+        plan = self.plan(
+            "pull_request",
+            ["tests/e2e/scenarios/test_reborn_webui_v2_legacy_extensions.py"],
+        )
+        # E2E scenarios live in the dedicated reborn-e2e.yml workflow, not
+        # the crate-bucket / root-partition / integration-lane plan emitted
+        # here. A scenario-only change must not fail closed as an unmapped
+        # path, and must not schedule crate buckets or integration lanes.
+        self.assertEqual(plan["mode"], "none")
+        self.assertEqual(plan["crate_buckets"], [])
+        self.assertEqual(plan["integration_lanes"], [])
+        self.assertEqual(plan["root_partitions"], [])
+        self.assertTrue(plan["run_qa_replay"])
+        self.assertTrue(
+            any("Reborn E2E workflow owns" in reason for reason in plan["reasons"]),
+            plan["reasons"],
+        )
+
+    def test_shared_e2e_harness_remains_an_explicit_mapping_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unmapped Reborn test path"):
+            self.plan("pull_request", ["tests/e2e/reborn_webui_harness.py"])
+
+    def test_reborn_e2e_and_crate_changes_keep_both_owners(self) -> None:
+        plan = self.plan(
+            "pull_request",
+            [
+                "tests/e2e/scenarios/test_reborn_webui_v2_legacy_extensions.py",
+                "crates/alpha/src/lib.rs",
+            ],
+        )
+        # The E2E scenario path is skipped (owned by reborn-e2e.yml) while
+        # the changed crate is still scheduled in the affected crate buckets.
+        self.assertEqual(plan["mode"], "selected")
+        self.assertEqual(plan["changed_packages"], ["alpha"])
+        self.assertTrue(plan["crate_buckets"])
+        self.assertTrue(plan["run_qa_replay"])
+        self.assertTrue(
+            any("Reborn E2E workflow owns" in reason for reason in plan["reasons"]),
+            plan["reasons"],
+        )
+
     def test_live_qa_harness_changes_run_only_qa_replay(self) -> None:
         for path in (
             "scripts/live-canary/README.md",
