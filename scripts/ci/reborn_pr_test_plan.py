@@ -366,7 +366,7 @@ def build_plan(
             reasons.append(f"static CI or workspace-policy checks own: {path}")
             continue
         if path.startswith(DEDICATED_WORKFLOW_PREFIXES):
-            reasons.append(f"dedicated stress workflow owns: {path}")
+            reasons.append(f"dedicated workflow owns: {path}")
             continue
         if path.startswith(DEDICATED_E2E_PREFIX):
             reasons.append(f"dedicated Reborn E2E workflow owns: {path}")

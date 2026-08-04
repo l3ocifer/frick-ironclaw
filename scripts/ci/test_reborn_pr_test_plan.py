@@ -386,12 +386,16 @@ class RebornPrTestPlanTests(unittest.TestCase):
         for path in (
             "tests/e2e/helpers.py",
             "tests/e2e/reborn_webui_harness.py",
+            "tests/e2e/reborn_coverage_tests.txt",
+            "tests/e2e/scenarios/test_reborn_webui_v2_projects_api.py",
             "tests/e2e/scenarios/test_reborn_webui_v2_smoke.py",
         ):
             with self.subTest(path=path):
                 plan = self.plan("pull_request", [path])
                 self.assertEqual(plan["mode"], "none")
                 self.assertTrue(plan["run_qa_replay"])
+                self.assertEqual(plan["integration_lanes"], [])
+                self.assertEqual(plan["coverage_mode"], "none")
                 self.assertTrue(
                     any(
                         reason.startswith("dedicated Reborn E2E workflow owns")
