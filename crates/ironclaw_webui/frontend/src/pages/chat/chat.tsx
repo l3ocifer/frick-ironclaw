@@ -20,6 +20,8 @@ import { RecoveryNotice } from "./components/recovery-notice";
 import { SuggestionChips } from "./components/suggestion-chips";
 import { TypingIndicator } from "./components/typing-indicator";
 import { useChat } from "./hooks/useChat";
+import { useChatCommands } from "./hooks/useChatCommands";
+import { matchCommand } from "./lib/chat-commands";
 import { channelConnectionDisplayName } from "../../lib/channel-connection-events";
 import { channelConnectionFromGate } from "./lib/gates";
 import { NEW_DRAFT_KEY } from "./lib/draft-store";
@@ -46,16 +48,6 @@ function pendingOnboardingLabel(onboarding) {
   return channelConnectionDisplayName(onboarding?.extensionName);
 }
 
-function hasVisibleStreamingAssistantText(messages, activeRunId) {
-  return (messages || []).some((message) =>
-    message?.role === "assistant" &&
-    message.isFinalReply === false &&
-    typeof message.content === "string" &&
-    message.content.length > 0 &&
-    (!activeRunId || message.turnRunId === activeRunId)
-  );
-}
-
 function cancellationFailureDiagnostic(error) {
   const status =
     error &&
@@ -78,6 +70,7 @@ export function Chat({
   composerDraft = "",
   composerResetKey = "",
   gatewayStatus,
+  regressionArtifactExportEnabled = false,
   globalAutoApproveEnabled = false,
   onConnectionStatusChange,
 }) {
@@ -98,6 +91,7 @@ export function Chat({
     recoveryNotice,
     activeRun,
     send,
+    runCommand,
     cancelRun,
     retryMessage,
     approve,
@@ -108,6 +102,7 @@ export function Chat({
     startOnboardingOAuth,
     dismissOnboardingPairing,
   } = useChat(activeThreadId);
+  const chatCommands = useChatCommands();
 
   React.useEffect(() => {
     onConnectionStatusChange?.(sseStatus);
@@ -149,14 +144,9 @@ export function Chat({
     Boolean(activeThreadId) && Boolean(pendingOnboarding);
   const activeThreadIsProcessing = Boolean(activeThreadId) && isProcessing;
   const activeRunId = activeRun?.runId || null;
-  const streamingAssistantTextVisible = hasVisibleStreamingAssistantText(
-    messages,
-    activeRunId
-  );
   const showTypingIndicator =
     activeThreadIsProcessing &&
-    !activeThreadHasGate &&
-    !streamingAssistantTextVisible;
+    !activeThreadHasGate;
   const hasMessages =
     messages.length > 0 ||
     activeThreadIsProcessing ||
@@ -175,15 +165,34 @@ export function Chat({
             name: pendingOnboardingLabel(pendingOnboarding),
           })
         : "";
+  // Queued-message UX: a running thread no longer disables the composer — a
+  // follow-up sent while a run is active is accepted and queued. Only a
+  // pending gate / onboarding step (which needs the user's input first) or an
+  // active cooldown blocks a send.
   const composerSendDisabled =
     activeThreadHasGate ||
     activeThreadHasOnboarding ||
-    (activeThreadIsProcessing &&
-      !activeThreadHasGate &&
-      !activeThreadHasOnboarding) ||
     cooldownSeconds > 0;
   const composerSendBlockedRef = React.useRef(composerSendDisabled);
   composerSendBlockedRef.current = composerSendDisabled;
+  // Identifies which "empty-thread cycle" may navigate away from the
+  // landing view. It's bumped on every truthy->falsy transition of
+  // activeThreadId (a genuine new cycle, e.g. "+ New") and by whichever
+  // send wins the navigation for the current cycle -- so a captured id
+  // only matches while its cycle is still current and unclaimed. That one
+  // comparison is enough to stop every stale closure from a batch of
+  // concurrent landing-composer sends from re-navigating, whether its
+  // cycle was already claimed by an earlier winner or superseded by a
+  // "+ New" before it settled. Each redundant navigation tears down and
+  // reopens the app's single SSE stream, and those reconnects are
+  // genuinely accepted, so they burn the caller's server-side rate-limit
+  // budget and strand WebChat on the "Disconnected" badge.
+  const previousActiveThreadIdRef = React.useRef(activeThreadId);
+  const emptyThreadCycleIdRef = React.useRef(0);
+  if (previousActiveThreadIdRef.current && !activeThreadId) {
+    emptyThreadCycleIdRef.current += 1;
+  }
+  previousActiveThreadIdRef.current = activeThreadId;
   const composerStatusText =
     approvalSubmitWarning ||
     (cooldownSeconds > 0 ? t("chat.retryIn", { seconds: cooldownSeconds }) : undefined);
@@ -208,24 +217,63 @@ export function Chat({
         throw new Error(approvalSubmitWarning);
       }
       if (composerSendBlockedRef.current) return null;
+      const sendCycleId = emptyThreadCycleIdRef.current;
+      // A newly created thread (from either path below) is not yet the
+      // selected/active one — route the browser to it, exactly as the send
+      // path already did, so the result (a system notice for a command, the
+      // first reply for a message) renders somewhere visible. Only the send
+      // that still owns the current empty-thread cycle may navigate; see
+      // `emptyThreadCycleIdRef`.
+      const selectResponseThread = (response) => {
+        const responseThreadId = response?.thread_id || activeThreadId;
+        if (
+          !activeThreadId &&
+          responseThreadId &&
+          onSelectThread &&
+          emptyThreadCycleIdRef.current === sendCycleId
+        ) {
+          emptyThreadCycleIdRef.current += 1;
+          onSelectThread(responseThreadId, { replace: true });
+        }
+      };
+      // Slash text naming an inventory command executes as a product command
+      // (no turn); anything else — including unknown slash text — submits as
+      // an ordinary message, matching channel behavior. Commands require an
+      // existing conversation (the execute route is thread-scoped): running
+      // one from the landing composer with no thread yet created one and
+      // then lost the result to the thread-load race — the new thread's
+      // history loads empty and wipes the just-appended notice, leaving an
+      // empty conversation behind. Rather than fix that ordering, homepage
+      // commands are intentionally disabled for now — do not drop the
+      // `activeThreadId` precondition below to "fix" this; the fix is to not
+      // offer commands there at all.
+      if (
+        activeThreadId &&
+        images.length === 0 &&
+        attachments.length === 0 &&
+        matchCommand(content, chatCommands)
+      ) {
+        const response = await runCommand(content);
+        selectResponseThread(response);
+        return response;
+      }
       const response = await send(content, {
         images,
         attachments,
         displayContent,
         threadId: activeThreadId,
       });
-      const responseThreadId = response?.thread_id || activeThreadId;
-      if (!activeThreadId && responseThreadId && onSelectThread) {
-        onSelectThread(responseThreadId, { replace: true });
-      }
+      selectResponseThread(response);
       return response;
     },
     [
       activeThreadId,
       activeThreadHasGate,
       approvalSubmitWarning,
+      chatCommands,
       composerSendDisabled,
       onSelectThread,
+      runCommand,
       send,
     ]
   );
@@ -337,6 +385,7 @@ export function Chat({
           <EmptyState
             onSuggestion={handleSuggestion}
             onSend={handleSend}
+            commands={activeThreadId ? chatCommands : []}
             disabled={false}
             sendDisabled={composerSendDisabled}
             initialText={composerDraft}
@@ -358,8 +407,13 @@ export function Chat({
             onLoadMore={loadMore}
             onRetryMessage={retryMessage}
             threadId={activeThreadId}
+            activeRunId={activeRunId}
+            regressionArtifactExportEnabled={
+              regressionArtifactExportEnabled
+            }
             logsPath={logsPath}
             pending={activeThreadIsProcessing}
+            commands={chatCommands}
           >
             {recoveryNotice &&
             (
@@ -453,6 +507,7 @@ export function Chat({
 
           <ChatInput
             onSend={handleSend}
+            commands={activeThreadId ? chatCommands : []}
             disabled={false}
             sendDisabled={composerSendDisabled}
             initialText={composerDraft}

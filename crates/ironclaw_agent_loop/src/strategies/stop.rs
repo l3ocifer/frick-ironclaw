@@ -1,9 +1,8 @@
 //! Stop-condition strategy contract.
 
 use async_trait::async_trait;
-use ironclaw_turns::{
-    LoopFailureKind, LoopMessageRef, LoopResultRef, run_profile::CapabilityProgress,
-};
+use ironclaw_host_api::turn::{LoopMessageRef, LoopResultRef};
+use ironclaw_loop_contracts::{CapabilityProgress, LoopFailureKind};
 
 use crate::state::{
     CapabilityCallSignature, LoopExecutionState, RepeatedCallWarningPhase,
@@ -192,12 +191,9 @@ pub(crate) enum StopKind {
     /// Strategy is satisfied; the executor maps this to graceful completion.
     GracefulStop,
     /// Safety-net escape for specific no-progress evidence such as repeated
-    /// call signatures or typed no-change capability results. The executor
-    /// resolves this to one of two honest terminals: if the driver-specific
-    /// final-answer nudge is enabled and the model synthesizes a real closing
-    /// answer, a graceful completion with that answer; otherwise a typed
-    /// `LoopFailureKind::NoProgressDetected` failure (never a canned
-    /// assistant reply finalized as a successful turn).
+    /// call signatures or typed no-change capability results. After the
+    /// bounded terminal-warning recovery turn is exhausted, the executor
+    /// resolves this to a typed `LoopFailureKind::NoProgressDetected` failure.
     NoProgressDetected,
     /// Strategy aborts with an explicit failure kind.
     Aborted(LoopFailureKind),
@@ -481,7 +477,7 @@ fn signature_made_progress(
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use ironclaw_turns::{LoopMessageRef, LoopResultRef};
+    use ironclaw_host_api::turn::{LoopMessageRef, LoopResultRef};
     use serde_json::json;
 
     use super::*;
@@ -577,17 +573,17 @@ mod tests {
     }
 
     mod default_stop_condition_strategy {
-        use ironclaw_host_api::{CapabilityId, TenantId, ThreadId};
-        use ironclaw_turns::{
-            AgentLoopDriverDescriptor, LoopFailureKind, LoopMessageRef, RunProfileId,
-            RunProfileVersion, TurnId, TurnRunId, TurnScope,
-            run_profile::{
-                CancellationPolicy, CapabilityProgress, CapabilitySurfaceProfileId,
-                CheckpointPolicy, CheckpointSchemaId, ConcurrencyClass, ContextProfileId,
-                LoopDriverId, LoopRunContext, ModelProfileId, RedactedRunProfileProvenance,
-                ResolvedRunProfile, ResourceBudgetPolicy, ResourceBudgetTier, RunClassId,
-                RunProfileFingerprint, RuntimeProfileConstraints, SchedulingClass, SteeringPolicy,
-            },
+        use ironclaw_host_api::ids::{CapabilityId, TenantId, ThreadId};
+        use ironclaw_host_api::turn::{
+            LoopMessageRef, RunProfileId, RunProfileVersion, TurnId, TurnRunId, TurnScope,
+        };
+        use ironclaw_loop_contracts::{
+            AgentLoopDriverDescriptor, CancellationPolicy, CapabilityProgress,
+            CapabilitySurfaceProfileId, CheckpointPolicy, CheckpointSchemaId, ConcurrencyClass,
+            ContextProfileId, LoopDriverId, LoopFailureKind, LoopRunContext, ModelProfileId,
+            RedactedRunProfileProvenance, ResolvedRunProfile, ResourceBudgetPolicy,
+            ResourceBudgetTier, RunClassId, RunProfileFingerprint, RuntimeProfileConstraints,
+            SchedulingClass, SteeringPolicy,
         };
         use serde_json::json;
 
@@ -656,8 +652,7 @@ mod tests {
                     max_model_calls: 32,
                     max_capability_invocations: 64,
                 },
-                personal_context_policy:
-                    ironclaw_turns::run_profile::PersonalContextPolicy::Excluded,
+                personal_context_policy: ironclaw_loop_contracts::PersonalContextPolicy::Excluded,
                 runtime_constraints: RuntimeProfileConstraints {
                     allow_raw_runtime_backend_selection: false,
                     allow_broad_capability_surface: false,

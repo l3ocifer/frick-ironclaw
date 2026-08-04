@@ -1,11 +1,107 @@
+// arch-exempt: large_file, backend parity contracts stay in one shared behavioral suite, plan #5274
 use ironclaw_filesystem::PostgresRootFilesystem;
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_filesystem::{
-    Capability, CasExpectation, Entry, FileType, FilesystemError, FilesystemOperation, Filter,
-    IndexKey, IndexKind, IndexName, IndexSpec, IndexValue, LibSqlRootFilesystem, Page, RecordKind,
-    SeqNo,
+    AtomicSubtreeEntry, Capability, CasExpectation, Entry, FileType, FilesystemError,
+    FilesystemOperation, Filter, InMemoryBackend, IndexKey, IndexKind, IndexName, IndexSpec,
+    IndexValue, LibSqlRootFilesystem, OrderedPage, Page, RecordKind, SeqNo, SortDirection,
 };
-use ironclaw_host_api::VirtualPath;
+use ironclaw_host_api::path::VirtualPath;
+
+#[tokio::test]
+async fn libsql_create_subtree_atomic_publishes_the_complete_batch() {
+    let filesystem = libsql_root().await;
+    let prefix = VirtualPath::new("/engine/tenants/t1/users/u1/attachments/message-1").unwrap();
+    let first =
+        VirtualPath::new("/engine/tenants/t1/users/u1/attachments/message-1/0-alpha.txt").unwrap();
+    let second =
+        VirtualPath::new("/engine/tenants/t1/users/u1/attachments/message-1/1-beta.txt").unwrap();
+
+    let versions = filesystem
+        .create_subtree_atomic(
+            &prefix,
+            vec![
+                AtomicSubtreeEntry {
+                    path: first.clone(),
+                    entry: Entry::bytes(b"alpha".to_vec()),
+                },
+                AtomicSubtreeEntry {
+                    path: second.clone(),
+                    entry: Entry::bytes(b"beta".to_vec()),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(versions.len(), 2);
+    assert_eq!(filesystem.read_file(&first).await.unwrap(), b"alpha");
+    assert_eq!(filesystem.read_file(&second).await.unwrap(), b"beta");
+}
+
+#[tokio::test]
+async fn libsql_create_subtree_atomic_rejects_conflicts_without_overwrite() {
+    let filesystem = libsql_root().await;
+    let prefix =
+        VirtualPath::new("/engine/tenants/t1/users/u1/attachments/message-conflict").unwrap();
+    let file =
+        VirtualPath::new("/engine/tenants/t1/users/u1/attachments/message-conflict/0.txt").unwrap();
+    filesystem
+        .create_subtree_atomic(
+            &prefix,
+            vec![AtomicSubtreeEntry {
+                path: file.clone(),
+                entry: Entry::bytes(b"original".to_vec()),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let error = filesystem
+        .create_subtree_atomic(
+            &prefix,
+            vec![AtomicSubtreeEntry {
+                path: file.clone(),
+                entry: Entry::bytes(b"replacement".to_vec()),
+            }],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, FilesystemError::VersionMismatch { .. }));
+    assert_eq!(filesystem.read_file(&file).await.unwrap(), b"original");
+}
+
+#[tokio::test]
+async fn libsql_create_subtree_atomic_rejects_invalid_batch_without_partial_write() {
+    let filesystem = libsql_root().await;
+    let prefix =
+        VirtualPath::new("/engine/tenants/t1/users/u1/attachments/message-invalid").unwrap();
+    let valid =
+        VirtualPath::new("/engine/tenants/t1/users/u1/attachments/message-invalid/0.txt").unwrap();
+    let outside = VirtualPath::new("/engine/tenants/t1/users/u2/escaped.txt").unwrap();
+
+    let error = filesystem
+        .create_subtree_atomic(
+            &prefix,
+            vec![
+                AtomicSubtreeEntry {
+                    path: valid.clone(),
+                    entry: Entry::bytes(b"valid".to_vec()),
+                },
+                AtomicSubtreeEntry {
+                    path: outside,
+                    entry: Entry::bytes(b"escaped".to_vec()),
+                },
+            ],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, FilesystemError::PathOutsideMount { .. }));
+    assert!(filesystem.get(&valid).await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn libsql_root_filesystem_reads_writes_and_stats_files() {
     let filesystem = libsql_root().await;
@@ -254,7 +350,7 @@ async fn libsql_root_filesystem_migration_failure_surfaces_infrastructure_varian
 
     let locked_db =
         std::sync::Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
-    let filesystem = LibSqlRootFilesystem::new(locked_db);
+    let filesystem = LibSqlRootFilesystem::new(locked_db).expect("filesystem runtime");
     let err = filesystem.run_migrations().await.unwrap_err();
     assert!(
         matches!(err, FilesystemError::BackendInfrastructure { .. }),
@@ -824,6 +920,529 @@ async fn libsql_vector_index_round_trips_and_ranks_by_cosine() {
         Some(&IndexValue::Bytes(blob(&[1.0, 0.0, 0.0])))
     );
 }
+#[tokio::test]
+async fn libsql_ordered_query_uses_composite_index_and_keyset_cursor() {
+    let filesystem = libsql_root().await;
+    let prefix = VirtualPath::new("/threads/index").unwrap();
+    let activity = IndexKey::new("activity").unwrap();
+    let thread_id = IndexKey::new("thread_id").unwrap();
+    filesystem
+        .ensure_index(
+            &prefix,
+            &IndexSpec::new(
+                IndexName::new("thread_activity").unwrap(),
+                vec![activity.clone(), thread_id.clone()],
+                IndexKind::Exact,
+            ),
+        )
+        .await
+        .unwrap();
+    let kind = RecordKind::new("thread_index").unwrap();
+    for (id, rank) in [("b", "001"), ("a", "001"), ("c", "002")] {
+        let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+            .unwrap()
+            .with_indexed(activity.clone(), IndexValue::Text(rank.into()))
+            .with_indexed(thread_id.clone(), IndexValue::Text(id.into()));
+        filesystem
+            .put(
+                &VirtualPath::new(format!("/threads/index/{id}")).unwrap(),
+                entry,
+                CasExpectation::Absent,
+            )
+            .await
+            .unwrap();
+    }
+    let first = filesystem
+        .query_ordered(
+            &prefix,
+            &Filter::All,
+            &ironclaw_filesystem::OrderedPage::new(
+                IndexName::new("thread_activity").unwrap(),
+                activity.clone(),
+                thread_id.clone(),
+                SortDirection::Ascending,
+                2,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|row| row.entry.indexed[&thread_id].clone())
+            .collect::<Vec<_>>(),
+        vec![IndexValue::Text("a".into()), IndexValue::Text("b".into())]
+    );
+    let second = filesystem
+        .query_ordered(
+            &prefix,
+            &Filter::All,
+            &ironclaw_filesystem::OrderedPage::new(
+                IndexName::new("thread_activity").unwrap(),
+                activity.clone(),
+                thread_id.clone(),
+                SortDirection::Ascending,
+                2,
+            )
+            .after(ironclaw_filesystem::OrderedQueryCursor {
+                value: IndexValue::Text("001".into()),
+                tie_breaker: IndexValue::Text("b".into()),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        second[0].entry.indexed[&thread_id],
+        IndexValue::Text("c".into())
+    );
+
+    let descending = filesystem
+        .query_ordered(
+            &prefix,
+            &Filter::All,
+            &ironclaw_filesystem::OrderedPage::new(
+                IndexName::new("thread_activity").unwrap(),
+                activity,
+                thread_id.clone(),
+                SortDirection::Descending,
+                2,
+            )
+            .after(ironclaw_filesystem::OrderedQueryCursor {
+                value: IndexValue::Text("001".into()),
+                tie_breaker: IndexValue::Text("b".into()),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(descending.len(), 1);
+    assert_eq!(
+        descending[0].entry.indexed[&thread_id],
+        IndexValue::Text("a".into())
+    );
+}
+
+#[tokio::test]
+async fn libsql_root_ordered_query_includes_normal_descendants() {
+    let filesystem = libsql_root().await;
+    // `VirtualPath` intentionally does not expose the bare virtual root, so use
+    // a declared top-level root to exercise the same descendant-pattern edge.
+    let root = VirtualPath::new("/engine").unwrap();
+    let rank = IndexKey::new("rank").unwrap();
+    let item_id = IndexKey::new("item_id").unwrap();
+    filesystem
+        .ensure_index(
+            &root,
+            &IndexSpec::new(
+                IndexName::new("root_items").unwrap(),
+                vec![rank.clone(), item_id.clone()],
+                IndexKind::Exact,
+            ),
+        )
+        .await
+        .unwrap();
+    filesystem
+        .put(
+            &VirtualPath::new("/engine/root-query/item-a").unwrap(),
+            Entry::record(
+                RecordKind::new("root_item").unwrap(),
+                &serde_json::json!({}),
+            )
+            .unwrap()
+            .with_indexed(rank.clone(), IndexValue::Text("001".into()))
+            .with_indexed(item_id.clone(), IndexValue::Text("item-a".into())),
+            CasExpectation::Absent,
+        )
+        .await
+        .unwrap();
+
+    let rows = filesystem
+        .query_ordered(
+            &root,
+            &Filter::All,
+            &ironclaw_filesystem::OrderedPage::new(
+                IndexName::new("root_items").unwrap(),
+                rank,
+                item_id,
+                SortDirection::Ascending,
+                10,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path.as_str(), "/engine/root-query/item-a");
+}
+
+#[tokio::test]
+async fn libsql_scopes_ordered_index_names_by_prefix() {
+    let filesystem = libsql_root().await;
+    filesystem
+        .ensure_index(
+            &VirtualPath::new("/engine/prefix-a").unwrap(),
+            &IndexSpec::new(
+                IndexName::new("shared_name").unwrap(),
+                vec![
+                    IndexKey::new("rank_a").unwrap(),
+                    IndexKey::new("id_a").unwrap(),
+                ],
+                IndexKind::Exact,
+            ),
+        )
+        .await
+        .unwrap();
+    filesystem
+        .ensure_index(
+            &VirtualPath::new("/engine/prefix-b").unwrap(),
+            &IndexSpec::new(
+                IndexName::new("shared_name").unwrap(),
+                vec![
+                    IndexKey::new("rank_b").unwrap(),
+                    IndexKey::new("id_b").unwrap(),
+                ],
+                IndexKind::Exact,
+            ),
+        )
+        .await
+        .expect("same index name with a different prefix is independent");
+}
+
+/// The projection's UPDATE and DELETE branches were replaced wholesale
+/// with the static trigger set, but the ordered-index contracts only insert and
+/// query. A stale row left behind after an indexed key changes, or after the
+/// source row is deleted, would go unnoticed.
+async fn static_projection_update_and_delete_contract<F: RootFilesystem>(
+    filesystem: &F,
+    base: &str,
+) {
+    let rank = IndexKey::new("rank").unwrap();
+    let item_id = IndexKey::new("item_id").unwrap();
+    let spec = IndexSpec::new(
+        IndexName::new("mutating_items_v1").unwrap(),
+        vec![rank.clone(), item_id.clone()],
+        IndexKind::Exact,
+    );
+    filesystem
+        .ensure_index(&VirtualPath::new(base.to_string()).unwrap(), &spec)
+        .await
+        .unwrap();
+    let path = VirtualPath::new(format!("{base}/item")).unwrap();
+    let write = async |rank_value: &str, expectation: CasExpectation| {
+        filesystem
+            .put(
+                &path,
+                Entry::record(
+                    RecordKind::new("mutating_item").unwrap(),
+                    &serde_json::json!({}),
+                )
+                .unwrap()
+                .with_indexed(rank.clone(), IndexValue::Text(rank_value.to_string()))
+                .with_indexed(item_id.clone(), IndexValue::Text("item".to_string())),
+                expectation,
+            )
+            .await
+            .unwrap()
+    };
+    let query = async || {
+        filesystem
+            .query_ordered(
+                &VirtualPath::new(base.to_string()).unwrap(),
+                &Filter::All,
+                &OrderedPage::new(
+                    IndexName::new("mutating_items_v1").unwrap(),
+                    rank.clone(),
+                    item_id.clone(),
+                    SortDirection::Ascending,
+                    16,
+                ),
+            )
+            .await
+            .unwrap()
+            .len()
+    };
+
+    let version = write("a", CasExpectation::Absent).await;
+    assert_eq!(query().await, 1, "the insert projects one row");
+
+    // Replacing the indexed key must leave exactly one row, not two.
+    write("b", CasExpectation::Version(version)).await;
+    assert_eq!(
+        query().await,
+        1,
+        "an indexed-key update must replace the projection row, not add one"
+    );
+
+    filesystem.delete(&path).await.unwrap();
+    assert_eq!(
+        query().await,
+        0,
+        "deleting the source row must remove its projection row"
+    );
+}
+
+#[tokio::test]
+async fn libsql_static_projection_update_and_delete_remove_stale_rows() {
+    let filesystem = libsql_root().await;
+    static_projection_update_and_delete_contract(&*filesystem, "/engine/mutating").await;
+}
+
+#[tokio::test]
+async fn in_memory_static_projection_update_and_delete_remove_stale_rows() {
+    let filesystem = InMemoryBackend::new();
+    static_projection_update_and_delete_contract(&filesystem, "/engine/mutating").await;
+}
+
+#[tokio::test]
+async fn libsql_ordered_index_declaration_never_backfills_existing_rows() {
+    let filesystem = libsql_root().await;
+    let prefix = VirtualPath::new("/processes/materialized/process").unwrap();
+    let status = IndexKey::new("status").unwrap();
+    let process_id = IndexKey::new("process_id").unwrap();
+    let kind = RecordKind::new("process").unwrap();
+    let old = Entry::record(kind.clone(), &serde_json::json!({}))
+        .unwrap()
+        .with_indexed(status.clone(), IndexValue::Text("queued".into()))
+        .with_indexed(process_id.clone(), IndexValue::Text("old".into()));
+    filesystem
+        .put(
+            &VirtualPath::new("/processes/materialized/process/old").unwrap(),
+            old,
+            CasExpectation::Absent,
+        )
+        .await
+        .unwrap();
+
+    let spec = IndexSpec::new(
+        IndexName::new("process_queue_declaration_contract").unwrap(),
+        vec![status.clone(), process_id.clone()],
+        IndexKind::Exact,
+    );
+    filesystem.ensure_index(&prefix, &spec).await.unwrap();
+    let page = ironclaw_filesystem::OrderedPage::new(
+        spec.name.clone(),
+        status.clone(),
+        process_id.clone(),
+        SortDirection::Ascending,
+        10,
+    );
+    assert!(
+        filesystem
+            .query_ordered(&prefix, &Filter::All, &page)
+            .await
+            .unwrap()
+            .is_empty(),
+        "declaration must not hide a request-time table scan as automatic backfill"
+    );
+
+    let new = Entry::record(kind, &serde_json::json!({}))
+        .unwrap()
+        .with_indexed(status, IndexValue::Text("queued".into()))
+        .with_indexed(process_id.clone(), IndexValue::Text("new".into()));
+    filesystem
+        .put(
+            &VirtualPath::new("/processes/materialized/process/new").unwrap(),
+            new,
+            CasExpectation::Absent,
+        )
+        .await
+        .unwrap();
+    let rows = filesystem
+        .query_ordered(&prefix, &Filter::All, &page)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].entry.indexed[&process_id],
+        IndexValue::Text("new".into())
+    );
+}
+
+/// Shared cross-backend body: an ordered-index spec declared on an ancestor
+/// prefix serves queries at child paths, and those queries stay scoped to the
+/// queried child subtree.
+///
+/// Projection rows are keyed by spec name and path only, with no record of the
+/// prefix that declared them, so a backend resolving an ancestor spec must
+/// still constrain results to the queried subtree. Without that constraint a
+/// child query returns a sibling's rows — a scope leak, not just a parity
+/// difference.
+async fn ancestor_declared_ordered_index_contract<F: RootFilesystem>(filesystem: &F, base: &str) {
+    let rank = IndexKey::new("rank").unwrap();
+    let item_id = IndexKey::new("item_id").unwrap();
+    let spec = IndexSpec::new(
+        IndexName::new("ancestor_declared_items_v1").unwrap(),
+        vec![rank.clone(), item_id.clone()],
+        IndexKind::Exact,
+    );
+    let root = VirtualPath::new(base.to_string()).unwrap();
+    filesystem.ensure_index(&root, &spec).await.unwrap();
+
+    for (child, leaf) in [("alpha", "a-1"), ("alpha", "a-2"), ("beta", "b-1")] {
+        filesystem
+            .put(
+                &VirtualPath::new(format!("{base}/{child}/{leaf}")).unwrap(),
+                Entry::record(
+                    RecordKind::new("ancestor_item").unwrap(),
+                    &serde_json::json!({}),
+                )
+                .unwrap()
+                .with_indexed(rank.clone(), IndexValue::Text(leaf.to_string()))
+                .with_indexed(item_id.clone(), IndexValue::Text(leaf.to_string())),
+                CasExpectation::Absent,
+            )
+            .await
+            .unwrap();
+    }
+
+    let page = || {
+        ironclaw_filesystem::OrderedPage::new(
+            spec.name.clone(),
+            rank.clone(),
+            item_id.clone(),
+            SortDirection::Ascending,
+            10,
+        )
+    };
+    let paths_at = async |prefix: String| -> Vec<String> {
+        filesystem
+            .query_ordered(&VirtualPath::new(prefix).unwrap(), &Filter::All, &page())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.path.as_str().to_string())
+            .collect()
+    };
+
+    // Declared on the ancestor, queried on a child: the write path projected
+    // into the ancestor declaration, and resolution found it from below.
+    assert_eq!(
+        paths_at(format!("{base}/alpha")).await,
+        vec![format!("{base}/alpha/a-1"), format!("{base}/alpha/a-2")],
+        "a child query must see the rows in its own subtree"
+    );
+    assert_eq!(
+        paths_at(format!("{base}/beta")).await,
+        vec![format!("{base}/beta/b-1")],
+        "a sibling subtree must not leak into a child query resolved from an ancestor spec"
+    );
+    // The declaring prefix itself still spans the whole subtree.
+    assert_eq!(paths_at(base.to_string()).await.len(), 3);
+}
+
+/// Shared cross-backend body for the existing-deployment path: a narrower spec
+/// declared before the root one keeps serving its own subtree once the root
+/// declaration is added, and a subtree that never had its own declaration is
+/// served by the root spec.
+///
+/// Declarations never backfill, so resolution must prefer the more specific
+/// spec — its projection is the one already holding rows written before the
+/// root declaration existed.
+async fn narrow_then_root_ordered_index_contract<F: RootFilesystem>(filesystem: &F, base: &str) {
+    let rank = IndexKey::new("rank").unwrap();
+    let item_id = IndexKey::new("item_id").unwrap();
+    let spec = || {
+        IndexSpec::new(
+            IndexName::new("migrating_items_v1").unwrap(),
+            vec![rank.clone(), item_id.clone()],
+            IndexKind::Exact,
+        )
+    };
+    let write = async |path: String, leaf: &str| {
+        filesystem
+            .put(
+                &VirtualPath::new(path).unwrap(),
+                Entry::record(
+                    RecordKind::new("migrating_item").unwrap(),
+                    &serde_json::json!({}),
+                )
+                .unwrap()
+                .with_indexed(rank.clone(), IndexValue::Text(leaf.to_string()))
+                .with_indexed(item_id.clone(), IndexValue::Text(leaf.to_string())),
+                CasExpectation::Absent,
+            )
+            .await
+            .unwrap();
+    };
+
+    // The deployment as it stands before the fix: a per-thread declaration,
+    // and a row written under it.
+    filesystem
+        .ensure_index(
+            &VirtualPath::new(format!("{base}/threads/t-1")).unwrap(),
+            &spec(),
+        )
+        .await
+        .unwrap();
+    write(format!("{base}/threads/t-1/m-1"), "m-1").await;
+
+    // The upgrade: the root declaration lands while the narrow one remains.
+    filesystem
+        .ensure_index(&VirtualPath::new(base.to_string()).unwrap(), &spec())
+        .await
+        .unwrap();
+    write(format!("{base}/threads/t-1/m-2"), "m-2").await;
+    // A thread created after the upgrade never gets its own declaration.
+    write(format!("{base}/threads/t-2/m-1"), "m-1").await;
+
+    let paths_at = async |prefix: String| -> Vec<String> {
+        filesystem
+            .query_ordered(
+                &VirtualPath::new(prefix).unwrap(),
+                &Filter::All,
+                &ironclaw_filesystem::OrderedPage::new(
+                    IndexName::new("migrating_items_v1").unwrap(),
+                    rank.clone(),
+                    item_id.clone(),
+                    SortDirection::Ascending,
+                    10,
+                ),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.path.as_str().to_string())
+            .collect()
+    };
+
+    assert_eq!(
+        paths_at(format!("{base}/threads/t-1")).await,
+        vec![
+            format!("{base}/threads/t-1/m-1"),
+            format!("{base}/threads/t-1/m-2"),
+        ],
+        "rows written before the root declaration must stay queryable after it"
+    );
+    assert_eq!(
+        paths_at(format!("{base}/threads/t-2")).await,
+        vec![format!("{base}/threads/t-2/m-1")],
+        "a subtree with no declaration of its own is served by the root spec"
+    );
+}
+
+#[tokio::test]
+async fn libsql_ordered_index_declared_at_ancestor_serves_scoped_descendant_queries() {
+    let filesystem = libsql_root().await;
+    ancestor_declared_ordered_index_contract(&*filesystem, "/engine/ancestor-declared").await;
+}
+
+#[tokio::test]
+async fn libsql_ordered_index_narrow_declaration_survives_root_declaration() {
+    let filesystem = libsql_root().await;
+    narrow_then_root_ordered_index_contract(&*filesystem, "/engine/narrow-then-root").await;
+}
+
+#[tokio::test]
+async fn in_memory_ordered_index_declared_at_ancestor_serves_scoped_descendant_queries() {
+    let filesystem = ironclaw_filesystem::InMemoryBackend::new();
+    ancestor_declared_ordered_index_contract(&filesystem, "/engine/ancestor-declared").await;
+}
+
+#[tokio::test]
+async fn in_memory_ordered_index_narrow_declaration_survives_root_declaration() {
+    let filesystem = ironclaw_filesystem::InMemoryBackend::new();
+    narrow_then_root_ordered_index_contract(&filesystem, "/engine/narrow-then-root").await;
+}
+
 #[tokio::test]
 async fn libsql_query_filters_on_indexed_projection() {
     let filesystem = libsql_root().await;
@@ -1428,7 +2047,8 @@ async fn libsql_create_dir_all_concurrent_shared_prefixes_waits_for_writer() {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("root-filesystem.db");
     let db = std::sync::Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
-    let filesystem = std::sync::Arc::new(LibSqlRootFilesystem::new(db));
+    let filesystem =
+        std::sync::Arc::new(LibSqlRootFilesystem::new(db).expect("filesystem runtime"));
     filesystem.run_migrations().await.unwrap();
 
     let mut tasks = Vec::new();
@@ -1459,7 +2079,8 @@ async fn libsql_put_concurrent_distinct_children_waits_for_writer() {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("root-filesystem.db");
     let db = std::sync::Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
-    let filesystem = std::sync::Arc::new(LibSqlRootFilesystem::new(db));
+    let filesystem =
+        std::sync::Arc::new(LibSqlRootFilesystem::new(db).expect("filesystem runtime"));
     filesystem.run_migrations().await.unwrap();
     let parent = VirtualPath::new("/engine/tenants/latency/users/libsql/runs/shared-put").unwrap();
     filesystem.create_dir_all(&parent).await.unwrap();
@@ -1493,7 +2114,7 @@ async fn libsql_root() -> TestLibSqlRootFilesystem {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("root-filesystem.db");
     let db = std::sync::Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
-    let filesystem = LibSqlRootFilesystem::new(db);
+    let filesystem = LibSqlRootFilesystem::new(db).expect("filesystem runtime");
     filesystem.run_migrations().await.unwrap();
     TestLibSqlRootFilesystem {
         filesystem,
@@ -1513,25 +2134,257 @@ async fn libsql_root() -> TestLibSqlRootFilesystem {
 mod postgres_tests {
     use super::*;
     use ironclaw_filesystem::{
-        Capability, CasExpectation, Entry, FileType, FilesystemError, FilesystemOperation, Filter,
-        IndexKey, IndexKind, IndexName, IndexSpec, IndexValue, Page, PostgresRootFilesystem,
-        RecordKind, SeqNo, TxnCapability,
+        AtomicSubtreeEntry, Capability, CasExpectation, Entry, FileType, FilesystemError,
+        FilesystemOperation, Filter, IndexKey, IndexKind, IndexName, IndexSpec, IndexValue, Page,
+        PostgresRootFilesystem, RecordKind, SeqNo, TxnCapability,
     };
-    use ironclaw_host_api::VirtualPath;
+    use ironclaw_host_api::path::VirtualPath;
+
+    /// One container per test binary, started on first use.
+    ///
+    /// Kept alive for the process: dropping the handle stops the database out
+    /// from under every later test. Each test still namespaces by a unique
+    /// path prefix, so sharing one instance is safe.
+    static POSTGRES_CONTAINER: tokio::sync::OnceCell<Option<ContainerUrl>> =
+        tokio::sync::OnceCell::const_new();
+
+    struct ContainerUrl {
+        url: String,
+        _container: testcontainers_modules::testcontainers::ContainerAsync<
+            testcontainers_modules::postgres::Postgres,
+        >,
+    }
+
+    /// The database these tests run against.
+    ///
+    /// An explicit URL wins, so a local run can point at an existing server.
+    /// Otherwise a container is provisioned, which is what lets these tests
+    /// actually run in CI lanes that have Docker but set no database URL —
+    /// previously every case here skipped there, leaving the PostgreSQL
+    /// projection code untested and uncovered.
+    async fn postgres_url() -> Option<String> {
+        if let Ok(url) = std::env::var("IRONCLAW_FILESYSTEM_POSTGRES_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+        {
+            return Some(url);
+        }
+        POSTGRES_CONTAINER
+            .get_or_init(|| async {
+                use testcontainers_modules::testcontainers::{ImageExt, runners::AsyncRunner};
+                let image = testcontainers_modules::postgres::Postgres::default()
+                    .with_db_name("ironclaw_test")
+                    .with_user("postgres")
+                    .with_password("postgres")
+                    .with_tag("16-alpine");
+                let container = match image.start().await {
+                    Ok(container) => container,
+                    Err(error) => {
+                        eprintln!(
+                            "skipping Postgres filesystem contract tests: \
+                             docker/testcontainers unavailable ({error})"
+                        );
+                        return None;
+                    }
+                };
+                let host = container.get_host().await.ok()?;
+                let port = container.get_host_port_ipv4(5432).await.ok()?;
+                Some(ContainerUrl {
+                    url: format!("postgres://postgres:postgres@{host}:{port}/ironclaw_test"),
+                    _container: container,
+                })
+            })
+            .await
+            .as_ref()
+            .map(|container| container.url.clone())
+    }
 
     async fn postgres_pool() -> Option<deadpool_postgres::Pool> {
         if std::env::var("IRONCLAW_SKIP_POSTGRES_TESTS").is_ok() {
             return None;
         }
-        let url = std::env::var("IRONCLAW_FILESYSTEM_POSTGRES_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .ok()?;
+        let url = postgres_url().await?;
         let config = url.parse::<tokio_postgres::Config>().ok()?;
         let manager = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
         deadpool_postgres::Pool::builder(manager)
             .max_size(4)
             .build()
             .ok()
+    }
+
+    /// Installs the projection triggers once per binary, before tests race.
+    ///
+    /// Declaring an ordered index installs those triggers, and that takes an
+    /// ACCESS EXCLUSIVE lock on `root_filesystem_entries`. Against a *fresh*
+    /// database every test would otherwise race the install while its
+    /// neighbours write the same table, and a writer already holding a row lock
+    /// there while it waits on the installer's advisory lock is a deadlock —
+    /// PostgreSQL breaks it by killing one side, which surfaces as `BackendBusy`
+    /// in whichever test lost rather than in the one doing the DDL. Running it
+    /// once leaves every later declaration on the no-DDL fast path. A warm
+    /// database hides this completely, so it reproduces only against a fresh
+    /// one, which is what CI provisions and a repeat local run does not.
+    ///
+    /// The work borrows the first caller's filesystem instead of caching a pool:
+    /// every `#[tokio::test]` has its own runtime, and `tokio_postgres` drives
+    /// each connection from a task on the runtime that created it, so a pool
+    /// shared across tests dies as `connection closed` the moment its origin
+    /// test finishes.
+    static PROJECTION_INSTALLED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+    async fn install_projection_once(filesystem: &PostgresRootFilesystem) {
+        PROJECTION_INSTALLED
+            .get_or_init(|| async {
+                // A unique prefix that is an ancestor of nothing any test
+                // writes, so the declaration projects no rows for them.
+                //
+                // Every step panics rather than returning: reaching here means
+                // a database was resolved, so a failure is a broken setup, not
+                // an unconfigured one. Completing the `OnceCell` quietly with no
+                // triggers installed would let the whole PostgreSQL projection
+                // suite pass while testing nothing -- and the changed-coverage
+                // exemptions for those residual lines are justified by these
+                // tests running.
+                let path = VirtualPath::new(format!(
+                    "/secrets/leases/pgwarmup_{}",
+                    uuid::Uuid::new_v4().simple()
+                ))
+                .expect("warm-up prefix is a valid virtual path");
+                let name = IndexName::new("warmup_probe").expect("warm-up index name");
+                let key = IndexKey::new("rank").expect("warm-up index key");
+                filesystem
+                    .ensure_index(&path, &IndexSpec::new(name, vec![key], IndexKind::Exact))
+                    .await
+                    .expect("warm-up declaration installs the static projection triggers");
+            })
+            .await;
+    }
+
+    /// A private database for a test that mutates or asserts global schema.
+    ///
+    /// The projection triggers live on `root_filesystem_entries`, so installing
+    /// or sweeping them takes an ACCESS EXCLUSIVE lock on that whole table, and
+    /// the `pg_trigger` assertions read state every other test shares. Sharing
+    /// one database, such a test blocks unrelated concurrent writers — which
+    /// surfaces as a `BackendBusy` failure in whichever test happens to be
+    /// mid-write, far from the cause — and races its own assertions against
+    /// their declarations. Path prefixes isolate rows; they cannot isolate
+    /// schema, so a schema-level test gets a schema-level scope.
+    struct IsolatedDatabase {
+        filesystem: PostgresRootFilesystem,
+        prefix: String,
+        client: tokio_postgres::Client,
+        admin: tokio_postgres::Client,
+        name: String,
+    }
+
+    impl IsolatedDatabase {
+        /// Drop the database on the way out of a passing test.
+        ///
+        /// This is the tidy path, not a guarantee: a failing assertion unwinds
+        /// straight past it, so a red run can leave its database behind. That
+        /// is what the sweep in `postgres_isolated_root` collects, rather than
+        /// wrapping the test body in `catch_unwind` — the cleanup is a courtesy
+        /// to whoever points these tests at their own server, and it is not
+        /// worth contorting the test to make it absolute.
+        ///
+        /// `FORCE` closes the pool's connections, which are not guaranteed to
+        /// have gone away by the time the handles drop.
+        async fn cleanup(self) {
+            let Self {
+                filesystem,
+                client,
+                admin,
+                name,
+                ..
+            } = self;
+            drop(filesystem);
+            drop(client);
+            let _ = admin
+                .execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"), &[])
+                .await;
+        }
+    }
+
+    async fn postgres_isolated_root() -> Option<IsolatedDatabase> {
+        // Same opt-out every other PostgreSQL case honours through
+        // `postgres_pool`, checked before anything provisions a container or
+        // issues DDL.
+        if std::env::var("IRONCLAW_SKIP_POSTGRES_TESTS").is_ok() {
+            return None;
+        }
+        // Past the skip flag and a resolvable URL, every failure below is a
+        // broken environment rather than an unconfigured one, so it panics.
+        // Returning `None` instead would make the legacy-trigger sweep -- the
+        // only coverage for that path, and the basis for waiving its residual
+        // lines in the changed-coverage exemptions -- report success while
+        // never running. A role that cannot CREATE DATABASE would silence the
+        // test and the gate together.
+        let config = postgres_url()
+            .await?
+            .parse::<tokio_postgres::Config>()
+            .expect("resolved postgres url parses as a connection config");
+        let (admin, connection) = config
+            .connect(tokio_postgres::NoTls)
+            .await
+            .expect("connect to the resolved postgres server");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Collect databases a previously failed run unwound past. No `FORCE`:
+        // a database another run still holds open refuses to drop, which is
+        // exactly the outcome we want when two binaries share a server.
+        if let Ok(stale) = admin
+            .query(
+                "SELECT datname FROM pg_database WHERE datname LIKE 'rfs_isolated_%'",
+                &[],
+            )
+            .await
+        {
+            for row in stale {
+                let name = row.get::<_, String>(0);
+                let _ = admin
+                    .execute(&format!("DROP DATABASE IF EXISTS {name}"), &[])
+                    .await;
+            }
+        }
+
+        // Identifiers cannot be bind parameters in DDL. `uuid::simple` is hex
+        // and the swept names come from `pg_database`, so both interpolations
+        // are server-supplied or generated, never caller input.
+        let name = format!("rfs_isolated_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .execute(&format!("CREATE DATABASE {name}"), &[])
+            .await
+            .expect("create the isolated database (the role needs CREATEDB)");
+
+        let mut isolated = config.clone();
+        isolated.dbname(&name);
+        let manager = deadpool_postgres::Manager::new(isolated.clone(), tokio_postgres::NoTls);
+        let pool = deadpool_postgres::Pool::builder(manager)
+            .max_size(4)
+            .build()
+            .expect("build a pool against the isolated database");
+        let filesystem = PostgresRootFilesystem::new(pool);
+        filesystem
+            .run_migrations()
+            .await
+            .expect("migrate the isolated database");
+        let (client, connection) = isolated
+            .connect(tokio_postgres::NoTls)
+            .await
+            .expect("connect to the isolated database");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        Some(IsolatedDatabase {
+            filesystem,
+            prefix: format!("/secrets/leases/pgtest_{}", uuid::Uuid::new_v4().simple()),
+            client,
+            admin,
+            name,
+        })
     }
 
     /// Build a fresh Postgres-backed filesystem with migrations applied.
@@ -1543,6 +2396,7 @@ mod postgres_tests {
         let pool = postgres_pool().await?;
         let fs = PostgresRootFilesystem::new(pool);
         fs.run_migrations().await.ok()?;
+        install_projection_once(&fs).await;
         // Unique per-test prefix under /secrets/leases (a known VirtualPath
         // root). Concurrent test runs against the same Postgres get
         // isolation via the prefix; cleanup happens by the next test's
@@ -1554,6 +2408,115 @@ mod postgres_tests {
 
     fn vpath(prefix: &str, leaf: &str) -> VirtualPath {
         VirtualPath::new(format!("{prefix}/{leaf}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn postgres_ordered_index_declared_at_ancestor_serves_scoped_descendant_queries() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        super::ancestor_declared_ordered_index_contract(&fs, &prefix).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_ordered_index_narrow_declaration_survives_root_declaration() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        super::narrow_then_root_ordered_index_contract(&fs, &prefix).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_create_subtree_atomic_publishes_the_complete_batch() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let batch_prefix = vpath(&prefix, "attachments/message-1");
+        let first = vpath(&prefix, "attachments/message-1/0-alpha.txt");
+        let second = vpath(&prefix, "attachments/message-1/1-beta.txt");
+
+        let versions = fs
+            .create_subtree_atomic(
+                &batch_prefix,
+                vec![
+                    AtomicSubtreeEntry {
+                        path: first.clone(),
+                        entry: Entry::bytes(b"alpha".to_vec()),
+                    },
+                    AtomicSubtreeEntry {
+                        path: second.clone(),
+                        entry: Entry::bytes(b"beta".to_vec()),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 2);
+        assert_eq!(fs.read_file(&first).await.unwrap(), b"alpha");
+        assert_eq!(fs.read_file(&second).await.unwrap(), b"beta");
+    }
+
+    #[tokio::test]
+    async fn postgres_create_subtree_atomic_rejects_conflicts_without_overwrite() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let batch_prefix = vpath(&prefix, "attachments/message-conflict");
+        let file = vpath(&prefix, "attachments/message-conflict/0.txt");
+        fs.create_subtree_atomic(
+            &batch_prefix,
+            vec![AtomicSubtreeEntry {
+                path: file.clone(),
+                entry: Entry::bytes(b"original".to_vec()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let error = fs
+            .create_subtree_atomic(
+                &batch_prefix,
+                vec![AtomicSubtreeEntry {
+                    path: file.clone(),
+                    entry: Entry::bytes(b"replacement".to_vec()),
+                }],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, FilesystemError::VersionMismatch { .. }));
+        assert_eq!(fs.read_file(&file).await.unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn postgres_create_subtree_atomic_rejects_invalid_batch_without_partial_write() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let batch_prefix = vpath(&prefix, "attachments/message-invalid");
+        let valid = vpath(&prefix, "attachments/message-invalid/0.txt");
+        let outside = VirtualPath::new(format!("{prefix}-outside/escaped.txt")).unwrap();
+
+        let error = fs
+            .create_subtree_atomic(
+                &batch_prefix,
+                vec![
+                    AtomicSubtreeEntry {
+                        path: valid.clone(),
+                        entry: Entry::bytes(b"valid".to_vec()),
+                    },
+                    AtomicSubtreeEntry {
+                        path: outside,
+                        entry: Entry::bytes(b"escaped".to_vec()),
+                    },
+                ],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, FilesystemError::PathOutsideMount { .. }));
+        assert!(fs.get(&valid).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2114,6 +3077,33 @@ mod postgres_tests {
     }
 
     #[tokio::test]
+    async fn postgres_transaction_reserves_i64_sequence_ranges_atomically() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let prefix_path = VirtualPath::new(&prefix).unwrap();
+        let sequence_path = vpath(&prefix, "sequence-range");
+        let mut transaction = fs.begin(&prefix_path).await.unwrap();
+
+        let first = transaction
+            .reserve_sequence_range(&sequence_path, 3)
+            .await
+            .unwrap();
+        let second = transaction
+            .reserve_sequence_range(&sequence_path, 2)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        assert_eq!(first, SeqNo::from_backend(3));
+        assert_eq!(second, SeqNo::from_backend(5));
+        assert_eq!(
+            fs.reserve_sequence(&sequence_path).await.unwrap(),
+            SeqNo::from_backend(6)
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_get_returns_none_for_missing_path() {
         let Some((fs, prefix)) = postgres_root().await else {
             return;
@@ -2145,6 +3135,38 @@ mod postgres_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FilesystemError::IndexConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_ordered_index_declaration_is_idempotent() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let fs = std::sync::Arc::new(fs);
+        let prefix = std::sync::Arc::new(VirtualPath::new(prefix).unwrap());
+        let spec = std::sync::Arc::new(IndexSpec::new(
+            IndexName::new("concurrent_ordered_projection_v1").unwrap(),
+            vec![
+                IndexKey::new("scope").unwrap(),
+                IndexKey::new("sequence").unwrap(),
+            ],
+            IndexKind::Exact,
+        ));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let fs = std::sync::Arc::clone(&fs);
+            let prefix = std::sync::Arc::clone(&prefix);
+            let spec = std::sync::Arc::clone(&spec);
+            let barrier = std::sync::Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                fs.ensure_index(prefix.as_ref(), spec.as_ref()).await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2190,6 +3212,286 @@ mod postgres_tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_ordered_query_uses_keyset_cursor() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let prefix_path = VirtualPath::new(&prefix).unwrap();
+        let activity = IndexKey::new("activity").unwrap();
+        let thread_id = IndexKey::new("thread_id").unwrap();
+        fs.ensure_index(
+            &prefix_path,
+            &IndexSpec::new(
+                IndexName::new("thread_activity").unwrap(),
+                vec![activity.clone(), thread_id.clone()],
+                IndexKind::Exact,
+            ),
+        )
+        .await
+        .unwrap();
+        let kind = RecordKind::new("thread_index").unwrap();
+        for (id, rank) in [("b", "001"), ("a", "001"), ("c", "002")] {
+            let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+                .unwrap()
+                .with_indexed(activity.clone(), IndexValue::Text(rank.into()))
+                .with_indexed(thread_id.clone(), IndexValue::Text(id.into()));
+            fs.put(&vpath(&prefix, id), entry, CasExpectation::Absent)
+                .await
+                .unwrap();
+        }
+        let rows = fs
+            .query_ordered(
+                &prefix_path,
+                &Filter::All,
+                &ironclaw_filesystem::OrderedPage::new(
+                    IndexName::new("thread_activity").unwrap(),
+                    activity,
+                    thread_id.clone(),
+                    SortDirection::Ascending,
+                    2,
+                )
+                .after(ironclaw_filesystem::OrderedQueryCursor {
+                    value: IndexValue::Text("001".into()),
+                    tie_breaker: IndexValue::Text("b".into()),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].entry.indexed[&thread_id],
+            IndexValue::Text("c".into())
+        );
+
+        let descending = fs
+            .query_ordered(
+                &prefix_path,
+                &Filter::All,
+                &ironclaw_filesystem::OrderedPage::new(
+                    IndexName::new("thread_activity").unwrap(),
+                    IndexKey::new("activity").unwrap(),
+                    thread_id.clone(),
+                    SortDirection::Descending,
+                    2,
+                )
+                .after(ironclaw_filesystem::OrderedQueryCursor {
+                    value: IndexValue::Text("001".into()),
+                    tie_breaker: IndexValue::Text("b".into()),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(descending.len(), 1);
+        assert_eq!(
+            descending[0].entry.indexed[&thread_id],
+            IndexValue::Text("a".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_ordered_index_projects_rows_under_long_prefixes() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let unique = prefix.rsplit('_').next().unwrap();
+        let index_name = IndexName::new(format!("long_prefix_projection_{unique}")).unwrap();
+        let status = IndexKey::new("status").unwrap();
+        let process_id = IndexKey::new("process_id").unwrap();
+        let tenant_prefix = VirtualPath::new(format!(
+            "{prefix}/tenants/tenant/agents/agent/projects/project/users/user/turns/materialized/process"
+        ))
+        .unwrap();
+        fs.ensure_index(
+            &tenant_prefix,
+            &IndexSpec::new(
+                index_name.clone(),
+                vec![status.clone(), process_id.clone()],
+                IndexKind::Exact,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let row_path = VirtualPath::new(format!("{}/run-1", tenant_prefix.as_str())).unwrap();
+        let row = Entry::record(RecordKind::new("process").unwrap(), &serde_json::json!({}))
+            .unwrap()
+            .with_indexed(status.clone(), IndexValue::Text("queued".into()))
+            .with_indexed(process_id.clone(), IndexValue::Text("run-1".into()));
+        fs.put(&row_path, row, CasExpectation::Absent)
+            .await
+            .unwrap();
+
+        let rows = fs
+            .query_ordered(
+                &tenant_prefix,
+                &Filter::All,
+                &ironclaw_filesystem::OrderedPage::new(
+                    index_name,
+                    status,
+                    process_id,
+                    SortDirection::Ascending,
+                    10,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, row_path);
+    }
+
+    #[tokio::test]
+    async fn postgres_scopes_ordered_index_names_by_prefix() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        for (suffix, rank, id) in [
+            ("prefix-a", "rank_a", "id_a"),
+            ("prefix-b", "rank_b", "id_b"),
+        ] {
+            fs.ensure_index(
+                &VirtualPath::new(format!("{prefix}/{suffix}")).unwrap(),
+                &IndexSpec::new(
+                    IndexName::new("shared_name").unwrap(),
+                    vec![IndexKey::new(rank).unwrap(), IndexKey::new(id).unwrap()],
+                    IndexKind::Exact,
+                ),
+            )
+            .await
+            .expect("same index name with a different prefix is independent");
+        }
+    }
+
+    /// libSQL pins the legacy-trigger sweep, PostgreSQL did not. Its
+    /// discovery, identifier validation, and drop path are distinct code, so a
+    /// sweep that silently misses would leave the per-declaration trigger
+    /// growth in place on every upgraded database while all other projection
+    /// tests still pass.
+    #[tokio::test]
+    async fn postgres_static_projection_sweeps_legacy_triggers() {
+        // Its own database: this case rewrites and then asserts the trigger set
+        // of a shared table, which no path prefix can isolate.
+        let Some(isolated) = postgres_isolated_root().await else {
+            return;
+        };
+        let IsolatedDatabase {
+            ref filesystem,
+            ref prefix,
+            ref client,
+            ..
+        } = isolated;
+        // Seed a survivor shaped like the per-declaration generation, over the
+        // test's own connection: production types must not carry test seams.
+        client
+            .batch_execute(
+                "CREATE OR REPLACE FUNCTION idx_rfs_legacy_probe_fn() RETURNS trigger                  LANGUAGE plpgsql AS $legacy$ BEGIN                    DELETE FROM root_filesystem_ordered_index_rows WHERE path = NEW.path;                    RETURN NEW; END; $legacy$;                  DROP TRIGGER IF EXISTS idx_rfs_legacy_probe ON root_filesystem_entries;                  CREATE TRIGGER idx_rfs_legacy_probe AFTER INSERT ON root_filesystem_entries                    FOR EACH ROW EXECUTE FUNCTION idx_rfs_legacy_probe_fn();",
+            )
+            .await
+            .expect("seed legacy trigger");
+
+        filesystem
+            .ensure_index(
+                &vpath(prefix, "sweep"),
+                &IndexSpec::new(
+                    IndexName::new("sweep_probe_v1").unwrap(),
+                    vec![IndexKey::new("rank").unwrap()],
+                    IndexKind::Exact,
+                ),
+            )
+            .await
+            .expect("declaration installs the static set and sweeps legacy triggers");
+
+        let remaining = client
+            .query(
+                "SELECT t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+                 WHERE c.relname = 'root_filesystem_entries' AND NOT t.tgisinternal \
+                 ORDER BY t.tgname",
+                &[],
+            )
+            .await
+            .expect("list triggers")
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert!(
+            !remaining.iter().any(|name| name.starts_with("idx_rfs_")),
+            "legacy per-declaration triggers must be swept, saw {remaining:?}"
+        );
+        // The whole set, not just the insert trigger: an install that dropped
+        // the update or delete trigger would still project new rows while
+        // silently leaving stale ones behind on replacement and deletion.
+        for required in [
+            "rfs_ordered_projection_v3_ai",
+            "rfs_ordered_projection_v3_au",
+            "rfs_ordered_projection_v3_ad",
+        ] {
+            assert!(
+                remaining.iter().any(|name| name == required),
+                "the static set must install {required}, saw {remaining:?}"
+            );
+        }
+        // And the behavior those triggers exist for, end to end.
+        super::static_projection_update_and_delete_contract(filesystem, prefix).await;
+        isolated.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_ordered_index_declaration_never_backfills_existing_rows() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let prefix_path = VirtualPath::new(&prefix).unwrap();
+        let status = IndexKey::new("status").unwrap();
+        let process_id = IndexKey::new("process_id").unwrap();
+        let kind = RecordKind::new("process").unwrap();
+        let old = Entry::record(kind.clone(), &serde_json::json!({}))
+            .unwrap()
+            .with_indexed(status.clone(), IndexValue::Text("queued".into()))
+            .with_indexed(process_id.clone(), IndexValue::Text("old".into()));
+        fs.put(&vpath(&prefix, "old"), old, CasExpectation::Absent)
+            .await
+            .unwrap();
+
+        let unique = prefix.rsplit('_').next().unwrap();
+        let spec = IndexSpec::new(
+            IndexName::new(format!("no_backfill_{unique}")).unwrap(),
+            vec![status.clone(), process_id.clone()],
+            IndexKind::Exact,
+        );
+        fs.ensure_index(&prefix_path, &spec).await.unwrap();
+        let page = ironclaw_filesystem::OrderedPage::new(
+            spec.name.clone(),
+            status.clone(),
+            process_id.clone(),
+            SortDirection::Ascending,
+            10,
+        );
+        assert!(
+            fs.query_ordered(&prefix_path, &Filter::All, &page)
+                .await
+                .unwrap()
+                .is_empty(),
+            "declaration must not hide a request-time table scan as automatic backfill"
+        );
+
+        let new = Entry::record(kind, &serde_json::json!({}))
+            .unwrap()
+            .with_indexed(status, IndexValue::Text("queued".into()))
+            .with_indexed(process_id.clone(), IndexValue::Text("new".into()));
+        fs.put(&vpath(&prefix, "new"), new, CasExpectation::Absent)
+            .await
+            .unwrap();
+        let rows = fs
+            .query_ordered(&prefix_path, &Filter::All, &page)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].entry.indexed[&process_id],
+            IndexValue::Text("new".into())
+        );
     }
 
     #[tokio::test]
@@ -2710,3 +4012,4 @@ mod postgres_tests {
         assert!(fs.capabilities().has(Capability::Events));
     }
 }
+// arch-exempt: large_file, fallible libSQL runtime construction only adjusts existing contract setup, plan #6175

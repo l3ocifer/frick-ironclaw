@@ -14,7 +14,10 @@
 mod programmable_surface;
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,26 +27,30 @@ use axum::http::{HeaderName, Method, Request, StatusCode, header};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use http_body_util::BodyExt;
+use ironclaw_extension_contracts::state::LifecyclePublicState;
 use ironclaw_host_api::{
-    ActivityId, AgentId, Blocked, CapabilityId, ExtensionId, GateRef, GateWaypoint,
-    InstallationState, InvocationId, Outcome, OutcomeRefs, ProductSurface, ProductSurfaceCaller,
-    ProductSurfaceError, ProductSurfaceErrorCode, ProductSurfaceErrorKind,
-    ProductSurfaceValidationCode, ProjectId, Resolution, ResultPreviewMeta, ResultProgress,
-    ResultRef, RuntimeKind, SafeSummary, TenantId, TerminateHint, ThreadId, ToolVerdict, UserId,
+    ids::{
+        ActivityId, AgentId, CapabilityId, ExtensionId, GateRef, InvocationId, ProjectId,
+        ResultRef, TenantId, ThreadId, UserId,
+    },
+    resolution::{
+        Blocked, GateWaypoint, Outcome, OutcomeRefs, Resolution, ResultPreviewMeta, ToolVerdict,
+    },
+    result_meta::{ResultProgress, TerminateHint},
+    runtime::RuntimeKind,
+    safe_summary::SafeSummary,
 };
 use ironclaw_product::{
     ADMIN_USER_DELETE_CAPABILITY_ID, ADMIN_USER_PUT_SECRET_CAPABILITY_ID, ADMIN_USER_SECRETS_VIEW,
     ADMIN_USER_SET_ROLE_CAPABILITY_ID, ADMIN_USER_SET_STATUS_CAPABILITY_ID,
     ADMIN_USER_UPDATE_CAPABILITY_ID, ADMIN_USER_VIEW, ADMIN_USERS_VIEW, AUTOMATIONS_VIEW,
-    AdminUserRecord, AdminUserRole, AdminUserSecretMeta, AdminUserStatus, CodexLoginStart,
-    EXTENSION_IMPORT_CAPABILITY_ID, EXTENSION_INSTALL_CAPABILITY_ID, EXTENSION_REGISTRY_VIEW,
+    EXTENSION_IMPORT_CAPABILITY_ID, EXTENSION_INSTALL_CAPABILITY_ID,
+    EXTENSION_REGISTER_HOSTED_MCP_CAPABILITY_ID, EXTENSION_REGISTRY_VIEW,
     EXTENSION_REMOVE_CAPABILITY_ID, EXTENSION_SETUP_SUBMIT_CAPABILITY_ID, EXTENSION_SETUP_VIEW,
     EXTENSIONS_VIEW, FS_LIST_VIEW, FS_MOUNTS_VIEW, FS_STAT_VIEW, FsMount, GLOBAL_AUTO_APPROVE_VIEW,
     LLM_ACTIVE_SET_CAPABILITY_ID, LLM_CONFIG_VIEW, LLM_PROVIDER_DELETE_CAPABILITY_ID,
     LLM_PROVIDER_UPSERT_CAPABILITY_ID, LOGS_VIEW, LifecyclePackageKind, LifecyclePackageRef,
-    LlmActiveSelection, LlmConfigSnapshot, LlmModelsResult, LlmProbeRequest, LlmProbeResult,
-    LlmProviderView, NearAiLoginRequest, NearAiLoginStart, NearAiWalletLoginRequest,
-    NearAiWalletLoginResult, OPERATOR_CONFIG_KEY_VIEW, OPERATOR_CONFIG_LIST_VIEW,
+    OPERATOR_CONFIG_KEY_VIEW, OPERATOR_CONFIG_LIST_VIEW,
     OPERATOR_CONFIG_SET_AUTO_APPROVE_CAPABILITY_ID, OPERATOR_CONFIG_VALIDATE_VIEW,
     OPERATOR_DIAGNOSTICS_VIEW, OPERATOR_LOGS_VIEW, OPERATOR_SETUP_RUN_CAPABILITY_ID,
     OPERATOR_SETUP_VIEW, OPERATOR_STATUS_VIEW, OUTBOUND_DELIVERY_TARGETS_VIEW,
@@ -69,10 +76,10 @@ use ironclaw_product::{
     RebornFsMountsResponse, RebornFsReadRequest, RebornFsStatRequest, RebornFsStatResponse,
     RebornGetProjectRequest, RebornGetRunStateResponse, RebornGlobalAutoApproveRequest,
     RebornGlobalAutoApproveResponse, RebornListAutomationsResponse, RebornListMembersResponse,
-    RebornListProjectsResponse, RebornListThreadsResponse, RebornLogQueryRequest,
-    RebornLogQueryResponse, RebornOperatorArea, RebornOperatorCommandPlaneResponse,
-    RebornOperatorConfigDiagnostic, RebornOperatorConfigDiagnosticSeverity,
-    RebornOperatorConfigEntry, RebornOperatorConfigGetResponse, RebornOperatorConfigListResponse,
+    RebornListProjectsResponse, RebornListThreadsResponse, RebornOperatorArea,
+    RebornOperatorCommandPlaneResponse, RebornOperatorConfigDiagnostic,
+    RebornOperatorConfigDiagnosticSeverity, RebornOperatorConfigEntry,
+    RebornOperatorConfigGetResponse, RebornOperatorConfigListResponse,
     RebornOperatorConfigSetProductRequest, RebornOperatorConfigSetRequest,
     RebornOperatorConfigValidateRequest, RebornOperatorConfigValidateResponse,
     RebornOperatorLogsQuery, RebornOperatorServiceLifecycleAction,
@@ -88,14 +95,14 @@ use ironclaw_product::{
     RebornResumeGateResponse, RebornRetryRunResponse, RebornRunArtifact, RebornRunArtifactRequest,
     RebornSetupExtensionResponse, RebornSkillContentResponse, RebornSkillListResponse,
     RebornSkillSearchResponse, RebornStreamEventsRequest, RebornStreamEventsResponse,
-    RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse,
-    RebornTraceCreditsResponse, RebornTraceHoldAuthorizeProductRequest,
-    RebornTraceHoldAuthorizeResponse, RebornViewPage, RebornViewQuery, RunArtifactLogs,
+    RebornSubmitTurnResponse, RebornThreadArtifact, RebornThreadArtifactRequest,
+    RebornTimelineRequest, RebornTimelineResponse, RebornTraceCreditsResponse,
+    RebornTraceHoldAuthorizeProductRequest, RebornTraceHoldAuthorizeResponse, RunArtifactLogs,
     RunArtifactRedaction, SKILL_AUTO_ACTIVATE_LEARNED_SET_CAPABILITY_ID,
     SKILL_AUTO_ACTIVATE_SET_CAPABILITY_ID, SKILL_CONTENT_VIEW, SKILL_INSTALL_CAPABILITY_ID,
     SKILL_REMOVE_CAPABILITY_ID, SKILL_SEARCH_VIEW, SKILL_UPDATE_CAPABILITY_ID, SKILLS_VIEW,
-    THREAD_DELETE_CAPABILITY_ID, THREADS_VIEW, TIMELINE_VIEW, TRACE_ACCOUNT_TRACES_VIEW,
-    TRACE_CREDITS_VIEW, rejecting_product_surface_error,
+    THREAD_ARTIFACT_SCHEMA, THREAD_ARTIFACT_VIEW, THREAD_DELETE_CAPABILITY_ID, THREADS_VIEW,
+    TIMELINE_VIEW, TRACE_ACCOUNT_TRACES_VIEW, TRACE_CREDITS_VIEW, rejecting_product_surface_error,
 };
 use ironclaw_product::{
     AdapterInstallationId, CapabilityActivityStatusView, CapabilityActivityView,
@@ -103,6 +110,24 @@ use ironclaw_product::{
     ProductOutboundPayload, ProductOutboundTarget, ProductProjectionItem, ProductProjectionState,
     ProgressKind, ProgressUpdateView, ProjectionCursor,
 };
+use ironclaw_product_contracts::admin_users::{
+    AdminUserRecord, AdminUserRole, AdminUserSecretMeta, AdminUserStatus,
+};
+use ironclaw_product_contracts::ironhub::{
+    IronhubInstallDeliveryRequest, IronhubInstallDeliveryResult,
+};
+use ironclaw_product_contracts::operator_llm::{
+    CodexLoginStart, LlmActiveSelection, LlmConfigSnapshot, LlmModelsResult, LlmProbeRequest,
+    LlmProbeResult, LlmProviderView, NearAiLoginRequest, NearAiLoginStart,
+    NearAiWalletLoginRequest, NearAiWalletLoginResult,
+};
+use ironclaw_product_contracts::product_wire::{RebornLogQueryRequest, RebornLogQueryResponse};
+use ironclaw_product_contracts::surface::{
+    ProductSurface, ProductSurfaceCaller, ProductSurfaceError, ProductSurfaceErrorCode,
+    ProductSurfaceErrorKind, ProductSurfaceEventSubscription, ProductSurfaceStreamResponse,
+    ProductSurfaceValidationCode,
+};
+use ironclaw_product_contracts::views::{RebornViewPage, RebornViewQuery};
 use ironclaw_threads::SessionThreadRecord;
 use ironclaw_turns::{
     AcceptedMessageRef, EventCursor, ReplyTargetBindingRef, RunProfileId, RunProfileVersion,
@@ -114,7 +139,7 @@ use ironclaw_webui::webui_v2::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tower::ServiceExt;
 
 use programmable_surface::ProgrammableProductSurface;
@@ -130,6 +155,7 @@ enum ProductSurfaceCallId {
     ProjectFsRead,
     FsRead,
     AttachmentRead,
+    IronhubDeliverInstall,
     TraceAccountLoginLink,
     TraceHoldAuthorize,
     OperatorConfigSetKey,
@@ -159,6 +185,7 @@ impl ProductSurfaceCallId {
             Self::ProjectFsRead => "project.fs.read",
             Self::FsRead => "fs.read",
             Self::AttachmentRead => "attachment.read",
+            Self::IronhubDeliverInstall => "ironhub.deliver_install",
             Self::TraceAccountLoginLink => "trace.account_login_link",
             Self::TraceHoldAuthorize => "trace.hold_authorize",
             Self::OperatorConfigSetKey => "operator.config.set_key",
@@ -188,6 +215,7 @@ impl ProductSurfaceCallId {
             "project.fs.read" => Some(Self::ProjectFsRead),
             "fs.read" => Some(Self::FsRead),
             "attachment.read" => Some(Self::AttachmentRead),
+            "ironhub.deliver_install" => Some(Self::IronhubDeliverInstall),
             "trace.account_login_link" => Some(Self::TraceAccountLoginLink),
             "trace.hold_authorize" => Some(Self::TraceHoldAuthorize),
             "operator.config.set_key" => Some(Self::OperatorConfigSetKey),
@@ -211,13 +239,19 @@ impl ProductSurfaceCallId {
 #[derive(Debug, Clone, PartialEq)]
 struct RecordedProductSurfaceCallRequest {
     call_id: String,
+    caller_user_id: String,
     input: Value,
 }
 
 impl RecordedProductSurfaceCallRequest {
-    fn from_value(call_id: ProductSurfaceCallId, input: Value) -> Self {
+    fn from_value(
+        call_id: ProductSurfaceCallId,
+        caller: &ProductSurfaceCaller,
+        input: Value,
+    ) -> Self {
         Self {
             call_id: call_id.as_str().to_string(),
+            caller_user_id: caller.user_id.as_str().to_string(),
             input,
         }
     }
@@ -273,6 +307,15 @@ fn caller_for_user(user_id: &str) -> ProductSurfaceCaller {
 
 fn router_with(services: Arc<dyn ProductSurface>) -> Router {
     router_with_caller(services, WebUiV2Capabilities::default(), caller())
+}
+
+fn artifact_router_with(services: Arc<dyn ProductSurface>) -> Router {
+    webui_v2_router(
+        WebUiV2State::new(services, DEFAULT_SSE_MAX_CONCURRENT_PER_CALLER)
+            .with_regression_artifact_export_enabled(true),
+    )
+    .layer(axum::Extension(caller()))
+    .layer(axum::Extension(WebUiV2Capabilities::default()))
 }
 
 fn router_with_caller(
@@ -462,6 +505,9 @@ struct StubServices {
     read_attachment_calls: Mutex<Vec<RebornAttachmentRequest>>,
     read_attachment_response: Mutex<Option<RebornAttachmentBytes>>,
     stream_events_calls: Mutex<Vec<RebornStreamEventsRequest>>,
+    subscribe_events_calls: Mutex<Vec<RebornStreamEventsRequest>>,
+    event_subscription_enabled: AtomicBool,
+    hold_event_subscription_open: AtomicBool,
     cancel_run_calls: Mutex<Vec<ProductCancelRunRequest>>,
     resolve_gate_calls: Mutex<Vec<ProductResolveGateRequest>>,
     retry_run_calls: Mutex<Vec<ProductRetryRunRequest>>,
@@ -562,6 +608,16 @@ impl StubServices {
             .push_back(response);
     }
 
+    fn enable_event_subscription(&self) {
+        self.event_subscription_enabled
+            .store(true, Ordering::Release);
+    }
+
+    fn hold_event_subscription_open(&self) {
+        self.hold_event_subscription_open
+            .store(true, Ordering::Release);
+    }
+
     /// Triggered the first time `stream_events` is invoked. Lets the SSE
     /// test wait on the actual service call rather than guessing at a
     /// timeout — axum's SSE body is lazy, so the handler does not run
@@ -609,7 +665,7 @@ impl StubServices {
         }
         Ok(RebornCreateThreadResponse {
             thread: SessionThreadRecord {
-                thread_id: ironclaw_host_api::ThreadId::new("thread:fake").expect("thread id"),
+                thread_id: ironclaw_host_api::ids::ThreadId::new("thread:fake").expect("thread id"),
                 scope: ironclaw_threads::ThreadScope {
                     tenant_id: TenantId::new("tenant-alpha").expect("tenant"),
                     agent_id: AgentId::new("agent-alpha").expect("agent"),
@@ -643,7 +699,7 @@ impl StubServices {
             return Ok(next);
         }
         Ok(RebornSubmitTurnResponse::Submitted {
-            thread_id: ironclaw_host_api::ThreadId::new(
+            thread_id: ironclaw_host_api::ids::ThreadId::new(
                 request.thread_id.clone().unwrap_or_default(),
             )
             .expect("thread id"),
@@ -668,7 +724,7 @@ impl StubServices {
             .push(request.clone());
         Ok(RebornTimelineResponse {
             thread: SessionThreadRecord {
-                thread_id: ironclaw_host_api::ThreadId::new(request.thread_id.clone())
+                thread_id: ironclaw_host_api::ids::ThreadId::new(request.thread_id.clone())
                     .expect("thread id"),
                 scope: ironclaw_threads::ThreadScope {
                     tenant_id: TenantId::new("tenant-alpha").expect("tenant"),
@@ -1232,6 +1288,9 @@ impl StubServices {
             id if id == PROJECTS_VIEW.id => Ok(RebornViewPage {
                 payload: serde_json::to_value(RebornListProjectsResponse {
                     projects: vec![sample_project_info("project-alpha")],
+                    total_projects: 1,
+                    active_projects: 1,
+                    archived_projects: 0,
                 })
                 .expect("projects payload"),
                 next_cursor: None,
@@ -1258,6 +1317,32 @@ impl StubServices {
                 .expect("project members payload"),
                 next_cursor: None,
             }),
+            id if id == THREAD_ARTIFACT_VIEW.id => {
+                let request: RebornThreadArtifactRequest =
+                    serde_json::from_value(query.params).expect("thread artifact params");
+                let artifact = RebornThreadArtifact {
+                    schema: THREAD_ARTIFACT_SCHEMA.to_string(),
+                    generated_at: Utc::now(),
+                    thread_id: request.thread_id,
+                    messages: Vec::new(),
+                    logs: RunArtifactLogs {
+                        source: "test".to_string(),
+                        available: true,
+                        complete: false,
+                        truncated: false,
+                        unavailable_reason: None,
+                        entries: Vec::new(),
+                    },
+                    redaction: RunArtifactRedaction {
+                        pipeline: "deterministic-trace-redactor-v1".to_string(),
+                        applied: false,
+                    },
+                };
+                Ok(RebornViewPage {
+                    payload: serde_json::to_value(artifact).expect("thread artifact payload"),
+                    next_cursor: None,
+                })
+            }
             _ => Err(rejecting_product_surface_error()),
         }
     }
@@ -1543,6 +1628,15 @@ impl StubServices {
                     .await?,
                 ))
             }
+            ProductSurfaceCallId::IronhubDeliverInstall => {
+                let request: IronhubInstallDeliveryRequest =
+                    serde_json::from_value(request.input).expect("input");
+                RecordedProductSurfaceCallResponse::json(IronhubInstallDeliveryResult {
+                    installed: true,
+                    slug: request.slug,
+                    message: "installed".to_string(),
+                })
+            }
             ProductSurfaceCallId::TraceAccountLoginLink => {
                 RecordedProductSurfaceCallResponse::json(
                     self.trace_account_login_link(caller).await?,
@@ -1678,17 +1772,22 @@ impl ProductSurface for StubServices {
     async fn invoke(
         &self,
         caller: ProductSurfaceCaller,
-        request: ironclaw_host_api::ProductSurfaceInvokeRequest,
-    ) -> Result<ironclaw_host_api::ProductSurfaceInvokeResponse, ProductSurfaceError> {
+        request: ironclaw_product_contracts::surface::ProductSurfaceInvokeRequest,
+    ) -> Result<
+        ironclaw_product_contracts::surface::ProductSurfaceInvokeResponse,
+        ProductSurfaceError,
+    > {
         if let Some(call_id) = ProductSurfaceCallId::parse(request.operation_id.as_str()) {
             let output = self
                 .record_product_surface_call(
-                    caller,
-                    RecordedProductSurfaceCallRequest::from_value(call_id, request.input),
+                    caller.clone(),
+                    RecordedProductSurfaceCallRequest::from_value(call_id, &caller, request.input),
                 )
                 .await?
                 .into_value()?;
-            return Ok(ironclaw_host_api::ProductSurfaceInvokeResponse { output });
+            return Ok(
+                ironclaw_product_contracts::surface::ProductSurfaceInvokeResponse { output },
+            );
         }
 
         let output = StubServices::invoke(
@@ -1700,14 +1799,15 @@ impl ProductSurface for StubServices {
         )
         .await?;
         let output = serde_json::to_value(output).map_err(ProductSurfaceError::internal_from)?;
-        Ok(ironclaw_host_api::ProductSurfaceInvokeResponse { output })
+        Ok(ironclaw_product_contracts::surface::ProductSurfaceInvokeResponse { output })
     }
 
     async fn query(
         &self,
         caller: ProductSurfaceCaller,
-        request: ironclaw_host_api::ProductSurfaceQueryRequest,
-    ) -> Result<ironclaw_host_api::ProductSurfaceQueryPage, ProductSurfaceError> {
+        request: ironclaw_product_contracts::surface::ProductSurfaceQueryRequest,
+    ) -> Result<ironclaw_product_contracts::surface::ProductSurfaceQueryPage, ProductSurfaceError>
+    {
         let page = StubServices::query(
             self,
             caller,
@@ -1718,17 +1818,22 @@ impl ProductSurface for StubServices {
             },
         )
         .await?;
-        Ok(ironclaw_host_api::ProductSurfaceQueryPage {
-            items: vec![page.payload],
-            next_cursor: page.next_cursor,
-        })
+        Ok(
+            ironclaw_product_contracts::surface::ProductSurfaceQueryPage {
+                items: vec![page.payload],
+                next_cursor: page.next_cursor,
+            },
+        )
     }
 
     async fn stream_events(
         &self,
         caller: ProductSurfaceCaller,
-        request: ironclaw_host_api::ProductSurfaceStreamRequest,
-    ) -> Result<ironclaw_host_api::ProductSurfaceStreamResponse, ProductSurfaceError> {
+        request: ironclaw_product_contracts::surface::ProductSurfaceStreamRequest,
+    ) -> Result<
+        ironclaw_product_contracts::surface::ProductSurfaceStreamResponse,
+        ProductSurfaceError,
+    > {
         let thread_id = request.stream_id.ok_or_else(|| {
             ProductSurfaceError::validation("stream_id", ProductSurfaceValidationCode::MissingField)
         })?;
@@ -1737,25 +1842,64 @@ impl ProductSurface for StubServices {
             .map(ProjectionCursor::new)
             .transpose()
             .map_err(ProductSurfaceError::internal_from)?;
-        let response = StubServices::stream_events(
-            self,
-            caller,
-            RebornStreamEventsRequest {
-                thread_id,
-                after_cursor,
-            },
-        )
-        .await?;
+        let stream_request = RebornStreamEventsRequest {
+            thread_id,
+            after_cursor,
+        };
+        let response = StubServices::stream_events(self, caller, stream_request.clone()).await?;
         let events = response
             .events
             .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProductSurfaceError::internal_from)?;
-        Ok(ironclaw_host_api::ProductSurfaceStreamResponse {
-            events,
-            next_cursor: None,
-        })
+        let subscription = if self.event_subscription_enabled.load(Ordering::Acquire) {
+            self.subscribe_events_calls
+                .lock()
+                .expect("lock")
+                .push(stream_request);
+            let responses = self
+                .next_stream_events
+                .lock()
+                .expect("lock")
+                .drain(..)
+                .collect::<Vec<_>>();
+            let hold_open = self.hold_event_subscription_open.load(Ordering::Acquire);
+            let (sender, receiver) = mpsc::channel(1);
+            tokio::spawn(async move {
+                for response in responses {
+                    let response = response.and_then(|response| {
+                        let events = response
+                            .events
+                            .into_iter()
+                            .map(serde_json::to_value)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(ProductSurfaceError::internal_from)?;
+                        Ok(ProductSurfaceStreamResponse {
+                            events,
+                            next_cursor: None,
+                            subscription: None,
+                        })
+                    });
+                    if sender.send(response).await.is_err() {
+                        return;
+                    }
+                }
+                if hold_open {
+                    std::future::pending::<()>().await;
+                }
+            });
+            Some(ProductSurfaceEventSubscription::new(receiver))
+        } else {
+            None
+        };
+        Ok(
+            ironclaw_product_contracts::surface::ProductSurfaceStreamResponse {
+                events,
+                next_cursor: None,
+                subscription,
+            },
+        )
     }
 }
 
@@ -1784,8 +1928,9 @@ fn operator_config_entry(key: String, value: Value) -> RebornOperatorConfigEntry
 fn extension_setup_response(package_ref: LifecyclePackageRef) -> RebornSetupExtensionResponse {
     RebornSetupExtensionResponse {
         package_ref,
-        phase: InstallationState::Installed,
+        phase: LifecyclePublicState::SetupNeeded,
         blockers: Vec::new(),
+        message: None,
         payload: None,
         secrets: Vec::new(),
         fields: Vec::new(),
@@ -1800,19 +1945,14 @@ fn extension_info(id: &str, active: bool) -> RebornExtensionInfo {
         display_name: id.to_string(),
         runtime: "first_party".to_string(),
         description: format!("{id} extension"),
-        authenticated: active,
-        active,
         tools: Vec::new(),
-        needs_setup: !active,
-        has_auth: false,
         installation_state: if active {
-            InstallationState::Active
+            LifecyclePublicState::Active
         } else {
-            InstallationState::Installed
+            LifecyclePublicState::SetupNeeded
         },
         activation_error: None,
         version: Some("1.0.0".to_string()),
-        onboarding_state: None,
         onboarding: None,
         auth_accounts: Vec::new(),
         surfaces: Vec::new(),
@@ -2221,7 +2361,7 @@ async fn get_timeline_threads_path_into_request() {
 #[tokio::test]
 async fn get_run_artifact_threads_path_and_run_path_into_request() {
     let services = Arc::new(StubServices::default());
-    let router = router_with(services.clone());
+    let router = artifact_router_with(services.clone());
     let run_id = "3d54a1f0-0a7f-4b9c-a350-4258f2fa3e18";
 
     let response = router
@@ -2250,6 +2390,65 @@ async fn get_run_artifact_threads_path_and_run_path_into_request() {
         serde_json::from_value(queries[0].params.clone()).expect("artifact params");
     assert_eq!(request.thread_id, "thread-x");
     assert_eq!(request.run_id, run_id);
+}
+
+#[tokio::test]
+async fn get_thread_artifact_threads_path_into_request() {
+    let services = Arc::new(StubServices::default());
+    let router = artifact_router_with(services.clone());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/webchat/v2/threads/thread-x/artifact")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let payload: Value = serde_json::from_slice(&body).expect("artifact json");
+    assert_eq!(payload["schema"], THREAD_ARTIFACT_SCHEMA);
+    let queries = services.view_queries.lock().expect("lock").clone();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].view_id, THREAD_ARTIFACT_VIEW.id);
+    let request: RebornThreadArtifactRequest =
+        serde_json::from_value(queries[0].params.clone()).expect("artifact params");
+    assert_eq!(request.thread_id, "thread-x");
+}
+
+#[tokio::test]
+async fn regression_artifact_routes_are_unmounted_by_default() {
+    let services = Arc::new(StubServices::default());
+    let router = router_with(services.clone());
+
+    for path in [
+        "/api/webchat/v2/threads/thread-x/runs/run-x/artifact",
+        "/api/webchat/v2/threads/thread-x/artifact",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "path={path}");
+    }
+
+    assert!(
+        services.view_queries.lock().expect("lock").is_empty(),
+        "a disabled artifact route must not invoke the product surface"
+    );
 }
 
 // The attachment-bytes route carries three path segments and returns raw
@@ -3610,7 +3809,7 @@ async fn get_session_returns_caller_identity_and_capabilities() {
     // rather than a static frontend list that can drift. The `accept` tokens
     // must be exactly the shared format registry's output (drift kill), and
     // the budgets must match what `decode_attachments` enforces.
-    let expected = ironclaw_product::product_attachment_capabilities();
+    let expected = ironclaw_attachments::attachment_capabilities();
     let accept: Vec<String> = body["attachments"]["accept"]
         .as_array()
         .expect("attachments.accept is an array")
@@ -3644,14 +3843,14 @@ async fn get_session_returns_caller_identity_and_capabilities() {
         !accept.iter().any(|t| t.contains('*')),
         "accept must not advertise wildcards: {accept:?}"
     );
-    assert_eq!(body["attachments"]["max_count"], expected.max_count);
+    assert_eq!(body["attachments"]["max_count"], expected.budgets.max_count);
     assert_eq!(
         body["attachments"]["max_file_bytes"],
-        expected.max_file_bytes
+        expected.budgets.max_file_bytes
     );
     assert_eq!(
         body["attachments"]["max_total_bytes"],
-        expected.max_total_bytes
+        expected.budgets.max_total_bytes
     );
 }
 
@@ -3711,6 +3910,37 @@ async fn get_session_reports_reborn_projects_feature_from_state_flag() {
         assert_eq!(
             body["features"]["reborn_projects"], enabled,
             "features.reborn_projects must mirror the state flag (enabled={enabled})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_session_reports_regression_artifact_export_feature_from_state_flag() {
+    for enabled in [false, true] {
+        let services = Arc::new(StubServices::default());
+        let router = webui_v2_router(
+            WebUiV2State::new(services, DEFAULT_SSE_MAX_CONCURRENT_PER_CALLER)
+                .with_regression_artifact_export_enabled(enabled),
+        )
+        .layer(axum::Extension(caller()))
+        .layer(axum::Extension(WebUiV2Capabilities::default()));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/webchat/v2/session")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(
+            body["features"]["regression_artifact_export"], enabled,
+            "session feature must mirror the artifact export gate"
         );
     }
 }
@@ -5294,6 +5524,164 @@ async fn install_extension_invokes_lifecycle_capability_with_body_package_ref() 
 }
 
 #[tokio::test]
+async fn ironhub_deliver_install_dispatches_with_authenticated_caller_and_typed_body() {
+    let services = Arc::new(StubServices::default());
+    let authenticated_caller = caller_for_user("user-ironhub");
+    let router = router_with_caller(
+        services.clone(),
+        WebUiV2Capabilities::default(),
+        authenticated_caller,
+    );
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/webchat/v2/ironhub/install")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"slug":"my-skill","version":"1.0.0","uid":"u","aid":"a","ts":1700000000,"nonce":"n","artifact_digest":"sha256:deadbeef","sig":"sig-1","private_manifest_url":"https://catalog.example/private/repo?token=rotating"}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["installed"], true);
+    assert_eq!(body["slug"], "my-skill");
+
+    let calls = services.surface_calls.lock().expect("lock").clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].call_id,
+        ProductSurfaceCallId::IronhubDeliverInstall.as_str()
+    );
+    assert_eq!(calls[0].caller_user_id, "user-ironhub");
+    assert_eq!(
+        calls[0].input,
+        serde_json::json!({
+            "slug": "my-skill",
+            "version": "1.0.0",
+            "uid": "u",
+            "aid": "a",
+            "ts": 1_700_000_000_u64,
+            "nonce": "n",
+            "artifact_digest": "sha256:deadbeef",
+            "sig": "sig-1",
+            "private_manifest_url": "https://catalog.example/private/repo?token=rotating"
+        })
+    );
+}
+
+#[tokio::test]
+async fn register_hosted_mcp_uses_closed_wire_without_extension_readback() {
+    let services = Arc::new(StubServices::default());
+    services.enqueue_invoke_response(Ok(successful_resolution(ActivityId::new())));
+    let router = router_with(services.clone());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/webchat/v2/extensions/register-hosted-mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"desired_id":"linear","desired_name":"Linear MCP","endpoint":"https://mcp.linear.app/mcp","auth_selection":{"kind":"oauth","client_profile_id":"linear-default"}}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["success"], true);
+    assert_eq!(body["package_ref"]["id"], "mcp-linear");
+    assert!(body.get("phase").is_none());
+
+    let calls = services.invoke_calls.lock().expect("lock");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0.as_str(),
+        EXTENSION_REGISTER_HOSTED_MCP_CAPABILITY_ID
+    );
+    assert_eq!(
+        calls[0].1,
+        serde_json::json!({
+            "desired_id": "linear",
+            "desired_name": "Linear MCP",
+            "endpoint": "https://mcp.linear.app/mcp",
+            "auth_selection": { "kind": "oauth", "client_profile_id": "linear-default" },
+        })
+    );
+    assert!(
+        services.view_queries.lock().expect("lock").is_empty(),
+        "registration is admission only and must not read an installation projection"
+    );
+}
+
+#[tokio::test]
+async fn register_hosted_mcp_surfaces_ambiguous_auth_as_a_typed_registration_choice() {
+    let services = Arc::new(StubServices::default());
+    services.enqueue_invoke_response(Err(ProductSurfaceError::validation(
+        "auth_selection",
+        ProductSurfaceValidationCode::AuthSelectionRequired,
+    )));
+    let router = router_with(services);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/webchat/v2/extensions/register-hosted-mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"desired_id":"stripe","desired_name":"Stripe MCP","endpoint":"https://mcp.stripe.com","auth_selection":{"kind":"auto"}}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["field"], "auth_selection");
+    assert_eq!(body["validation_code"], "auth_selection_required");
+}
+
+#[tokio::test]
+async fn register_hosted_mcp_sanitizes_missing_and_forbidden_fields() {
+    for body in [
+        r#"{"desired_id":"linear","endpoint":"https://mcp.linear.app/mcp"}"#,
+        r#"{"desired_id":"linear","desired_name":"Linear MCP","endpoint":"https://mcp.linear.app/mcp","secrets":{"token":"must-not-cross"}}"#,
+    ] {
+        let services = Arc::new(StubServices::default());
+        let response = router_with(services.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/webchat/v2/extensions/register-hosted-mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_body = read_json(response).await;
+        assert_eq!(response_body["error"], "invalid_request");
+        assert_eq!(response_body["field"], "request");
+        assert_eq!(response_body["validation_code"], "invalid_value");
+        assert!(services.invoke_calls.lock().expect("lock").is_empty());
+        assert!(!response_body.to_string().contains("token"));
+    }
+}
+
+#[tokio::test]
 async fn install_extension_accepts_auth_gate_only_after_setup_needed_read_back() {
     let services = Arc::new(StubServices::default());
     services.enqueue_invoke_response(Ok(blocked_auth_resolution(ActivityId::new())));
@@ -6667,6 +7055,180 @@ async fn stream_events_continues_immediately_after_non_empty_batch() {
     );
 }
 
+#[tokio::test]
+async fn stream_events_forwards_one_continuous_subscription_without_poll_gaps() {
+    let services = Arc::new(StubServices::default());
+    services.enable_event_subscription();
+    services.enqueue_stream_events(Ok(RebornStreamEventsResponse {
+        events: vec![make_projection_update_envelope("cursor:sub-a")],
+    }));
+    services.enqueue_stream_events(Ok(RebornStreamEventsResponse {
+        events: vec![make_projection_update_envelope("cursor:sub-b")],
+    }));
+
+    let response = router_with(services.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/webchat/v2/threads/thread-x/events")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    let mut body = response.into_body();
+    let bytes = collect_sse_until(&mut body, Duration::from_millis(250), |buf| {
+        parse_sse_events(buf).len() >= 2
+    })
+    .await;
+    drop(body);
+
+    assert_eq!(
+        parse_sse_events(&bytes).len(),
+        2,
+        "both back-to-back subscription events must reach one SSE connection"
+    );
+    assert_eq!(
+        services.subscribe_events_calls.lock().expect("lock").len(),
+        1,
+        "the SSE connection must open exactly one product subscription"
+    );
+    assert_eq!(
+        services.stream_events_calls.lock().expect("lock").len(),
+        1,
+        "the SSE connection must enter the product stream method only once"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_events_emits_application_keep_alive_while_subscription_is_idle() {
+    let services = Arc::new(StubServices::default());
+    services.enable_event_subscription();
+    services.hold_event_subscription_open();
+
+    let response = router_with(services)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/webchat/v2/threads/thread-x/events")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    let mut body = response.into_body();
+    let body_task = tokio::spawn(async move {
+        collect_sse_until(&mut body, Duration::from_secs(30), |buffer| {
+            String::from_utf8_lossy(buffer).contains("event: keep_alive")
+        })
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::task::yield_now().await;
+
+    let bytes = body_task.await.expect("SSE body task");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("event: keep_alive"), "{text}");
+    assert!(text.contains(r#"data: {"type":"keep_alive"}"#), "{text}");
+}
+
+// Keep-alive frames are liveness pings, not durable resume positions.
+// The product seam stamps an advancing cursor into every envelope
+// (including `KeepAlive`), and the browser's `EventSource` echoes the
+// last `id:` back as `Last-Event-ID` on reconnect. If a keep-alive is
+// the last frame before a disconnect, resuming from its cursor would
+// skip real events that precede it. Pin that keep-alive envelopes never
+// carry an SSE `id:` so the browser keeps the last real event's id as
+// the resume point.
+#[tokio::test]
+async fn stream_events_keep_alive_frame_carries_no_sse_id() {
+    let services = Arc::new(StubServices::default());
+
+    let real_envelope = make_projection_envelope("cursor:real", "hello");
+    let keep_alive_envelope =
+        make_outbound_envelope("cursor:keepalive", ProductOutboundPayload::KeepAlive);
+
+    services.enqueue_stream_events(Ok(RebornStreamEventsResponse {
+        events: vec![real_envelope.clone(), keep_alive_envelope],
+    }));
+    services.enqueue_stream_events(Ok(RebornStreamEventsResponse { events: Vec::new() }));
+
+    let router = router_with(services.clone());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/webchat/v2/threads/thread-x/events")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body = response.into_body();
+    let mut bytes = Vec::<u8>::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let have_events = bytes.windows(2).filter(|w| *w == b"\n\n").count() >= 2;
+        let saw_second_call = services.stream_events_calls.lock().expect("lock").len() >= 2;
+        if have_events && saw_second_call {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(remaining, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    bytes.extend_from_slice(data.as_ref());
+                }
+            }
+            _ => break,
+        }
+    }
+    drop(body);
+
+    let events = parse_sse_events(&bytes);
+    let keep_alive = events
+        .iter()
+        .find(|event| event.event.as_deref() == Some("keep_alive"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a keep_alive event; got: {events:?}; raw: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+    assert!(
+        keep_alive.id.is_none(),
+        "keep_alive frame must not carry an SSE id (resume cursor); got: {keep_alive:?}"
+    );
+    let keep_alive_json: Value =
+        serde_json::from_str(keep_alive.data.as_deref().expect("data")).expect("keep_alive json");
+    assert_eq!(keep_alive_json["type"], "keep_alive");
+    // The cursor field may be present on the frame (it is the envelope's
+    // projection cursor), but it must not be surfaced as the SSE `id:`
+    // field — that is the contract the assertion above pins.
+    assert_eq!(
+        keep_alive_json.get("cursor"),
+        Some(&Value::String("cursor:keepalive".to_string())),
+        "keep_alive frame data carries its envelope cursor as a data field, {keep_alive_json}"
+    );
+
+    // The preceding real event still carries its cursor id, so the browser
+    // keeps it as the Last-Event-ID resume point across the keep-alive.
+    let real_event = events
+        .iter()
+        .find(|event| event.event.as_deref() == Some("final_reply"))
+        .expect("real event precedes keep-alive");
+    let real_cursor_json =
+        serde_json::to_string(real_envelope.projection_cursor()).expect("cursor json");
+    assert_eq!(real_event.id.as_deref(), Some(real_cursor_json.as_str()));
+}
+
 // Pins the *wire* contract the browser sees, not just the handler being
 // called: each envelope must emit a typed WebChat v2 event with the
 // JSON-serialized projection cursor as the SSE `id` and the redacted
@@ -7786,6 +8348,9 @@ async fn list_projects_queries_product_surface_view() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = read_json(response).await;
     assert_eq!(body["projects"][0]["project_id"], "project-alpha");
+    assert_eq!(body["total_projects"], 1);
+    assert_eq!(body["active_projects"], 1);
+    assert_eq!(body["archived_projects"], 0);
     let queries = services.view_queries.lock().expect("lock");
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].view_id.as_str(), PROJECTS_VIEW.id);

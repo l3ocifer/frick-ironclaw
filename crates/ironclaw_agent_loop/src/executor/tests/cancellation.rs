@@ -1,11 +1,11 @@
 use super::{
     AgentLoopExecutor, AgentLoopExecutorError, AgentLoopHostError, AgentLoopHostErrorKind,
-    CanonicalAgentLoopExecutor, CapabilityFailureKind, CheckpointKind, HostStage,
-    LoopCancelReasonKind, LoopCancelledReasonKind, LoopCheckpointKind, LoopExecutionState,
-    LoopExit, LoopGateRef, LoopInput, LoopInputAckToken, LoopInputBatch, LoopInputCursor,
-    LoopInterruptKind, LoopResultRef, LoopRunInfoPort, LoopSafeSummary, MockHost, calls_response,
-    family_with_drain, final_staged_state, input_ack, input_cursor, message_ref, reply_response,
-    resolution, surface_version,
+    CanonicalAgentLoopExecutor, CheckpointKind, FailureKind, HostStage, LoopCancelReasonKind,
+    LoopCancelledReasonKind, LoopCheckpointKind, LoopExecutionState, LoopExit, LoopGateRef,
+    LoopInput, LoopInputAckToken, LoopInputBatch, LoopInputCursor, LoopInterruptKind,
+    LoopResultRef, LoopRunInfoPort, LoopSafeSummary, MockHost, calls_response, family_with_drain,
+    final_staged_state, input_ack, input_cursor, message_ref, reply_response, resolution,
+    surface_version,
 };
 
 #[tokio::test]
@@ -287,11 +287,19 @@ async fn steering_drain_acks_only_after_cursor_checkpoint_is_durable() {
         host.acked_input_tokens(),
         vec![LoopInputAckToken::new("input-ack:after-user").expect("valid")]
     );
+    // The drain stage checkpoints the advanced input cursor and acks
+    // immediately, BEFORE this iteration's prompt bundle is built — the ack is
+    // what flips the queued transcript row model-visible, so an ack deferred
+    // past the prompt build would feed the model a prompt without the drained
+    // message. The two pinned invariants are: no ack before a durable cursor
+    // checkpoint, and no prompt build before the ack.
     assert_eq!(
         host.events(),
         vec![
             "checkpoint:before_model".to_string(),
             "ack_inputs".to_string(),
+            "build_prompt_bundle".to_string(),
+            "checkpoint:before_model".to_string(),
             "checkpoint:final".to_string(),
         ]
     );
@@ -328,9 +336,16 @@ async fn cancellation_after_steering_drain_flushes_pending_input_ack() {
         host.acked_input_tokens(),
         vec![LoopInputAckToken::new("input-ack:after-user-before-cancel").expect("valid")]
     );
+    // The drained input is acked eagerly by the drain stage (after its durable
+    // cursor checkpoint); the cancellation observed right after still exits
+    // with the ack already flushed rather than dropping it.
     assert_eq!(
         host.events(),
-        vec!["checkpoint:final".to_string(), "ack_inputs".to_string()]
+        vec![
+            "checkpoint:before_model".to_string(),
+            "ack_inputs".to_string(),
+            "checkpoint:final".to_string(),
+        ]
     );
 }
 
@@ -368,8 +383,9 @@ async fn cancellation_after_pending_input_ack_strict_profile_propagates_checkpoi
 
     assert_eq!(
         err,
-        AgentLoopExecutorError::CheckpointFailed {
-            stage: CheckpointKind::Final
+        AgentLoopExecutorError::CheckpointRejected {
+            stage: CheckpointKind::Final,
+            safe_summary: LoopSafeSummary::new("scripted checkpoint failure").expect("safe"),
         }
     );
 }
@@ -413,7 +429,6 @@ async fn cancellation_after_pending_input_ack_permissive_profile_propagates_chec
             kind: AgentLoopHostErrorKind::Unavailable,
             safe_summary: LoopSafeSummary::new("scripted checkpoint payload failure").unwrap(),
             reason_kind: None,
-            diagnostic_ref: None,
             detail: None,
         }
     );
@@ -451,12 +466,17 @@ async fn cancellation_after_followup_drain_flushes_pending_input_ack() {
         host.acked_input_tokens(),
         vec![LoopInputAckToken::new("input-ack:after-followup-before-cancel").expect("valid")]
     );
+    // The follow-up drain acks eagerly after its own durable cursor
+    // checkpoint (second before_model event), so by the time the post-drain
+    // cancellation check exits, the ack is already flushed.
     assert_eq!(
         host.events(),
         vec![
+            "build_prompt_bundle".to_string(),
             "checkpoint:before_model".to_string(),
-            "checkpoint:final".to_string(),
+            "checkpoint:before_model".to_string(),
             "ack_inputs".to_string(),
+            "checkpoint:final".to_string(),
         ]
     );
 }
@@ -478,16 +498,39 @@ async fn model_cancelled_returns_cancelled_without_retry() {
     assert_eq!(host.model_requests().len(), 1);
 }
 
+#[tokio::test]
+async fn transcript_finalize_cancelled_propagates_cancelled_without_retry() {
+    let host = MockHost::new(vec![reply_response()])
+        .fail_transcript_with(AgentLoopHostErrorKind::Cancelled);
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let result = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await;
+
+    assert!(matches!(result, Err(AgentLoopExecutorError::Cancelled)));
+    assert_eq!(
+        host.model_requests().len(),
+        1,
+        "transcript cancellation must not trigger another model call"
+    );
+    assert!(
+        host.finalized_assistant_messages().is_empty(),
+        "a cancelled transcript write must not fabricate a finalized reply"
+    );
+}
+
 #[tokio::test(start_paused = true)]
-async fn cancellation_during_availability_backoff_wakes_the_sleep() {
-    // Availability backoffs run up to 60s per attempt; a cancel request must
+async fn cancellation_during_internal_error_backoff_wakes_the_sleep() {
+    // Internal-error backoffs run up to 60s per attempt; a cancel request must
     // wake the executor out of the backoff sleep instead of waiting it out.
     // Under paused time a non-cancellation-aware sleep would auto-advance the
     // clock by the full first backoff (1s), so the elapsed-time assertion
     // pins the select-over-cancellation behavior.
     let host = MockHost::new(Vec::new()).with_model_errors(vec![AgentLoopHostError::new(
-        AgentLoopHostErrorKind::Unavailable,
-        "model unavailable",
+        AgentLoopHostErrorKind::Internal,
+        "model provider failed internally",
     )]);
     let executor = CanonicalAgentLoopExecutor;
     let state = LoopExecutionState::initial_for_run(host.run_context());
@@ -496,7 +539,7 @@ async fn cancellation_during_availability_backoff_wakes_the_sleep() {
     let family = crate::families::default();
     let run = executor.execute_family(&family, &host, state);
     let cancel = async {
-        // Fires while the executor is inside the 1s availability backoff.
+        // Fires while the executor is inside the 1s internal-error backoff.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         host.request_cancellation(LoopCancelReasonKind::UserRequested);
     };
@@ -539,11 +582,11 @@ async fn cancellation_after_retry_prompt_rebuild_skips_second_model_call() {
 #[tokio::test]
 async fn capability_cancelled_returns_cancelled_exit_without_retry() {
     let host = MockHost::new(vec![calls_response()]).with_batch_outcomes(vec![
-        ironclaw_host_api::ResolutionBatch {
+        ironclaw_host_api::resolution::ResolutionBatch {
             resolutions: vec![resolution::failed(
-                CapabilityFailureKind::Cancelled,
+                FailureKind::Cancelled,
                 "capability cancelled".to_string(),
-                None,
+                super::diagnostic_failure_detail("capability cancelled"),
             )],
             stopped_on_suspension: false,
         },
@@ -668,11 +711,11 @@ async fn cancellation_after_before_side_effect_checkpoint_skips_capability_call(
 async fn cancellation_after_capability_batch_preserves_completed_result() {
     let result_ref = LoopResultRef::new("result:late-cancel").expect("valid");
     let host = MockHost::new(vec![calls_response()])
-        .with_batch_outcomes(vec![ironclaw_host_api::ResolutionBatch {
+        .with_batch_outcomes(vec![ironclaw_host_api::resolution::ResolutionBatch {
             resolutions: vec![resolution::completed(
                 result_ref.clone(),
                 "completed before cancellation".to_string(),
-                ironclaw_turns::run_profile::CapabilityProgress::MadeProgress,
+                ironclaw_loop_contracts::CapabilityProgress::MadeProgress,
                 true,
                 0,
                 None,
@@ -741,7 +784,6 @@ async fn cancellation_checkpoint_payload_unavailable_propagates_for_permissive_p
             kind: AgentLoopHostErrorKind::Unavailable,
             safe_summary: LoopSafeSummary::model_gateway_failed(),
             reason_kind: None,
-            diagnostic_ref: None,
             detail: Some(raw_summary.to_string()),
         }
     );
@@ -768,8 +810,9 @@ async fn cancellation_checkpoint_failure_propagates_executor_error_for_strict_pr
 
     assert_eq!(
         err,
-        AgentLoopExecutorError::CheckpointFailed {
-            stage: CheckpointKind::Final
+        AgentLoopExecutorError::CheckpointRejected {
+            stage: CheckpointKind::Final,
+            safe_summary: LoopSafeSummary::new("scripted checkpoint failure").expect("safe"),
         }
     );
     assert_eq!(host.checkpoint_kinds(), vec![LoopCheckpointKind::Final]);

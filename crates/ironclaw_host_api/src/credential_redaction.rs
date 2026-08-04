@@ -1,6 +1,6 @@
 //! Shared credential-redaction primitives for the model-visible result
-//! vocabulary — the single definition used by both [`crate::SafeSummary`] (the
-//! bounded caption) and [`crate::ModelResultPreview`] (the bounded tool-result
+//! vocabulary — the single definition used by both [`crate::safe_summary::SafeSummary`] (the
+//! bounded caption) and [`crate::model_result_preview::ModelResultPreview`] (the bounded tool-result
 //! CONTENT preview).
 //!
 //! Two independent scans:
@@ -51,27 +51,119 @@ pub(crate) fn contains_credential_marker(lower: &str) -> bool {
 /// boundary and keep matching exactly as before. Canonical copy of
 /// `ironclaw_threads::tool_result_reference::contains_marker_at_word_boundary`
 /// (verified there by `sensitive_markers_match_on_word_boundary_not_substring`).
+/// Boundary rule for ONE candidate match, extracted from
+/// [`contains_marker_at_word_boundary`] so the detector and the redactor cannot
+/// drift. A marker that already carries a non-alphanumeric delimiter on a side
+/// (`bearer `, `authorization:`) does not additionally require an alphanumeric
+/// boundary there — applying the check uniformly made `bearer ` fail to match in
+/// "presented as a Bearer header", so the detector refused text the redactor had
+/// left untouched.
+fn marker_match_at(haystack: &str, marker: &str, start: usize, end: usize) -> bool {
+    let starts_alnum = marker.starts_with(|c: char| c.is_ascii_alphanumeric());
+    let ends_alnum = marker.ends_with(|c: char| c.is_ascii_alphanumeric());
+    let before_ok = !starts_alnum
+        || haystack
+            .get(..start)
+            .is_none_or(|prefix| !prefix.ends_with(|c: char| c.is_ascii_alphanumeric()));
+    let after_ok = !ends_alnum
+        || haystack
+            .get(end..)
+            .is_none_or(|suffix| !suffix.starts_with(|c: char| c.is_ascii_alphanumeric()));
+    before_ok && after_ok
+}
+
 fn contains_marker_at_word_boundary(haystack: &str, marker: &str) -> bool {
     if marker.is_empty() {
         return false;
     }
-    let starts_alnum = marker.starts_with(|c: char| c.is_ascii_alphanumeric());
-    let ends_alnum = marker.ends_with(|c: char| c.is_ascii_alphanumeric());
     for (start, _) in haystack.match_indices(marker) {
-        let end = start + marker.len();
-        let before_ok = !starts_alnum
-            || haystack
-                .get(..start)
-                .is_none_or(|prefix| !prefix.ends_with(|c: char| c.is_ascii_alphanumeric()));
-        let after_ok = !ends_alnum
-            || haystack
-                .get(end..)
-                .is_none_or(|suffix| !suffix.starts_with(|c: char| c.is_ascii_alphanumeric()));
-        if before_ok && after_ok {
+        if marker_match_at(haystack, marker, start, start + marker.len()) {
             return true;
         }
     }
     false
+}
+
+pub(crate) const CREDENTIAL_REDACTION_PLACEHOLDER: &str = "[redacted]";
+
+/// Mask credential markers and credential-shaped tokens in `value`, preserving
+/// the surrounding content.
+///
+/// This is the redacting counterpart to [`contains_credential_marker`] /
+/// [`contains_secret_like_token`]: where those answer "should this be refused",
+/// this answers "what can safely be shown". A caller holding model-visible
+/// content should prefer masking the offending span over discarding the whole
+/// payload — dropping it loses legitimate output and, on the preview path, the
+/// continuation metadata that travels with it.
+///
+/// NOTE (revisit): the marker list is credential *vocabulary*, so a description
+/// that merely mentions "no API key required" is masked even though it contains
+/// no credential. `contains_unredacted_credential_value` already models the
+/// sharper "label followed by an actual value" rule; moving this to that
+/// predicate would stop masking harmless prose. Deliberately not changed here —
+/// masking is strictly better than today's wholesale refusal, and narrowing the
+/// rule is a separate decision about a shared credential boundary.
+pub(crate) fn redact_credential_text(value: &str) -> String {
+    let mut redacted = String::with_capacity(value.len());
+    let mut rest = value;
+    // Markers are matched case-insensitively at a word boundary, mirroring
+    // `contains_credential_marker`, so "Secretary" is left alone.
+    'outer: while !rest.is_empty() {
+        let lower = rest.to_ascii_lowercase();
+        let mut best: Option<(usize, usize)> = None;
+        for marker in CREDENTIAL_MARKERS {
+            let mut from = 0;
+            while let Some(found) = lower[from..].find(marker) {
+                let start = from + found;
+                let end = start + marker.len();
+                if marker_match_at(&lower, marker, start, end) {
+                    if best.is_none_or(|(best_start, _)| start < best_start) {
+                        best = Some((start, end));
+                    }
+                    break;
+                }
+                from = start + 1;
+            }
+        }
+        match best {
+            Some((start, end)) => {
+                redacted.push_str(&rest[..start]);
+                redacted.push_str(CREDENTIAL_REDACTION_PLACEHOLDER);
+                rest = &rest[end..];
+            }
+            None => {
+                redacted.push_str(rest);
+                break 'outer;
+            }
+        }
+    }
+    redact_secret_like_tokens(&redacted)
+}
+
+/// Replace whole tokens with a credential-shaped prefix (`sk-`, `ghp_`, `AKIA…`).
+fn redact_secret_like_tokens(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut token = String::new();
+    let flush = |out: &mut String, token: &mut String| {
+        if !token.is_empty() {
+            if has_secret_like_prefix(&token.to_ascii_lowercase()) {
+                out.push_str(CREDENTIAL_REDACTION_PLACEHOLDER);
+            } else {
+                out.push_str(token);
+            }
+            token.clear();
+        }
+    };
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+            token.push(character);
+        } else {
+            flush(&mut out, &mut token);
+            out.push(character);
+        }
+    }
+    flush(&mut out, &mut token);
+    out
 }
 
 /// True when any whitespace/punctuation-delimited token in `lower` (already
@@ -82,6 +174,87 @@ pub(crate) fn contains_secret_like_token(lower: &str) -> bool {
             !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_' | '.')
         })
         .any(has_secret_like_prefix)
+}
+
+/// True when diagnostic text contains a credential assignment with a value or
+/// URL userinfo. Credential vocabulary by itself remains valid diagnostic
+/// context (`password field is required`).
+pub(crate) fn contains_unredacted_credential_value(lower: &str) -> bool {
+    const LABELS: &[&str] = &[
+        "access token",
+        "access-token",
+        "access_token",
+        "api key",
+        "api-key",
+        "api_key",
+        "authorization",
+        "client secret",
+        "client-secret",
+        "client_secret",
+        "cookie",
+        "credential",
+        "password",
+        "passwd",
+        "private key",
+        "private-key",
+        "private_key",
+        "refresh token",
+        "refresh-token",
+        "refresh_token",
+        "secret",
+        "token",
+    ];
+
+    LABELS.iter().any(|label| {
+        lower.match_indices(label).any(|(start, _)| {
+            let end = start + label.len();
+            let before_ok = lower
+                .get(..start)
+                .is_none_or(|prefix| !prefix.ends_with(is_identifier_character));
+            let after_ok = lower
+                .get(end..)
+                .is_none_or(|suffix| !suffix.starts_with(is_identifier_character));
+            if !before_ok || !after_ok {
+                return false;
+            }
+            let suffix = lower[end..]
+                .trim_start()
+                .trim_start_matches(['"', '\'', '`'])
+                .trim_start();
+            let Some(value) = suffix
+                .strip_prefix('=')
+                .or_else(|| suffix.strip_prefix(':'))
+            else {
+                return false;
+            };
+            let value = value
+                .trim_start()
+                .trim_start_matches(['"', '\'', '`'])
+                .trim_start();
+            !value.is_empty() && !value.starts_with("[redacted]")
+        })
+    }) || contains_url_userinfo(lower)
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+}
+
+fn contains_url_userinfo(value: &str) -> bool {
+    let mut remainder = value;
+    while let Some(scheme_end) = remainder.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = remainder[authority_start..]
+            .find(|character: char| {
+                matches!(character, '/' | '?' | '#') || character.is_whitespace()
+            })
+            .map_or(remainder.len(), |index| authority_start + index);
+        if remainder[authority_start..authority_end].contains('@') {
+            return true;
+        }
+        remainder = &remainder[authority_end..];
+    }
+    false
 }
 
 /// True when a credential-shaped prefix starts this token or any interior
@@ -174,6 +347,50 @@ mod tests {
         assert!(contains_credential_marker("the password is hunter2"));
         // `passwordless` is a different word — not a standalone `password`.
         assert!(!contains_credential_marker("passwordless login enabled"));
+    }
+
+    #[test]
+    fn marker_boundaries_and_redaction_skip_embedded_vocabulary() {
+        assert!(marker_match_at("secret", "secret", 0, 6));
+        assert!(!marker_match_at("xsecret", "secret", 1, 7));
+        assert!(!marker_match_at("secretary", "secret", 0, 6));
+        assert!(marker_match_at("bearer token", "bearer ", 0, 7));
+        assert!(marker_match_at(
+            "authorization: token",
+            "authorization:",
+            0,
+            14
+        ));
+        assert_eq!(
+            redact_credential_text("secretary then secret value"),
+            "secretary then [redacted] value"
+        );
+    }
+
+    #[test]
+    fn diagnostic_credential_guard_distinguishes_vocabulary_from_values() {
+        for safe in [
+            "password field is required",
+            "token bucket exhausted",
+            "secret sharing failed",
+            "credential setup is unavailable",
+            r#"{"password":"[REDACTED]"}"#,
+        ] {
+            assert!(
+                !contains_unredacted_credential_value(&safe.to_ascii_lowercase()),
+                "safe vocabulary was treated as a value: {safe}"
+            );
+        }
+        for unsafe_text in [
+            "password=hunter2",
+            r#"{"api_key":"opaque"}"#,
+            "https://user:pass@example.com/path",
+        ] {
+            assert!(
+                contains_unredacted_credential_value(&unsafe_text.to_ascii_lowercase()),
+                "credential value was not detected: {unsafe_text}"
+            );
+        }
     }
 
     #[test]

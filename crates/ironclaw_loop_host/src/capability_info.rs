@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 
-use ironclaw_host_api::{CapabilityId, EffectKind, ProviderToolName, RuntimeKind};
-use ironclaw_turns::run_profile::{
-    AgentLoopHostError, AgentLoopHostErrorKind, ProviderToolDefinition,
+use ironclaw_host_api::{
+    capability::EffectKind,
+    ids::{CapabilityId, ProviderToolName},
+    runtime::RuntimeKind,
 };
+use ironclaw_loop_contracts::{AgentLoopHostError, AgentLoopHostErrorKind, ProviderToolDefinition};
 
 pub(crate) const TOOL_NAME: &str = "capability_info";
 pub(crate) const CAPABILITY_ID: &str = "ironclaw.loop.capability_info";
@@ -93,6 +95,7 @@ pub(super) fn tool_definition() -> Result<ProviderToolDefinition, AgentLoopHostE
         name: provider_tool_name()?,
         description: "Get names, summary, or schema details for a currently visible capability."
             .to_string(),
+        description_trust: Default::default(),
         parameters: schema(),
     })
 }
@@ -262,6 +265,7 @@ fn runtime_kind_label(runtime: RuntimeKind) -> &'static str {
         RuntimeKind::Wasm => "wasm",
         RuntimeKind::Mcp => "mcp",
         RuntimeKind::Script => "script",
+        RuntimeKind::Sandbox => "sandbox",
         RuntimeKind::FirstParty => "first_party",
         RuntimeKind::System => "system",
     }
@@ -304,4 +308,17 @@ fn target_not_visible() -> AgentLoopHostError {
         AgentLoopHostErrorKind::InvalidInvocation,
         "capability_info target is not on the visible surface",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the wire label for the sandboxed-shell lane. `runtime_kind_label`
+    /// is a second copy of `ironclaw_host_runtime::surface::runtime_kind_token`
+    /// (see the mirrored test there) — the two can drift.
+    #[test]
+    fn runtime_kind_label_maps_sandbox_to_stable_wire_string() {
+        assert_eq!(runtime_kind_label(RuntimeKind::Sandbox), "sandbox");
+    }
 }

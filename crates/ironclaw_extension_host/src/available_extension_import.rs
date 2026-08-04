@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
+use ironclaw_extension_contracts::recipe::VendorAuthRecipe;
 use ironclaw_extensions::{
     ExtensionAssetPath, ExtensionManifestRecord, ExtensionPackage, ExtensionRuntimeV2,
     ManifestSource,
 };
 use ironclaw_filesystem::{FileType, FilesystemError, RootFilesystem};
-use ironclaw_host_api::{ExtensionId, RuntimeKind, VirtualPath};
-use ironclaw_product::{LifecyclePackageKind, LifecyclePackageRef, ProductSurfaceFailure};
+use ironclaw_host_api::{ids::ExtensionId, path::VirtualPath, runtime::RuntimeKind};
+use ironclaw_product_contracts::error::ProductOperationFailure;
+use ironclaw_product_contracts::package_lifecycle::{
+    LifecycleExtensionOnboarding, LifecyclePackageKind, LifecyclePackageRef,
+};
 
 use crate::product_extension_host_api_contract_registry;
 
@@ -23,7 +27,7 @@ use crate::{MAX_EXTENSION_BUNDLE_FILES, MAX_EXTENSION_BUNDLE_UNCOMPRESSED_BYTES}
 pub async fn materialize_available_extension<F>(
     fs: &F,
     extension: &AvailableExtensionPackage,
-) -> Result<(), ProductSurfaceFailure>
+) -> Result<(), ProductOperationFailure>
 where
     F: RootFilesystem + ?Sized,
 {
@@ -44,7 +48,7 @@ where
                     );
                 }
             }
-            return Err(ProductSurfaceFailure::Transient {
+            return Err(ProductOperationFailure::Transient {
                 reason: format!(
                     "failed to materialize extension asset {}: {error}",
                     asset.path
@@ -70,7 +74,7 @@ where
 pub fn extension_asset_path(
     extension_id: &ExtensionId,
     asset_path: &str,
-) -> Result<VirtualPath, ProductSurfaceFailure> {
+) -> Result<VirtualPath, ProductOperationFailure> {
     let root = VirtualPath::new(format!("/system/extensions/{}", extension_id.as_str()))
         .map_err(map_binding_error)?;
     ExtensionAssetPath::new(asset_path.to_string())
@@ -86,7 +90,7 @@ pub fn extension_asset_path(
 pub async fn inline_extension_dir_assets<F>(
     fs: &F,
     root: &VirtualPath,
-) -> Result<Vec<AvailableExtensionAsset>, ProductSurfaceFailure>
+) -> Result<Vec<AvailableExtensionAsset>, ProductOperationFailure>
 where
     F: RootFilesystem + ?Sized,
 {
@@ -98,7 +102,7 @@ where
         let entries =
             fs.list_dir(&dir)
                 .await
-                .map_err(|error| ProductSurfaceFailure::Transient {
+                .map_err(|error| ProductOperationFailure::Transient {
                     reason: format!("failed to list available extension assets: {error}"),
                 })?;
         for child in entries {
@@ -114,7 +118,7 @@ where
                 )));
             }
             let bytes = fs.read_file(&child.path).await.map_err(|error| {
-                ProductSurfaceFailure::Transient {
+                ProductOperationFailure::Transient {
                     reason: format!(
                         "failed to read available extension asset {}: {error}",
                         child.path.as_str()
@@ -152,7 +156,66 @@ where
 pub fn imported_extension_package(
     files: Vec<(String, Vec<u8>)>,
     reserved_bundled_ids: &[String],
-) -> Result<AvailableExtensionPackage, ProductSurfaceFailure> {
+) -> Result<AvailableExtensionPackage, ProductOperationFailure> {
+    extension_package_from_files(files, reserved_bundled_ids, ManifestSource::InstalledLocal)
+}
+
+/// Build a registry-installed extension package from already verified files.
+///
+/// Registry clients own signature, provenance, size, and digest verification.
+/// This boundary still applies every extension-host invariant: reserved-id
+/// rejection, manifest validation, declared-asset completeness, and WASI
+/// component validation.
+pub fn registry_extension_package(
+    files: Vec<(String, Vec<u8>)>,
+    reserved_bundled_ids: &[String],
+) -> Result<AvailableExtensionPackage, ProductOperationFailure> {
+    extension_package_from_files(
+        files,
+        reserved_bundled_ids,
+        ManifestSource::RegistryInstalled,
+    )
+}
+
+/// Parse an extension manifest at the import boundary.
+///
+/// Exposed so a caller that downloads a manifest and its assets as separate
+/// artifacts can read the paths the manifest declares and place each asset
+/// where it says, instead of agreeing a path convention with the publisher out
+/// of band. Applies the same host port catalog and contract registry the
+/// package build applies, so what parses here is what installs.
+pub fn parse_imported_manifest(
+    manifest_toml: &str,
+    source: ManifestSource,
+) -> Result<ExtensionManifestRecord, ProductOperationFailure> {
+    let host_ports = ironclaw_host_runtime::default_host_port_catalog().map_err(|error| {
+        ProductOperationFailure::InvalidBindingRequest {
+            reason: format!("host port catalog rejected imported extension: {error}"),
+        }
+    })?;
+    let contracts = product_extension_host_api_contract_registry().map_err(|error| {
+        ProductOperationFailure::InvalidBindingRequest {
+            reason: format!("host API contract registry rejected imported extension: {error}"),
+        }
+    })?;
+    // Uploaded and registry packages are both untrusted host inputs. Only
+    // binary-compiled packages may claim the HostBundled trust/runtime tier.
+    ExtensionManifestRecord::from_toml_with_root_binding(
+        manifest_toml.to_string(),
+        source,
+        &host_ports,
+        None,
+        &contracts,
+        ironclaw_extensions::PackageRootBinding::FabricateOnLoad,
+    )
+    .map_err(map_binding_error)
+}
+
+fn extension_package_from_files(
+    files: Vec<(String, Vec<u8>)>,
+    reserved_bundled_ids: &[String],
+    source: ManifestSource,
+) -> Result<AvailableExtensionPackage, ProductOperationFailure> {
     let manifest_toml = files
         .iter()
         .find(|(path, _)| path == "manifest.toml")
@@ -162,26 +225,7 @@ pub fn imported_extension_package(
                 map_binding_error(format!("imported manifest.toml is not UTF-8: {error}"))
             })
         })?;
-    let host_ports = ironclaw_host_runtime::default_host_port_catalog().map_err(|error| {
-        ProductSurfaceFailure::InvalidBindingRequest {
-            reason: format!("host port catalog rejected imported extension: {error}"),
-        }
-    })?;
-    let contracts = product_extension_host_api_contract_registry().map_err(|error| {
-        ProductSurfaceFailure::InvalidBindingRequest {
-            reason: format!("host API contract registry rejected imported extension: {error}"),
-        }
-    })?;
-    // Uploads are always validated as InstalledLocal. Only binary-compiled
-    // packages may claim the HostBundled trust/runtime tier.
-    let record = ExtensionManifestRecord::from_toml(
-        manifest_toml,
-        ManifestSource::InstalledLocal,
-        &host_ports,
-        None,
-        &contracts,
-    )
-    .map_err(map_binding_error)?;
+    let record = parse_imported_manifest(&manifest_toml, source)?;
     let runtime_kind = record.manifest().runtime.kind();
     if runtime_kind != RuntimeKind::Wasm {
         return Err(map_binding_error(format!(
@@ -197,6 +241,19 @@ pub fn imported_extension_package(
     }
     let id = extension_id.as_str();
     let root = VirtualPath::new(format!("/system/extensions/{id}")).map_err(map_binding_error)?;
+    // Attach the now-known root to the resolved contract without reparsing
+    // the TOML (REC-2: `from_resolved` rebuilds from the already-validated
+    // contract).
+    let mut resolved_with_root = record.resolved().clone();
+    resolved_with_root.root_binding =
+        ironclaw_extensions::PackageRootBinding::Materialized(root.clone());
+    let record = ExtensionManifestRecord::from_resolved(
+        record.raw_toml(),
+        source,
+        resolved_with_root,
+        record.manifest_hash().cloned(),
+    )
+    .map_err(map_binding_error)?;
     let surface_kinds = surface_kinds_from_manifest_record(&record, id)?;
     let manifest = record
         .manifest()
@@ -243,16 +300,56 @@ pub fn imported_extension_package(
         )?,
         manifest_toml: record.raw_toml().to_string(),
         resolved_manifest: Arc::new(record.resolved().clone()),
-        source: ManifestSource::InstalledLocal,
+        source,
         package,
         cleanup_requirements: Vec::new(),
         surface_kinds,
         channel_directions: None,
         channel_presentation: None,
         assets,
-        onboarding_override: None,
+        onboarding_override: onboarding_from_auth_recipes(record.resolved()),
         oauth_setup_override: None,
         search_aliases: Vec::new(),
+    })
+}
+
+/// Carry the vendor's own account-setup copy out of the manifest so an installed
+/// extension can tell the user how to obtain the secret it is asking for.
+///
+/// Without this an imported package surfaces "this needs a credential" and
+/// nothing else: the user has no steps to follow, and a model asked for help has
+/// no grounded source and invents them. The copy is authored by whoever authored
+/// the manifest, so it is descriptive text only — it grants nothing and is
+/// rendered, never executed.
+///
+/// Only the first vendor that carries copy is used. Every registry tool today
+/// declares exactly one, and concatenating several vendors' instructions would
+/// produce guidance for a credential the user was not asked for.
+fn onboarding_from_auth_recipes(
+    manifest: &ironclaw_extensions::ResolvedExtensionManifest,
+) -> Option<LifecycleExtensionOnboarding> {
+    manifest.auth.iter().find_map(|surface| {
+        let (display_name, instructions, setup_url) = match surface.recipe.as_ref()? {
+            VendorAuthRecipe::ApiKey(recipe) => (
+                &recipe.display_name,
+                recipe.instructions.as_ref(),
+                recipe.setup_url.as_ref(),
+            ),
+            VendorAuthRecipe::Oauth2Code(recipe) => (
+                &recipe.display_name,
+                recipe.instructions.as_ref(),
+                recipe.setup_url.as_ref(),
+            ),
+        };
+        let instructions = instructions?;
+        Some(LifecycleExtensionOnboarding {
+            instructions: instructions.clone(),
+            credential_instructions: Some(instructions.clone()),
+            setup_url: setup_url.map(|url| url.as_str().to_string()),
+            credential_next_step: Some(format!(
+                "Add the {display_name} credential to finish activating this extension."
+            )),
+        })
     })
 }
 
@@ -281,7 +378,7 @@ mod tests {
     use async_trait::async_trait;
     use ironclaw_extensions::ManifestSource;
     use ironclaw_filesystem::{DirEntry, FileStat, FilesystemOperation, InMemoryBackend};
-    use ironclaw_host_api::RuntimeKind;
+    use ironclaw_host_api::runtime::RuntimeKind;
 
     use crate::{AvailableExtensionAssetContent, AvailableExtensionCatalog};
 
@@ -394,7 +491,7 @@ output_schema_ref = "schemas/search.output.json"
         let error = inline_extension_dir_assets(&MismatchedAssetPathFilesystem, &root)
             .await
             .expect_err("asset paths outside the extension root must fail discovery");
-        let ProductSurfaceFailure::InvalidBindingRequest { reason } = error else {
+        let ProductOperationFailure::InvalidBindingRequest { reason } = error else {
             panic!("expected invalid binding request, got {error:?}");
         };
         assert!(reason.contains("/system/extensions/other/asset.txt"));
@@ -509,7 +606,7 @@ output_schema_ref = "schemas/search.output.json"
         )
         .await
         .expect_err("transient manifest read error must abort the catalog load");
-        assert!(matches!(error, ProductSurfaceFailure::Transient { .. }));
+        assert!(matches!(error, ProductOperationFailure::Transient { .. }));
     }
 
     struct UnreadableManifestFilesystem;
@@ -598,6 +695,89 @@ prompt_doc_ref = "prompts/run.md"
     }
 
     #[test]
+    fn registry_extension_package_rejects_non_utf8_manifest() {
+        let error =
+            registry_extension_package(vec![("manifest.toml".to_string(), vec![0xff])], &[])
+                .expect_err("registry manifests must be UTF-8");
+        assert!(format!("{error}").contains("not UTF-8"));
+    }
+
+    #[test]
+    fn imported_auth_recipe_onboarding_preserves_api_key_and_oauth_copy() {
+        for (method, recipe, expected_name, expected_url) in [
+            (
+                "api_key",
+                r#"fields = [ { handle = "fixture_api_key", label = "API key", secret = true } ]"#,
+                "Fixture API",
+                "https://example.com/api-keys",
+            ),
+            (
+                "oauth2_code",
+                r#"authorization_endpoint = "https://example.com/oauth/authorize"
+token_endpoint = "https://example.com/oauth/token"
+scopes = ["read"]
+client_credentials = { client_id_handle = "fixture_client_id", client_secret_handle = "fixture_client_secret" }
+
+[auth.fixture.token_response]
+access_token = "/access_token""#,
+                "Fixture OAuth",
+                "https://example.com/oauth/apps",
+            ),
+        ] {
+            let manifest = format!(
+                r#"schema_version = "reborn.extension_manifest.v3"
+id = "fixture"
+name = "Fixture"
+version = "0.1.0"
+description = "fixture"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/fixture.wasm"
+
+[[tools]]
+origin_gate_matrix = {{ loop_run = "gated_unless_granted", product = "forbidden", automation = "forbidden" }}
+id = "fixture.run"
+description = "run"
+effects = ["network", "use_secret"]
+default_permission = "ask"
+visibility = "model"
+input_schema_ref = "schemas/input.json"
+
+[[tools.credentials]]
+handle = "fixture_api_key"
+vendor = "fixture"
+audience = {{ scheme = "https", host = "example.com" }}
+injection = {{ type = "header", name = "authorization", prefix = "Bearer " }}
+
+[auth.fixture]
+method = "{method}"
+display_name = "{expected_name}"
+instructions = "Create the vendor credential."
+setup_url = "{expected_url}"
+{recipe}"#
+            );
+            let record = parse_imported_manifest(&manifest, ManifestSource::RegistryInstalled)
+                .expect("auth fixture manifest");
+            let onboarding =
+                onboarding_from_auth_recipes(record.resolved()).expect("published setup copy");
+            assert_eq!(onboarding.instructions, "Create the vendor credential.");
+            assert_eq!(
+                onboarding.credential_instructions,
+                Some(onboarding.instructions.clone())
+            );
+            assert_eq!(onboarding.setup_url.as_deref(), Some(expected_url));
+            assert!(
+                onboarding
+                    .credential_next_step
+                    .as_deref()
+                    .is_some_and(|step| step.contains(expected_name))
+            );
+        }
+    }
+
+    #[test]
     fn test_tool_fixture_manifests_stay_importable() {
         for (label, manifest) in [
             (
@@ -623,6 +803,7 @@ prompt_doc_ref = "prompts/run.md"
                 &host_ports,
                 None,
                 &contracts,
+                None,
             )
             .unwrap_or_else(|error| panic!("test-tools/{label} manifest must validate: {error}"));
             assert_eq!(record.manifest().runtime.kind(), RuntimeKind::Wasm);
@@ -636,6 +817,15 @@ prompt_doc_ref = "prompts/run.md"
                 .expect("complete wasm tool bundle must import");
         assert_eq!(package.source, ManifestSource::InstalledLocal);
         assert_eq!(package.package_ref.id.as_str(), "uploaded-tool");
+        // The two-pass root attach (parse with root=None to learn the id,
+        // then rebuild via `from_resolved` with the id-derived root) must
+        // survive onto the resolved contract, not just `package.package.root`.
+        assert_eq!(
+            package.resolved_manifest.root_binding,
+            ironclaw_extensions::PackageRootBinding::Materialized(
+                VirtualPath::new("/system/extensions/uploaded-tool").unwrap()
+            )
+        );
     }
 
     #[tokio::test]
@@ -666,7 +856,7 @@ prompt_doc_ref = "prompts/run.md"
         let error = imported_extension_package(
             vec![(
                 "manifest.toml".to_string(),
-                include_str!("../../ironclaw_first_party_extensions/assets/github/manifest.toml")
+                include_str!("../../extensions/packages/github/manifest.toml")
                     .as_bytes()
                     .to_vec(),
             )],

@@ -5,7 +5,7 @@
 /// the concrete executors the `ironclaw_reborn_cli` binary assembles in
 /// production (`crates/ironclaw_reborn_cli/src/first_party/`).
 ///
-/// Composition names `ironclaw_first_party_extensions` in production nowhere
+/// Composition names `ironclaw_extension_support` in production nowhere
 /// (extension-runtime DEL-7); the binary supplies these registrars on the build
 /// input. Tests re-derive the same wiring here through the test-support
 /// feature so they can install/activate/dispatch the first-party extensions
@@ -17,7 +17,7 @@ use ironclaw_auth::{
     CredentialAccount, CredentialAccountSelectionRequest, RuntimeCredentialAccountVisibilityPolicy,
 };
 use ironclaw_extension_host::{FirstPartyHandlerRegistrar, FirstPartyRegistrarContext};
-use ironclaw_first_party_extensions::{
+use ironclaw_extension_support::{
     FIRST_PARTY_WEB_GET_CONTENT_CAPABILITY_ID, FIRST_PARTY_WEB_SEARCH_CAPABILITY_ID,
     FirstPartyWebDispatchError, FirstPartyWebDispatchRequest, FirstPartyWebExecutor,
     GOOGLE_PROVIDER_ID, GsuiteCapabilitySpec, GsuiteCredentialDispatchReason,
@@ -26,17 +26,23 @@ use ironclaw_first_party_extensions::{
     find_gsuite_capability, gsuite_google_account_visible_to_requester, gsuite_package_specs,
 };
 use ironclaw_host_api::{
-    CapabilityId, ExtensionId, HostApiError, NetworkScheme, NetworkTargetPattern,
-    RuntimeCredentialAccountSetup, RuntimeCredentialAuthRequirement, RuntimeCredentialRequirement,
-    RuntimeCredentialRequirementSource, RuntimeCredentialTarget, RuntimeDispatchErrorKind,
-    SecretHandle, VendorId,
+    action::{NetworkScheme, NetworkTargetPattern},
+    capability::{
+        RuntimeCredentialAccountSetup, RuntimeCredentialRequirement,
+        RuntimeCredentialRequirementSource,
+    },
+    decision::RuntimeCredentialAuthRequirement,
+    dispatch::RuntimeDispatchErrorKind,
+    error::HostApiError,
+    http::RuntimeCredentialTarget,
+    ids::{CapabilityId, ExtensionId, SecretHandle, VendorId},
 };
 use ironclaw_host_runtime::{
     FirstPartyCapabilityError, FirstPartyCapabilityHandler, FirstPartyCapabilityRegistry,
     FirstPartyCapabilityRequest, FirstPartyCapabilityResult, ProductAuthProviderRuntimePorts,
 };
 
-/// The full set of first-party handler registrars a local-dev/test build
+/// The full set of first-party handler registrars a standalone/test build
 /// needs, mirroring `ironclaw_reborn_cli::first_party::bundled_first_party_registrars`.
 pub fn bundled_first_party_registrars() -> Vec<Arc<dyn FirstPartyHandlerRegistrar>> {
     vec![

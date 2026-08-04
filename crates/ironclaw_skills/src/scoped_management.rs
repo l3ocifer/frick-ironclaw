@@ -2,16 +2,23 @@ use std::{path::PathBuf, sync::Arc};
 
 use ironclaw_filesystem::{DiskFilesystem, FilesystemError, RootFilesystem};
 use ironclaw_host_api::{
-    HostApiError, HostPath, InvocationId, MountAlias, MountGrant, MountPermissions, MountView,
-    ResourceScope, UserId, VirtualPath,
+    error::HostApiError,
+    ids::{InvocationId, UserId},
+    mount::{MountGrant, MountPermissions, MountView},
+    path::{HostPath, MountAlias, VirtualPath},
+    resource::ResourceScope,
 };
 
 use crate::{
     SkillContentRequest, SkillContentResult, SkillInstallRequest, SkillInstallResult,
     SkillInstallSource, SkillManagementContext, SkillManagementError, SkillRemoveRequest,
     SkillRemoveResult, SkillSearchRequest, SkillSearchResult, SkillSummary, SkillUpdateRequest,
-    SkillUpdateResult, install_skill, list_skills, read_skill_content, remove_skill, search_skills,
-    update_skill,
+    SkillUpdateResult, install_skill, list_skills,
+    management::{
+        SKILL_FILE_NAME, SkillBundleSnapshot, USER_SKILLS_ROOT, capture_skill_bundle,
+        restore_skill_bundle,
+    },
+    read_skill_content, remove_skill, search_skills, update_skill,
 };
 
 pub type ScopedSkillManagementMountResolver =
@@ -41,6 +48,16 @@ pub struct ScopedSkillManagementPort {
     owner_user_id: UserId,
     filesystem: Arc<dyn RootFilesystem>,
     mount_resolver: Arc<ScopedSkillManagementMountResolver>,
+}
+
+/// Opaque host-maintenance state used to compensate a failed skill replacement.
+///
+/// Persisted source metadata remains private so it cannot leak through
+/// caller/model-visible skill reads.
+pub struct SkillReplacementSnapshot {
+    scope: ResourceScope,
+    name: String,
+    bundle: SkillBundleSnapshot,
 }
 
 impl ScopedSkillManagementPort {
@@ -117,6 +134,33 @@ impl ScopedSkillManagementPort {
         Ok(read_skill_content(&context, SkillContentRequest { name }).await?)
     }
 
+    pub async fn capture_replacement_snapshot_for_scope(
+        &self,
+        scope: ResourceScope,
+        name: &str,
+    ) -> Result<SkillReplacementSnapshot, ScopedSkillManagementError> {
+        let context = self.context_for_scope(scope.clone())?;
+        let bundle = capture_skill_bundle(&context, name).await?;
+        Ok(SkillReplacementSnapshot {
+            scope,
+            name: name.to_string(),
+            bundle,
+        })
+    }
+
+    pub async fn restore_replacement_snapshot(
+        &self,
+        snapshot: SkillReplacementSnapshot,
+    ) -> Result<SkillInstallResult, ScopedSkillManagementError> {
+        let context = self.context_for_scope(snapshot.scope)?;
+        let source = restore_skill_bundle(&context, &snapshot.name, snapshot.bundle).await?;
+        Ok(SkillInstallResult {
+            scoped_path: format!("{USER_SKILLS_ROOT}/{}/{SKILL_FILE_NAME}", snapshot.name),
+            name: snapshot.name,
+            source,
+        })
+    }
+
     pub async fn update_for_scope(
         &self,
         scope: ResourceScope,
@@ -142,6 +186,27 @@ impl ScopedSkillManagementPort {
                 files: &[],
                 source: SkillInstallSource::User,
                 source_url: None,
+            },
+        )
+        .await?)
+    }
+
+    pub async fn install_from_url_for_scope(
+        &self,
+        scope: ResourceScope,
+        name: Option<&str>,
+        content: &str,
+        source_url: &str,
+    ) -> Result<SkillInstallResult, ScopedSkillManagementError> {
+        let context = self.context_for_scope(scope)?;
+        Ok(install_skill(
+            &context,
+            SkillInstallRequest {
+                name,
+                content,
+                files: &[],
+                source: SkillInstallSource::InstalledUrl,
+                source_url: Some(source_url),
             },
         )
         .await?)
@@ -198,29 +263,29 @@ where
     ))
 }
 
-pub fn build_existing_local_dev_skill_management_port(
+pub fn build_existing_standalone_skill_management_port(
     owner_id: impl Into<String>,
-    local_dev_storage_root: impl Into<PathBuf>,
+    standalone_storage_root: impl Into<PathBuf>,
 ) -> Result<Option<Arc<ScopedSkillManagementPort>>, ScopedSkillManagementBuildError> {
     let owner_id = owner_id.into();
-    let local_dev_storage_root = local_dev_storage_root.into();
-    if !local_dev_storage_root.try_exists().map_err(|error| {
+    let standalone_storage_root = standalone_storage_root.into();
+    if !standalone_storage_root.try_exists().map_err(|error| {
         ScopedSkillManagementBuildError::InvalidConfig {
-            reason: format!("local-dev skill storage root could not be inspected: {error}"),
+            reason: format!("standalone skill storage root could not be inspected: {error}"),
         }
     })? {
         return Ok(None);
     }
-    if !local_dev_storage_root.is_dir() {
+    if !standalone_storage_root.is_dir() {
         return Err(ScopedSkillManagementBuildError::InvalidConfig {
-            reason: "local-dev skill storage root is not a directory".to_string(),
+            reason: "standalone skill storage root is not a directory".to_string(),
         });
     }
 
     let mut filesystem = DiskFilesystem::new();
     filesystem.mount_local(
         VirtualPath::new("/projects")?,
-        HostPath::from_path_buf(local_dev_storage_root),
+        HostPath::from_path_buf(standalone_storage_root),
     )?;
     let owner_user_id =
         UserId::new(owner_id).map_err(|error| ScopedSkillManagementBuildError::InvalidConfig {
@@ -235,5 +300,81 @@ pub fn build_existing_local_dev_skill_management_port(
 fn invalid_skill_context(error: impl std::fmt::Display) -> ScopedSkillManagementError {
     ScopedSkillManagementError::InvalidContext {
         reason: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ironclaw_filesystem::InMemoryBackend;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn replacement_snapshot_round_trips_through_scoped_port() {
+        let owner = UserId::new("replacement-snapshot-owner").expect("owner id");
+        let port =
+            build_scoped_skill_management_port(owner.clone(), Arc::new(InMemoryBackend::new()));
+        let scope =
+            ResourceScope::local_default(owner, InvocationId::new()).expect("resource scope");
+        let content =
+            "---\nname: scoped-snapshot\ndescription: rollback fixture\n---\n# Original\n";
+        port.install_from_url_for_scope(
+            scope.clone(),
+            None,
+            content,
+            "https://hub.example/scoped-snapshot/SKILL.md",
+        )
+        .await
+        .expect("install original skill");
+
+        let snapshot = port
+            .capture_replacement_snapshot_for_scope(scope.clone(), "scoped-snapshot")
+            .await
+            .expect("capture replacement snapshot");
+        port.remove_for_scope(scope.clone(), "scoped-snapshot")
+            .await
+            .expect("remove original skill");
+        let restored = port
+            .restore_replacement_snapshot(snapshot)
+            .await
+            .expect("restore replacement snapshot");
+
+        assert_eq!(restored.name, "scoped-snapshot");
+        assert_eq!(restored.source, crate::ManagedSkillSource::Installed);
+        assert_eq!(
+            port.read_content_for_scope(scope, "scoped-snapshot")
+                .await
+                .expect("read restored skill")
+                .content,
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_snapshot_rejects_missing_skill_without_creating_state() {
+        let owner = UserId::new("missing-snapshot-owner").expect("owner id");
+        let port =
+            build_scoped_skill_management_port(owner.clone(), Arc::new(InMemoryBackend::new()));
+        let scope =
+            ResourceScope::local_default(owner, InvocationId::new()).expect("resource scope");
+
+        let error = match port
+            .capture_replacement_snapshot_for_scope(scope.clone(), "missing-skill")
+            .await
+        {
+            Ok(_) => panic!("missing skill cannot produce a replacement snapshot"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ScopedSkillManagementError::Skill(ref source)
+                if source.kind() == crate::SkillManagementErrorKind::NotFound
+        ));
+        assert!(
+            port.list_for_scope(scope)
+                .await
+                .expect("list remains readable")
+                .is_empty()
+        );
     }
 }

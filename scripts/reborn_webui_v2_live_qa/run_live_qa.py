@@ -215,6 +215,14 @@ try:
     )
 except ValueError:
     LIVE_QA_CASE_ATTEMPTS = 2
+NO_RETRY_CASE_NAME_MARKERS = (
+    "_routine",
+    "_delivery",
+    "_trigger",
+    "exactly_once",
+    "_guard",
+    "_hygiene",
+)
 HN_KEYWORD_SEARCH_URL = (
     "https://hn.algolia.com/api/v1/search_by_date"
     "?query=NEAR%20AI&tags=story&hitsPerPage=1"
@@ -802,6 +810,113 @@ def validate_case_llm_trace(output_dir: Path, case_name: str) -> Path:
     if not payload["steps"]:
         raise LiveQaError(f"expected LLM trace for {case_name} contains no steps")
     return trace_path
+
+
+def parse_case_llm_trace_metrics(trace_path: Path) -> dict[str, object]:
+    """Extract privacy-safe scalar metrics from one complete per-case trace.
+
+    Model calls are response-bearing ``text``/``tool_calls`` steps; user-input
+    markers are deliberately excluded. Tool calls are counted from every item
+    in each response's full ``tool_calls`` list, so the count is not bounded by
+    any checkpoint diagnostic ring. Legacy traces predate aggregate provider
+    usage: their call counts and step token totals remain exact, while cache and
+    cost fields stay unknown instead of being reported as zero.
+    """
+    try:
+        payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LiveQaError(f"LLM trace metrics are missing or invalid: {exc}") from exc
+    steps = payload.get("steps") if isinstance(payload, dict) else None
+    if not isinstance(steps, list):
+        raise LiveQaError("LLM trace metrics require a steps list")
+
+    model_call_count = 0
+    tool_call_count = 0
+    step_input_tokens = 0
+    step_output_tokens = 0
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        response = step.get("response")
+        if not isinstance(response, dict):
+            continue
+        response_type = response.get("type")
+        if response_type not in {"text", "tool_calls"}:
+            continue
+        model_call_count += 1
+        input_tokens = response.get("input_tokens")
+        output_tokens = response.get("output_tokens")
+        if isinstance(input_tokens, int) and not isinstance(input_tokens, bool):
+            step_input_tokens += max(0, input_tokens)
+        if isinstance(output_tokens, int) and not isinstance(output_tokens, bool):
+            step_output_tokens += max(0, output_tokens)
+        if response_type == "tool_calls" and isinstance(response.get("tool_calls"), list):
+            tool_call_count += len(response["tool_calls"])
+
+    usage = payload.get("usage")
+    has_provider_usage = isinstance(usage, dict)
+
+    def usage_int(name: str) -> int | None:
+        if not isinstance(usage, dict):
+            return None
+        value = usage.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        return value
+
+    input_tokens = usage_int("input_tokens") if has_provider_usage else None
+    output_tokens = usage_int("output_tokens") if has_provider_usage else None
+    cache_read_tokens = (
+        usage_int("cache_read_input_tokens") if has_provider_usage else None
+    )
+    if input_tokens is None:
+        input_tokens = step_input_tokens
+    if output_tokens is None:
+        output_tokens = step_output_tokens
+    uncached_input_tokens = (
+        max(0, input_tokens - cache_read_tokens)
+        if cache_read_tokens is not None
+        else None
+    )
+    cost_usd = usage.get("total_cost_usd") if isinstance(usage, dict) else None
+    if not isinstance(cost_usd, str) or not cost_usd.strip():
+        cost_usd = None
+
+    return {
+        "model_call_count": model_call_count,
+        "tool_call_count": tool_call_count,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "uncached_input_tokens": uncached_input_tokens,
+        "cost_usd": cost_usd,
+    }
+
+
+def _zero_case_metrics() -> dict[str, object]:
+    """Metrics for a case known not to have invoked the model."""
+    return {
+        "model_call_count": 0,
+        "tool_call_count": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "uncached_input_tokens": 0,
+        "cost_usd": "0",
+    }
+
+
+def _unavailable_case_metrics() -> dict[str, object]:
+    """Honest shape for an interrupted model case with no complete trace."""
+    return {
+        "model_call_count": None,
+        "tool_call_count": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "cache_read_tokens": None,
+        "uncached_input_tokens": None,
+        "cost_usd": None,
+    }
 
 
 async def start_reborn_server(
@@ -1560,13 +1675,38 @@ def _is_case_retriable(result: ProbeResult) -> bool:
     details = result.details
     if details.get("blocked"):
         return False
-    if details.get("failure_class") == "infrastructure":
+    if details.get("failure_class") in {
+        "infrastructure",
+        "deterministic",
+        "security",
+        "idempotency",
+    }:
         return False
     if details.get("inconclusive"):
         return False
     if _is_provider_incident(result):
         return False
     return True
+
+
+def _case_attempts(
+    case_name: str,
+    case_spec: CaseSpec,
+    *,
+    configured_attempts: int,
+) -> int:
+    """Resolve retries from typed case policy and fail loud on policy drift."""
+    mechanically_no_retry = any(
+        marker in case_name for marker in NO_RETRY_CASE_NAME_MARKERS
+    )
+    if mechanically_no_retry and case_spec.retry_policy != "never":
+        raise LiveQaError(
+            f"{case_name} performs a deterministic or side-effecting check "
+            "and must declare retry_policy='never'"
+        )
+    if case_spec.retry_policy == "never":
+        return 1
+    return max(1, configured_attempts)
 
 
 async def _run_case_with_retries(
@@ -1583,13 +1723,32 @@ async def _run_case_with_retries(
     ``fn(ctx)`` drives a fresh chat turn against the same already-running
     server/ctx — no restart — which is the intended retry semantics for a
     nondeterministic model/network flake. The number of attempts made is
-    recorded into ``result.details["attempts"]``.
+    recorded into ``result.details["attempt_history"]``. A successful retry is
+    classified as a flake rather than being reported as an ordinary pass.
     """
     total = max(1, attempts)
     result: ProbeResult | None = None
+    attempt_history: list[dict[str, object]] = []
     for attempt in range(1, total + 1):
         result = await fn(ctx)
+        attempt_history.append(
+            {
+                "attempt": attempt,
+                "success": result.success,
+                "latency_ms": result.latency_ms,
+                "details": dict(result.details),
+            }
+        )
         result.details["attempts"] = attempt
+        result.details["attempt_history"] = attempt_history
+        result.details["flake"] = result.success and attempt > 1
+        result.details["retry_outcome"] = (
+            "flake"
+            if result.details["flake"]
+            else "passed"
+            if result.success
+            else "failed"
+        )
         if result.success or attempt >= total or not is_retriable(result):
             return result
         print(
@@ -1597,7 +1756,8 @@ async def _run_case_with_retries(
             f"attempt={attempt}/{total}",
             flush=True,
         )
-    assert result is not None  # the loop body always runs at least once
+    if result is None:
+        raise LiveQaError("live QA retry loop did not execute")
     return result
 
 
@@ -3971,7 +4131,7 @@ def _capability_run_statuses(
                 FROM root_filesystem_entries
                 WHERE is_dir = 0
                   AND content_type = 'application/json'
-                  AND path LIKE '%/run-state/%'
+                  AND path LIKE '%/processes/materialized/process/%'
                 """
             ).fetchall()
     except sqlite3.Error:
@@ -3988,6 +4148,11 @@ def _capability_run_statuses(
             continue
         if not isinstance(payload, dict):
             continue
+        if payload.get("row_type") == "process":
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            payload = {**payload, **metadata}
         capability_id = payload.get("capability_id")
         if capability_id in wanted:
             statuses[str(capability_id)].append(str(payload.get("status") or "unknown"))
@@ -4055,7 +4220,7 @@ def _current_turn_capability_evidence(
                 FROM root_filesystem_entries
                 WHERE is_dir = 0
                   AND content_type = 'application/json'
-                  AND path LIKE '%/run-state/%'
+                  AND path LIKE '%/processes/materialized/process/%'
                 """
             ).fetchall()
             display_preview_rows = db.execute(
@@ -4171,6 +4336,11 @@ def _current_turn_capability_evidence(
             continue
         if not isinstance(payload, dict):
             continue
+        if payload.get("row_type") == "process":
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            payload = {**payload, **metadata}
         invocation_id = str(payload.get("invocation_id") or "")
         event = terminal_events.get(invocation_id)
         scope = payload.get("scope")
@@ -8156,6 +8326,7 @@ CASES: dict[str, CaseSpec] = {
         requires_telegram=True,
         default_enabled=False,
         implemented=False,
+        retry_policy="never",
     ),
     "qa_2a_gmail_connect": CaseSpec(
         case_qa_2a_gmail_connect,
@@ -8178,12 +8349,14 @@ CASES: dict[str, CaseSpec] = {
     "qa_2e_calendar_prep_email_routine": CaseSpec(
         case_qa_2e_calendar_prep_email_routine,
         requires_google_product_auth=True,
+        retry_policy="never",
     ),
     "qa_2f_calendar_prep_email_delivery": CaseSpec(
         case_qa_2f_calendar_prep_email_delivery,
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_3a_slack_connect": CaseSpec(
         case_qa_3a_slack_connect,
@@ -8196,11 +8369,13 @@ CASES: dict[str, CaseSpec] = {
         case_qa_3c_endpoint_status_slack_routine,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_3d_endpoint_status_slack_delivery": CaseSpec(
         case_qa_3d_endpoint_status_slack_delivery,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_4a_gmail_connect": CaseSpec(
         case_qa_4a_gmail_connect,
@@ -8215,12 +8390,14 @@ CASES: dict[str, CaseSpec] = {
         case_qa_4d_github_release_slack_routine,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_4e_github_release_email_delivery": CaseSpec(
         case_qa_4e_github_release_email_delivery,
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_5a_slack_connect": CaseSpec(
         case_qa_5a_slack_connect,
@@ -8245,6 +8422,7 @@ CASES: dict[str, CaseSpec] = {
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_6a_gmail_connect": CaseSpec(
         case_qa_6a_gmail_connect,
@@ -8263,12 +8441,14 @@ CASES: dict[str, CaseSpec] = {
     "qa_6d_gmail_to_sheet_routine": CaseSpec(
         case_qa_6d_gmail_to_sheet_routine,
         requires_google_product_auth=True,
+        retry_policy="never",
     ),
     "qa_6e_gmail_to_sheet_delivery": CaseSpec(
         case_qa_6e_gmail_to_sheet_delivery,
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_7a_slack_product_channel_connect": CaseSpec(
         case_qa_7a_slack_product_channel_connect,
@@ -8285,11 +8465,13 @@ CASES: dict[str, CaseSpec] = {
         requires_slack=True,
         requires_slack_target=True,
         requires_google_product_auth=True,
+        retry_policy="never",
     ),
     "qa_7d_slack_bug_message_trigger": CaseSpec(
         case_qa_7d_slack_bug_message_trigger,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_7e_slack_bug_sheet_delivery": CaseSpec(
         case_qa_7e_slack_bug_sheet_delivery,
@@ -8298,6 +8480,7 @@ CASES: dict[str, CaseSpec] = {
         requires_google_product_auth=True,
         requires_google_runtime_access=True,
         default_enabled=False,
+        retry_policy="never",
     ),
     "qa_8a_slack_connect": CaseSpec(
         case_qa_8a_slack_connect,
@@ -8310,11 +8493,13 @@ CASES: dict[str, CaseSpec] = {
         case_qa_8c_hn_keyword_slack_routine,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_8d_hn_keyword_slack_delivery": CaseSpec(
         case_qa_8d_hn_keyword_slack_delivery,
         requires_slack=True,
         requires_slack_target=True,
+        retry_policy="never",
     ),
     "qa_9a_slack_connect": CaseSpec(
         case_qa_9a_slack_connect,
@@ -8329,6 +8514,7 @@ CASES: dict[str, CaseSpec] = {
         # The workspace sweep runs on the personal token; without this gate a
         # wrong-workspace token would make the sweep structurally blind.
         requires_slack_personal_auth=True,
+        retry_policy="never",
     ),
     "qa_9c_slack_digest_names_not_ids": CaseSpec(
         case_qa_9c_slack_digest_names_not_ids,
@@ -8345,6 +8531,7 @@ CASES: dict[str, CaseSpec] = {
         requires_slack=True,
         requires_slack_target=True,
         requires_slack_personal_auth=True,
+        retry_policy="never",
     ),
     # QA 10 family: Slack tool-correctness probes (self-identity, status
     # fields, thread replies, membership view, structured errors, mention
@@ -8406,6 +8593,7 @@ CASES: dict[str, CaseSpec] = {
         requires_slack=True,
         requires_slack_target=True,
         requires_slack_personal_auth=True,
+        retry_policy="never",
     ),
     "qa_10i_slack_raw_entity_hygiene": CaseSpec(
         case_qa_10i_slack_raw_entity_hygiene,
@@ -8414,6 +8602,7 @@ CASES: dict[str, CaseSpec] = {
         requires_slack=True,
         requires_slack_target=True,
         requires_slack_personal_auth=True,
+        retry_policy="never",
     ),
 }
 
@@ -8460,6 +8649,7 @@ def write_case_manifest(output_dir: Path, selected_cases: list[str]) -> Path:
                 "requires_github_auth": spec.requires_github_auth,
                 "expects_llm_trace": spec.expects_llm_trace,
                 "implemented": spec.implemented,
+                "retry_policy": spec.retry_policy,
                 "status": (
                     "default"
                     if spec.default_enabled
@@ -8493,7 +8683,7 @@ def write_case_manifest(output_dir: Path, selected_cases: list[str]) -> Path:
 
 TRACE_EXPORT_PATH_MARKERS = (
     "/threads/agents/",
-    "/run-state/agents/",
+    "/processes/materialized/",
     "/checkpoint-state/agents/",
     "/approvals/agents/",
     "/authorization/leases/agents/",
@@ -8621,6 +8811,7 @@ async def run_cases(args: argparse.Namespace) -> int:
             f"ironclaw binary missing at {binary}; rerun without --skip-build"
         )
     results: list[ProbeResult] = []
+    invoked_cases: set[str] = set()
     trace_exports: list[dict[str, object]] = []
     first_base_url = ""
     for case_index, name in enumerate(selected_cases):
@@ -8940,10 +9131,15 @@ async def run_cases(args: argparse.Namespace) -> int:
                 write_preflight(args.output_dir, prepared_home)
                 shutil.copyfile(preflight_path, case_preflight_path)
             print(f"[reborn-webui-v2-live-qa] running case={name}", flush=True)
+            invoked_cases.add(name)
             result = await _run_case_with_retries(
                 CASES[name].fn,
                 ctx,
-                attempts=LIVE_QA_CASE_ATTEMPTS,
+                attempts=_case_attempts(
+                    name,
+                    case_spec,
+                    configured_attempts=LIVE_QA_CASE_ATTEMPTS,
+                ),
                 is_retriable=_is_case_retriable,
             )
             result = _attach_browser_diagnostics(args.output_dir, result)
@@ -8951,7 +9147,8 @@ async def run_cases(args: argparse.Namespace) -> int:
             results.append(result)
             print(
                 f"[reborn-webui-v2-live-qa] case={name} success={result.success} "
-                f"latency_ms={result.latency_ms}",
+                f"latency_ms={result.latency_ms} "
+                f"retry_outcome={result.details.get('retry_outcome', 'not_run')}",
                 flush=True,
             )
             if _is_provider_incident(result):
@@ -8991,30 +9188,33 @@ async def run_cases(args: argparse.Namespace) -> int:
                 break
         finally:
             stop_process(proc)
-            if (
-                completed_result is not None
-                and completed_result.success
-                and case_spec.expects_llm_trace
-            ):
+            if completed_result is not None and case_spec.expects_llm_trace:
                 try:
                     trace_path = validate_case_llm_trace(args.output_dir, name)
                     completed_result.details["llm_trace_path"] = str(trace_path)
+                    completed_result.details["metrics"] = parse_case_llm_trace_metrics(
+                        trace_path
+                    )
                 except LiveQaError as exc:
-                    completed_result.success = False
-                    completed_result.details.update(
-                        {
-                            "blocking": True,
-                            "failure_class": "infrastructure",
-                            "failure_category": "trace_harvest",
-                            "failure_status": "failed",
-                            "error": str(exc),
-                        }
-                    )
-                    print(
-                        f"[reborn-webui-v2-live-qa] case={name} success=False "
-                        "blocked=trace_harvest",
-                        flush=True,
-                    )
+                    if completed_result.success:
+                        completed_result.success = False
+                        completed_result.details.update(
+                            {
+                                "blocking": True,
+                                "failure_class": "infrastructure",
+                                "failure_category": "trace_harvest",
+                                "failure_status": "failed",
+                                "error": str(exc),
+                            }
+                        )
+                        print(
+                            f"[reborn-webui-v2-live-qa] case={name} success=False "
+                            "blocked=trace_harvest",
+                            flush=True,
+                        )
+                    # Preserve an existing case failure. A failed model run can
+                    # terminate before the recorder publishes a complete step,
+                    # so missing metrics are honest rather than trace_harvest.
             trace_export = export_case_trace(args.output_dir, name, prepared_home.path)
             trace_exports.append(trace_export)
             print(
@@ -9022,6 +9222,19 @@ async def run_cases(args: argparse.Namespace) -> int:
                 f"entries={trace_export['entry_count']}",
                 flush=True,
             )
+    for result in results:
+        if "metrics" in result.details:
+            continue
+        result_case = str(result.details.get("case") or "")
+        result_spec = CASES.get(result_case)
+        model_was_not_invoked = (
+            result_spec is not None and not result_spec.expects_llm_trace
+        ) or result_case not in invoked_cases
+        result.details["metrics"] = (
+            _zero_case_metrics()
+            if model_was_not_invoked
+            else _unavailable_case_metrics()
+        )
     results_path = write_results(args.output_dir, results, first_base_url)
     trace_index_path = write_trace_index(args.output_dir, trace_exports)
     green_explanation_path = write_green_run_explanation(args.output_dir, results)

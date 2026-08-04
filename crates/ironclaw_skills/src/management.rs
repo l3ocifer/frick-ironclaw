@@ -14,7 +14,12 @@ use ironclaw_filesystem::{
     BackendCapabilities, DirEntry, FileStat, FileType, FilesystemError, RecordVersion,
     RootFilesystem, ScopedFilesystem,
 };
-use ironclaw_host_api::{HostApiError, MountView, ResourceScope, ScopedPath, VirtualPath};
+use ironclaw_host_api::{
+    error::HostApiError,
+    mount::MountView,
+    path::{ScopedPath, VirtualPath},
+    resource::ResourceScope,
+};
 
 mod install_bundle;
 #[cfg(test)]
@@ -24,6 +29,7 @@ pub use install_bundle::{
     MAX_INSTALL_BUNDLE_FILE_BYTES, MAX_INSTALL_BUNDLE_FILES, MAX_INSTALL_BUNDLE_TOTAL_BYTES,
     SkillInstallFile,
 };
+pub(crate) use install_bundle::{SkillBundleSnapshot, capture_skill_bundle, restore_skill_bundle};
 
 use install_bundle::{
     existing_skill_install_matches, install_metadata_source, installed_skill_source,
@@ -247,6 +253,8 @@ pub struct SkillContentRequest<'a> {
 pub struct SkillContentResult {
     pub name: String,
     pub content: String,
+    pub source: SkillSource,
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,9 +580,18 @@ pub async fn read_skill_content(
     let content = read_skill_file(context, &skill_path)
         .await?
         .ok_or_else(|| SkillManagementError::new(SkillManagementErrorKind::NotFound))?;
+    let install_metadata = read_install_metadata_bytes(context, &skill_path).await?;
+    let source = install_metadata
+        .as_deref()
+        .map(|bytes| install_metadata_source(SkillSource::User, bytes))
+        .unwrap_or(SkillSource::User);
     Ok(SkillContentResult {
         name: request.name.to_string(),
         content,
+        source,
+        // Persisted origins are host-maintenance metadata. Keep them out of
+        // the caller/model-visible read result.
+        source_url: None,
     })
 }
 

@@ -1,11 +1,9 @@
 use async_trait::async_trait;
-use ironclaw_turns::{
-    LoopGateRef,
-    run_profile::{
-        AgentLoopHostError, AgentLoopHostErrorKind, CheckpointSchemaId, LoopCheckpointRequest,
-        LoopProgressEvent, LoopSafeSummary, StageCheckpointPayloadRequest,
-        sanitize_model_visible_text,
-    },
+use ironclaw_host_api::turn::LoopGateRef;
+use ironclaw_loop_contracts::{
+    AgentLoopHostError, AgentLoopHostErrorKind, CheckpointSchemaId, LoopCheckpointRequest,
+    LoopProgressEvent, LoopRecoveryClass, LoopRecoveryDisposition, LoopRecoveryStage,
+    LoopSafeSummary, StageCheckpointPayloadRequest, sanitize_model_visible_text,
 };
 
 use crate::state::{CheckpointKind, LoopExecutionState};
@@ -14,12 +12,12 @@ use crate::state::{CheckpointKind, LoopExecutionState};
 use crate::executor::CanonicalAgentLoopExecutor;
 
 #[cfg(test)]
-use ironclaw_turns::run_profile::AgentLoopDriverHost;
+use ironclaw_loop_contracts::AgentLoopDriverHost;
 
 use super::{
-    AgentLoopExecutorError, CancelCheck, CheckpointWrite, ExecutorStage, HostStage,
-    PendingInputAck, StageContext, cancelled_exit_with_reason, cancelled_reason_from_signal,
-    checkpoint_kind_to_host, debug_host_unavailable,
+    AgentLoopExecutorError, CancelCheck, CheckpointWrite, ExecutorStage, HostStage, StageContext,
+    cancelled_exit_with_reason, cancelled_reason_from_signal, checkpoint_kind_to_host,
+    debug_host_unavailable,
 };
 
 #[cfg(test)]
@@ -110,6 +108,37 @@ impl CheckpointStage {
         let _ = ctx.host.emit_loop_progress(event).await;
     }
 
+    /// Append recovery evidence before the recovery transition can continue.
+    ///
+    /// Unlike observational progress, this event is a durable metric input.
+    /// Its sequence advances only after the host accepts the append. A worker
+    /// replaying the pre-transition checkpoint therefore reuses the same
+    /// sequence and logical event identity.
+    pub(super) async fn emit_recovery(
+        &self,
+        ctx: StageContext<'_>,
+        state: &mut LoopExecutionState,
+        stage: LoopRecoveryStage,
+        class: LoopRecoveryClass,
+        disposition: LoopRecoveryDisposition,
+    ) -> Result<(), AgentLoopExecutorError> {
+        let sequence = state
+            .recovery_event_sequence
+            .checked_add(1)
+            .ok_or(AgentLoopExecutorError::RecoverySequenceExhausted)?;
+        ctx.host
+            .emit_loop_progress(LoopProgressEvent::FailureRecovered {
+                sequence,
+                stage,
+                class,
+                disposition,
+            })
+            .await
+            .map_err(recovery_event_host_error)?;
+        state.recovery_event_sequence = sequence;
+        Ok(())
+    }
+
     // Cancellation is checked cooperatively at N boundary points between external calls.
     // A macro refactor was considered but deferred; the explicit sites are self-documenting.
     pub(super) async fn cancel_if_requested(
@@ -133,13 +162,15 @@ impl CheckpointStage {
             // into a checkpoint-free `Cancelled` exit. Other variants (e.g.
             // `HostUnavailable`) must propagate so the runner can apply its
             // recovery policy.
-            Err(AgentLoopExecutorError::CheckpointFailed { .. })
-                if !ctx
-                    .host
-                    .run_context()
-                    .resolved_run_profile
-                    .checkpoint_policy
-                    .require_final_checkpoint =>
+            Err(
+                AgentLoopExecutorError::CheckpointFailed { .. }
+                | AgentLoopExecutorError::CheckpointRejected { .. },
+            ) if !ctx
+                .host
+                .run_context()
+                .resolved_run_profile
+                .checkpoint_policy
+                .require_final_checkpoint =>
             {
                 Ok(CancelCheck::Exit(cancelled_exit_with_reason(
                     ctx.host,
@@ -148,55 +179,6 @@ impl CheckpointStage {
                     None,
                 )?))
             }
-            Err(error) => Err(error),
-        }
-    }
-
-    pub(super) async fn cancel_if_requested_after_pending_input_ack(
-        &self,
-        ctx: StageContext<'_>,
-        state: LoopExecutionState,
-        pending_input_ack: &mut PendingInputAck,
-    ) -> Result<CancelCheck, AgentLoopExecutorError> {
-        let Some(signal) = ctx.host.observe_cancellation() else {
-            return Ok(CancelCheck::Continue(Box::new(state)));
-        };
-
-        let fallback_state = state.clone();
-        match self.write(ctx, state, CheckpointKind::Final).await {
-            Ok(checked) => {
-                pending_input_ack.ack(ctx.host).await?;
-                Ok(CancelCheck::Exit(cancelled_exit_with_reason(
-                    ctx.host,
-                    checked.state,
-                    cancelled_reason_from_signal(&signal),
-                    Some(checked.checkpoint_id),
-                )?))
-            }
-            // Permissive profile: absorb only checkpoint-write failures. The
-            // pending ack is intentionally NOT flushed here — no durable
-            // checkpoint was written, so advancing the input cursor would
-            // commit progress that the runner has no record of.
-            Err(AgentLoopExecutorError::CheckpointFailed { .. })
-                if !ctx
-                    .host
-                    .run_context()
-                    .resolved_run_profile
-                    .checkpoint_policy
-                    .require_final_checkpoint =>
-            {
-                Ok(CancelCheck::Exit(cancelled_exit_with_reason(
-                    ctx.host,
-                    fallback_state,
-                    cancelled_reason_from_signal(&signal),
-                    None,
-                )?))
-            }
-            // Strict profile (or non-checkpoint error variant): propagate the
-            // error so the runner sees the same failure mode as
-            // `cancel_if_requested`. Returning `Ok(LoopExit::failed)`
-            // would silently mask `HostUnavailable` and break the strict
-            // require-final-checkpoint contract.
             Err(error) => Err(error),
         }
     }
@@ -210,6 +192,20 @@ fn checkpoint_host_error(
         return AgentLoopExecutorError::Cancelled;
     }
     debug_host_unavailable(HostStage::Checkpoint, &error);
+    if error.kind == AgentLoopHostErrorKind::CheckpointRejected {
+        let safe_summary = LoopSafeSummary::new(error.safe_summary).unwrap_or_else(|error| {
+            tracing::debug!(
+                checkpoint_kind = ?kind,
+                validation_error = %error,
+                "checkpoint rejection summary rejected; using fixed fallback"
+            );
+            LoopSafeSummary::checkpoint_rejected()
+        });
+        return AgentLoopExecutorError::CheckpointRejected {
+            stage: kind,
+            safe_summary,
+        };
+    }
     if matches!(
         error.kind,
         AgentLoopHostErrorKind::Unavailable
@@ -238,11 +234,38 @@ fn checkpoint_host_error(
             kind: error.kind,
             safe_summary,
             reason_kind: error.reason_kind,
-            diagnostic_ref: error.diagnostic_ref,
             detail,
         };
     }
     AgentLoopExecutorError::CheckpointFailed { stage: kind }
+}
+
+fn recovery_event_host_error(error: AgentLoopHostError) -> AgentLoopExecutorError {
+    if error.kind == AgentLoopHostErrorKind::Cancelled {
+        return AgentLoopExecutorError::Cancelled;
+    }
+    debug_host_unavailable(HostStage::Checkpoint, &error);
+    let raw_summary = error.safe_summary;
+    let (safe_summary, rejected_summary_detail) = match LoopSafeSummary::new(raw_summary.clone()) {
+        Ok(summary) => (summary, None),
+        Err(validation_error) => {
+            tracing::debug!(
+                validation_error = %validation_error,
+                "recovery event error summary rejected; using fallback"
+            );
+            (
+                LoopSafeSummary::model_gateway_failed(),
+                Some(sanitize_model_visible_text(raw_summary)),
+            )
+        }
+    };
+    AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+        stage: HostStage::Checkpoint,
+        kind: error.kind,
+        safe_summary,
+        reason_kind: error.reason_kind,
+        detail: error.detail.or(rejected_summary_detail),
+    }
 }
 
 pub(super) struct CheckpointInput {
@@ -289,5 +312,33 @@ impl CanonicalAgentLoopExecutor {
             host,
         };
         InputStage.drain_followup(ctx, state).await
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_host_error_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_checkpoint_rejection_summary_uses_cause_neutral_fallback() {
+        let error = checkpoint_host_error(
+            CheckpointKind::BeforeModel,
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::CheckpointRejected,
+                "api_key marker must not escape",
+            ),
+        );
+
+        assert_eq!(
+            error,
+            AgentLoopExecutorError::CheckpointRejected {
+                stage: CheckpointKind::BeforeModel,
+                safe_summary: LoopSafeSummary::checkpoint_rejected(),
+            }
+        );
+        assert_eq!(
+            LoopSafeSummary::checkpoint_rejected().as_str(),
+            "checkpoint was rejected and no safe explanation was available"
+        );
     }
 }

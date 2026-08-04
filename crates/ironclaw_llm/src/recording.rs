@@ -27,6 +27,7 @@ use crate::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, CompletionStreamSink, LlmProvider,
     ModelMetadata, Role, ToolCompletionRequest, ToolCompletionResponse,
 };
+use crate::trace_binding::{ObservedToolResult, canonical_tool_result_payload};
 
 // ── Trace format types ─────────────────────────────────────────────
 
@@ -34,6 +35,10 @@ use crate::provider::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceFile {
     pub model_name: String,
+    /// Aggregate provider-reported scalar usage for this trace. Optional for
+    /// backward compatibility with existing replay fixtures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TraceUsage>,
     /// Workspace memory documents captured before the recording session.
     /// Replay should restore these before running the trace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -43,6 +48,23 @@ pub struct TraceFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_exchanges: Vec<HttpExchange>,
     pub steps: Vec<TraceStep>,
+}
+
+/// Privacy-safe aggregate usage recorded alongside response-bearing steps.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TraceUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_input_tokens: u32,
+    pub cache_creation_input_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct RecordingUsage {
+    trace: TraceUsage,
+    total_cost: Decimal,
 }
 
 /// A memory document captured at recording start.
@@ -570,32 +592,28 @@ fn safe_truncate(content: &str, max_bytes: usize) -> String {
 // the literal ID into the fixture, replay-time mission_create will produce
 // a fresh ID and the recorded mission_fire will fail with "not found".
 //
-// Solution: at recording time, scan the prior conversation's tool result
-// messages, build a `{call_id: {field: value}}` lookup, and rewrite any
-// matching literal value in the new tool call's arguments as a template
-// `{{call_id.field}}`. The replay engine's `substitute_templates` already
-// resolves those templates against the *current* tool result values.
+// Solution: rewrite matching values as exact `$trace_result` references to the
+// original tool-call ID and an RFC 6901 JSON Pointer. Replay resolves those
+// references against the current run's result.
 
-/// Build a `{key: {field: stringified_value}}` lookup of every prior tool
-/// result in the conversation, used to parameterize subsequent tool-call
-/// arguments at recording time.
+#[derive(Default)]
+struct PriorToolLookup {
+    exact: Vec<ObservedToolResult>,
+    /// Legacy fallback for sanitized user messages that have lost call IDs.
+    legacy: HashMap<String, HashMap<String, String>>,
+}
+
+/// Build a lookup of every prior tool result in the conversation.
 ///
 /// The recorder must handle two shapes of "prior tool result":
 ///
 /// 1. **Native `Role::Tool` messages** — keyed by their `tool_call_id`.
 ///    Used by providers that pass tool results through unmodified.
-/// 2. **Sanitized user messages** — `sanitize_tool_messages` rewrites
-///    orphaned tool results as `Role::User` content of the form
-///    `[Tool \`name\` returned: <json>]`. These have no call_id, so we key
-///    them by `tool:<name>` instead. The replay engine resolves both forms
-///    via the same `{{key.field}}` template syntax.
-///
-/// In both cases, only top-level scalar fields of the JSON content are
-/// indexed (string, number, bool). Nested objects and arrays are skipped —
-/// they're rarely useful as parameterization keys and would inflate the
-/// lookup with noise.
-fn build_prior_tool_lookup(messages: &[ChatMessage]) -> HashMap<String, HashMap<String, String>> {
-    let mut lookup: HashMap<String, HashMap<String, String>> = HashMap::new();
+/// 2. **Sanitized user messages** have no call ID. Those retain the legacy
+///    top-level `{{tool:name.field}}` fallback until the sanitizer preserves
+///    the original ID.
+fn build_prior_tool_lookup(messages: &[ChatMessage]) -> PriorToolLookup {
+    let mut lookup = PriorToolLookup::default();
     for msg in messages {
         // ── Shape 1: native Role::Tool with structured content. ──
         if msg.role == Role::Tool {
@@ -603,7 +621,12 @@ fn build_prior_tool_lookup(messages: &[ChatMessage]) -> HashMap<String, HashMap<
                 continue;
             };
             let content = unwrap_tool_output(&msg.content);
-            index_json_into(&mut lookup, call_id, &content);
+            if let Some(parsed) = parse_tool_result_content(&content) {
+                lookup.exact.push(ObservedToolResult {
+                    tool_call_id: call_id.to_string(),
+                    content: parsed,
+                });
+            }
             continue;
         }
         // ── Shape 2: Role::User rewrite of orphaned tool results. ──
@@ -613,10 +636,16 @@ fn build_prior_tool_lookup(messages: &[ChatMessage]) -> HashMap<String, HashMap<
             // Key as `tool:<name>` so it doesn't collide with call_ids
             // and stays unique across multiple tool invocations.
             let key = format!("tool:{tool_name}");
-            index_json_into(&mut lookup, &key, payload);
+            index_json_into(&mut lookup.legacy, &key, payload);
         }
     }
     lookup
+}
+
+fn parse_tool_result_content(content: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(content).ok().or_else(|| {
+        coerce_python_repr_to_json(content).and_then(|json| serde_json::from_str(&json).ok())
+    })
 }
 
 /// Parse a JSON object literal out of `content` and merge its top-level
@@ -798,22 +827,40 @@ fn json_value_as_scalar_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Walk a JSON value and replace any string that exactly matches a value in
-/// the lookup with a `{{call_id.field}}` template. Operates in place.
+/// Replace a string that uniquely matches a prior result with an exact
+/// tool-call-ID/JSON-Pointer binding.
 ///
-/// We only do *full-string* replacement (not substring) to avoid corrupting
-/// strings that incidentally contain a UUID; the replay's
-/// `substitute_templates` is symmetric and resolves the template back to the
-/// current value.
-fn parameterize_value(
-    value: &mut serde_json::Value,
-    lookup: &HashMap<String, HashMap<String, String>>,
-) {
+/// Full-string replacement avoids corrupting incidental substrings. Ambiguous
+/// matches remain literal rather than guessing which tool call produced them.
+fn parameterize_value(value: &mut serde_json::Value, lookup: &PriorToolLookup) {
     match value {
         serde_json::Value::String(s) => {
-            // Look for a (call_id, field) pair whose value exactly matches `s`.
-            // Use the first match — duplicates are pathological and rare.
-            for (call_id, fields) in lookup {
+            let mut exact_matches = Vec::new();
+            for result in &lookup.exact {
+                let Some(payload) = canonical_tool_result_payload(&result.content) else {
+                    continue;
+                };
+                find_string_pointers(
+                    payload.as_ref(),
+                    s,
+                    String::new(),
+                    &mut exact_matches,
+                    &result.tool_call_id,
+                );
+                if exact_matches.len() > 1 {
+                    break;
+                }
+            }
+            if let [(tool_call_id, pointer)] = exact_matches.as_slice() {
+                *value = serde_json::json!({
+                    "$trace_result": {
+                        "tool_call_id": tool_call_id,
+                        "pointer": pointer,
+                    }
+                });
+                return;
+            }
+            for (call_id, fields) in &lookup.legacy {
                 for (field, recorded) in fields {
                     if recorded == s {
                         *s = format!("{{{{{call_id}.{field}}}}}");
@@ -836,12 +883,57 @@ fn parameterize_value(
     }
 }
 
+fn find_string_pointers(
+    value: &serde_json::Value,
+    target: &str,
+    pointer: String,
+    matches: &mut Vec<(String, String)>,
+    tool_call_id: &str,
+) {
+    if matches.len() > 1 {
+        return;
+    }
+    match value {
+        serde_json::Value::String(candidate) if candidate == target => {
+            matches.push((tool_call_id.to_string(), pointer));
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                find_string_pointers(
+                    child,
+                    target,
+                    format!("{pointer}/{}", escape_json_pointer_token(key)),
+                    matches,
+                    tool_call_id,
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                find_string_pointers(
+                    child,
+                    target,
+                    format!("{pointer}/{index}"),
+                    matches,
+                    tool_call_id,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn escape_json_pointer_token(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
+}
+
 // ── RecordingLlm ───────────────────────────────────────────────────
 
 /// LLM provider decorator that records interactions into a trace file.
 pub struct RecordingLlm {
     inner: Arc<dyn LlmProvider>,
     steps: Mutex<Vec<TraceStep>>,
+    usage: Mutex<RecordingUsage>,
     prev_message_count: Mutex<usize>,
     output_path: PathBuf,
     model_name: String,
@@ -856,6 +948,7 @@ impl RecordingLlm {
         Self {
             inner,
             steps: Mutex::new(Vec::new()),
+            usage: Mutex::new(RecordingUsage::default()),
             prev_message_count: Mutex::new(0),
             output_path,
             model_name,
@@ -932,11 +1025,13 @@ impl RecordingLlm {
         // completions can continue recording while a checkpoint is written.
         let _flush_guard = self.flush_lock.lock().await;
         let steps = self.steps.lock().await.clone();
+        let usage = self.usage.lock().await.trace.clone();
         let memory_snapshot = self.memory_snapshot.lock().await.clone();
         let http_exchanges = self.http_interceptor.take_exchanges().await;
 
         let trace = TraceFile {
             model_name: self.model_name.clone(),
+            usage: Some(usage),
             memory_snapshot,
             http_exchanges,
             steps,
@@ -1065,6 +1160,17 @@ impl RecordingLlm {
         tool_results: Vec<ExpectedToolResult>,
         response: &CompletionResponse,
     ) {
+        // Publish the step and its aggregate usage as one snapshot. `flush`
+        // takes the same lock, so an eager flush cannot observe usage ahead of
+        // steps (or vice versa) when model calls complete concurrently.
+        let publication_guard = self.flush_lock.lock().await;
+        self.record_usage(
+            response.input_tokens,
+            response.output_tokens,
+            response.cache_read_input_tokens,
+            response.cache_creation_input_tokens,
+        )
+        .await;
         self.steps.lock().await.push(TraceStep {
             request_hint: hint,
             response: TraceResponse::Text {
@@ -1074,6 +1180,7 @@ impl RecordingLlm {
             },
             expected_tool_results: tool_results,
         });
+        drop(publication_guard);
         self.flush_after_step().await;
     }
 
@@ -1081,9 +1188,17 @@ impl RecordingLlm {
         &self,
         hint: Option<RequestHint>,
         tool_results: Vec<ExpectedToolResult>,
-        prior_tool_lookup: &HashMap<String, HashMap<String, String>>,
+        prior_tool_lookup: &PriorToolLookup,
         response: &ToolCompletionResponse,
     ) {
+        let publication_guard = self.flush_lock.lock().await;
+        self.record_usage(
+            response.input_tokens,
+            response.output_tokens,
+            response.cache_read_input_tokens,
+            response.cache_creation_input_tokens,
+        )
+        .await;
         let step = if response.tool_calls.is_empty() {
             TraceStep {
                 request_hint: hint,
@@ -1119,12 +1234,57 @@ impl RecordingLlm {
         };
 
         self.steps.lock().await.push(step);
+        drop(publication_guard);
         self.flush_after_step().await;
+    }
+
+    async fn record_usage(
+        &self,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_input_tokens: u32,
+        cache_creation_input_tokens: u32,
+    ) {
+        let mut usage = self.usage.lock().await;
+        usage.trace.input_tokens = usage.trace.input_tokens.saturating_add(input_tokens);
+        usage.trace.output_tokens = usage.trace.output_tokens.saturating_add(output_tokens);
+        usage.trace.cache_read_input_tokens = usage
+            .trace
+            .cache_read_input_tokens
+            .saturating_add(cache_read_input_tokens);
+        usage.trace.cache_creation_input_tokens = usage
+            .trace
+            .cache_creation_input_tokens
+            .saturating_add(cache_creation_input_tokens);
+
+        let (input_rate, output_rate) = self.inner.cost_per_token();
+        if input_rate.is_zero() && output_rate.is_zero() {
+            return;
+        }
+        let cache_read_discount = self.inner.cache_read_discount();
+        let cache_read_rate = if cache_read_discount > Decimal::ZERO {
+            input_rate / cache_read_discount
+        } else {
+            input_rate
+        };
+        let uncached_input_tokens = input_tokens.saturating_sub(cache_read_input_tokens);
+        let step_cost = input_rate * Decimal::from(uncached_input_tokens)
+            + cache_read_rate * Decimal::from(cache_read_input_tokens)
+            + input_rate
+                * self.inner.cache_write_multiplier()
+                * Decimal::from(cache_creation_input_tokens)
+            + output_rate * Decimal::from(output_tokens);
+        usage.total_cost += step_cost;
+        usage.trace.total_cost_usd = Some(usage.total_cost.normalize().to_string());
     }
 }
 
 #[async_trait]
 impl LlmProvider for RecordingLlm {
+    fn provider_id(&self) -> String {
+        self.inner.provider_id()
+    }
+
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }
@@ -1168,12 +1328,9 @@ impl LlmProvider for RecordingLlm {
     ) -> Result<ToolCompletionResponse, LlmError> {
         let (hint, tool_results) = self.capture_new_messages(&request.messages).await;
         // Parameterize tool call arguments BEFORE the request is consumed.
-        // We need access to the prior conversation's tool results (Role::Tool
-        // messages) so we can rewrite literal IDs/values that came from a
-        // previous tool's output as `{{call_id.field}}` templates. The replay
-        // engine resolves these templates at lookup time using the *current*
-        // tool result values, so non-deterministic IDs (mission UUIDs, etc.)
-        // don't bake the recording-time values into the fixture.
+        // Literal IDs from native Role::Tool results become exact call-ID /
+        // JSON-Pointer references. Sanitized user messages that lost their
+        // call ID retain the legacy template fallback.
         let prior_tool_lookup = build_prior_tool_lookup(&request.messages);
         let response = self.inner.complete_with_tools(request).await?;
         self.record_tool_completion_response(hint, tool_results, &prior_tool_lookup, &response)
@@ -1207,6 +1364,14 @@ impl LlmProvider for RecordingLlm {
 
     fn effective_model_name(&self, requested_model: Option<&str>) -> String {
         self.inner.effective_model_name(requested_model)
+    }
+
+    fn fallback_route(
+        &self,
+        fallback_index: u32,
+        requested_model: Option<&str>,
+    ) -> Result<crate::ModelFallbackRoute, LlmError> {
+        self.inner.fallback_route(fallback_index, requested_model)
     }
 
     fn active_model_name(&self) -> String {
@@ -1249,6 +1414,55 @@ mod tests {
     }
 
     struct StreamingStub;
+    struct ToolCallStub;
+
+    #[async_trait]
+    impl LlmProvider for ToolCallStub {
+        fn model_name(&self) -> &str {
+            "tool-call-stub"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Err(LlmError::RequestFailed {
+                provider: "tool-call-stub".to_string(),
+                reason: "text completion is not used by this test".to_string(),
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            Ok(ToolCompletionResponse {
+                content: None,
+                tool_calls: vec![crate::provider::ToolCall {
+                    id: "call_read".to_string(),
+                    name: "google-docs__read_content".to_string(),
+                    arguments: serde_json::json!({
+                        "document_id": "fresh-document",
+                        "label": "root-value",
+                    }),
+                    reasoning: None,
+                    signature: None,
+                    arguments_parse_error: None,
+                }],
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: crate::provider::FinishReason::ToolUse,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning: None,
+                reasoning_details: None,
+            })
+        }
+    }
 
     #[async_trait]
     impl LlmProvider for StreamingStub {
@@ -1257,7 +1471,7 @@ mod tests {
         }
 
         fn cost_per_token(&self) -> (Decimal, Decimal) {
-            (Decimal::ZERO, Decimal::ZERO)
+            (Decimal::new(1, 6), Decimal::new(2, 6))
         }
 
         async fn complete(
@@ -1283,8 +1497,8 @@ mod tests {
                 output_tokens: 2,
                 finish_reason: crate::provider::FinishReason::Stop,
                 reasoning: None,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 1,
+                cache_creation_input_tokens: 2,
             })
         }
 
@@ -1311,7 +1525,7 @@ mod tests {
                 input_tokens: 4,
                 output_tokens: 2,
                 finish_reason: crate::provider::FinishReason::Stop,
-                cache_read_input_tokens: 0,
+                cache_read_input_tokens: 1,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
                 reasoning_details: None,
@@ -1469,6 +1683,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_with_tools_records_exact_result_bindings() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("exact_binding_trace.json");
+        let recorder = RecordingLlm::new(
+            Arc::new(ToolCallStub),
+            path.clone(),
+            "tool-call-test".to_string(),
+        );
+
+        recorder
+            .complete_with_tools(ToolCompletionRequest::new(
+                vec![
+                    ChatMessage::user("create and read"),
+                    ChatMessage::tool_result(
+                        "call_create",
+                        "google-docs__create_document",
+                        r#"{"document":{"id":"fresh-document"}}"#,
+                    ),
+                    ChatMessage::tool_result("call_label", "builtin__label", r#""root-value""#),
+                ],
+                Vec::new(),
+            ))
+            .await
+            .expect("stubbed tool completion succeeds");
+
+        let trace: TraceFile = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("tool trace is flushed incrementally"),
+        )
+        .expect("tool trace parses");
+        let TraceResponse::ToolCalls { tool_calls, .. } =
+            &trace.steps.last().expect("recorded response").response
+        else {
+            panic!("expected recorded tool calls");
+        };
+        assert_eq!(
+            tool_calls[0].arguments,
+            serde_json::json!({
+                "document_id": {
+                    "$trace_result": {
+                        "tool_call_id": "call_create",
+                        "pointer": "/document/id",
+                    }
+                },
+                "label": {
+                    "$trace_result": {
+                        "tool_call_id": "call_label",
+                        "pointer": "",
+                    }
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn complete_streaming_forwards_deltas_and_flushes_final_response() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let path = dir.path().join("streaming_trace.json");
@@ -1497,6 +1765,12 @@ mod tests {
             &trace.steps.last().expect("recorded response").response,
             TraceResponse::Text { content, .. } if content == "streamed answer"
         ));
+        let usage = trace.usage.expect("new traces include aggregate usage");
+        assert_eq!(usage.input_tokens, 3);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.cache_read_input_tokens, 1);
+        assert_eq!(usage.cache_creation_input_tokens, 2);
+        assert_eq!(usage.total_cost_usd.as_deref(), Some("0.000009"));
     }
 
     #[tokio::test]
@@ -1955,6 +2229,7 @@ mod tests {
     fn serde_roundtrip_extended_format() {
         let trace = TraceFile {
             model_name: "test".to_string(),
+            usage: None,
             memory_snapshot: vec![MemorySnapshotEntry {
                 path: "context/vision.md".to_string(),
                 content: "Be helpful.".to_string(),
@@ -2067,7 +2342,55 @@ mod tests {
         assert_eq!(trace.model_name, "old-trace");
         assert!(trace.memory_snapshot.is_empty());
         assert!(trace.http_exchanges.is_empty());
+        assert!(trace.usage.is_none());
         assert!(trace.steps[0].expected_tool_results.is_empty());
+    }
+
+    #[test]
+    fn parameterizes_nested_tool_result_with_exact_binding() {
+        let messages = vec![ChatMessage::tool_result(
+            "call_upload",
+            "google-drive__upload_file",
+            r#"{"file":{"id":"fresh-file-id"}}"#,
+        )];
+        let lookup = build_prior_tool_lookup(&messages);
+        let mut arguments = serde_json::json!({"file_id": "fresh-file-id"});
+
+        parameterize_value(&mut arguments, &lookup);
+
+        assert_eq!(
+            arguments,
+            serde_json::json!({
+                "file_id": {
+                    "$trace_result": {
+                        "tool_call_id": "call_upload",
+                        "pointer": "/file/id"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn leaves_ambiguous_tool_result_value_literal() {
+        let messages = vec![
+            ChatMessage::tool_result(
+                "call_first",
+                "google-drive__upload_file",
+                r#"{"file":{"id":"same-id"}}"#,
+            ),
+            ChatMessage::tool_result(
+                "call_second",
+                "google-drive__upload_file",
+                r#"{"file":{"id":"same-id"}}"#,
+            ),
+        ];
+        let lookup = build_prior_tool_lookup(&messages);
+        let mut arguments = serde_json::json!({"file_id": "same-id"});
+
+        parameterize_value(&mut arguments, &lookup);
+
+        assert_eq!(arguments, serde_json::json!({"file_id": "same-id"}));
     }
 
     #[test]

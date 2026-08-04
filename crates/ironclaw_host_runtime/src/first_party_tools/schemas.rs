@@ -12,16 +12,29 @@ use crate::first_party_tools::time::UNIX_MILLIS_THRESHOLD;
 pub(crate) fn resolve_native_memory_input_schema_ref(reference: &str) -> Option<Value> {
     let raw = match reference {
         "schemas/memory/document-read.input.v1.json" => {
-            include_str!("../../assets/memory_native/schemas/memory/document-read.input.v1.json")
+            include_str!(
+                "../../../extensions/packages/memory-native/schemas/memory/document-read.input.v1.json"
+            )
         }
         "schemas/memory/document-write.input.v1.json" => {
-            include_str!("../../assets/memory_native/schemas/memory/document-write.input.v1.json")
+            include_str!(
+                "../../../extensions/packages/memory-native/schemas/memory/document-write.input.v1.json"
+            )
         }
         "schemas/memory/search.input.v1.json" => {
-            include_str!("../../assets/memory_native/schemas/memory/search.input.v1.json")
+            include_str!(
+                "../../../extensions/packages/memory-native/schemas/memory/search.input.v1.json"
+            )
         }
         "schemas/memory/tree.input.v1.json" => {
-            include_str!("../../assets/memory_native/schemas/memory/tree.input.v1.json")
+            include_str!(
+                "../../../extensions/packages/memory-native/schemas/memory/tree.input.v1.json"
+            )
+        }
+        "schemas/memory/profile-set.input.v1.json" => {
+            include_str!(
+                "../../../extensions/packages/memory-native/schemas/memory/profile-set.input.v1.json"
+            )
         }
         _ => return None,
     };
@@ -92,6 +105,41 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
                 "routed": { "type": "boolean", "const": true }
             },
             "required": ["routed"],
+            "additionalProperties": false
+        }),
+        "schemas/builtin/attach_workspace_file_to_reply.input.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Existing file path under /workspace to attach to the final reply."
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Optional safe download filename. Defaults to the workspace basename."
+                },
+                "mime_type": {
+                    "type": "string",
+                    "description": "Optional MIME type override. Defaults from common filename extensions or application/octet-stream."
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "schemas/builtin/attach_workspace_file_to_reply.output.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "attached": { "type": "boolean", "const": true },
+                "attachment_ref": {
+                    "type": "string",
+                    "pattern": "^att_[0-9a-f]{64}$",
+                    "description": "Opaque host-issued reference for the registered attachment."
+                },
+                "filename": { "type": "string" },
+                "mime_type": { "type": "string" },
+                "size_bytes": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["attached", "attachment_ref", "filename", "mime_type", "size_bytes"],
             "additionalProperties": false
         }),
         "schemas/builtin/http-save.input.v1.json" => http_schema(true),
@@ -202,26 +250,6 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
                 }
             },
             "required": ["display_handle"],
-            "additionalProperties": false
-        }),
-        "schemas/builtin/profile_set.input.v1.json" => json!({
-            "type": "object",
-            "properties": {
-                "timezone": {
-                    "type": "string",
-                    "description": "IANA timezone name, e.g. America/Los_Angeles or Asia/Tokyo"
-                },
-                "locale": {
-                    "type": "string",
-                    "description": "BCP-47 locale tag, e.g. en-US or ja-JP",
-                    "maxLength": 35
-                },
-                "location": {
-                    "type": "string",
-                    "description": "Free-text location label, e.g. Tokyo, Japan"
-                }
-            },
-            "minProperties": 1,
             "additionalProperties": false
         }),
         "schemas/builtin/read_file.input.v1.json" => json!({
@@ -380,6 +408,30 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
             },
             "additionalProperties": false
         }),
+        "schemas/builtin/extension_register_hosted_mcp.input.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "desired_id": {
+                    "type": "string",
+                    "description": "Short stable id for this custom MCP server, without the reserved mcp- prefix."
+                },
+                "desired_name": {
+                    "type": "string",
+                    "description": "User-facing name for the custom MCP extension."
+                },
+                "endpoint": {
+                    "type": "string",
+                    "description": "HTTPS MCP server endpoint supplied by the user or provider documentation."
+                },
+                "auth_type": {
+                    "type": "string",
+                    "enum": ["no_auth", "bearer", "oauth"],
+                    "description": "Explicit authentication type from provider documentation or user context. Use no_auth only for a documented public endpoint, bearer for an API token or PAT, and oauth for a browser authorization-code flow. Ask the user when unclear; never infer automatically."
+                }
+            },
+            "required": ["desired_id", "desired_name", "endpoint", "auth_type"],
+            "additionalProperties": false
+        }),
         "schemas/builtin/extension_install.input.v1.json"
         | "schemas/builtin/extension_remove.input.v1.json" => json!({
             "type": "object",
@@ -387,6 +439,87 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
                 "extension_id": { "type": "string", "description": "Extension id from extension_search results" }
             },
             "required": ["extension_id"],
+            "additionalProperties": false
+        }),
+        "schemas/builtin/ironhub_search.input.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Optional free-text filter matched against entry names and descriptions. OMIT IT to return the entire catalog — that is how you list everything available. A query returns only matching entries: compare total_entries against catalog_total before describing the result as what is available." }
+            },
+            "additionalProperties": false
+        }),
+        "schemas/builtin/ironhub_info.input.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "IronHub tool or skill name." },
+                "kind": { "type": "string", "enum": ["tool", "skill"] }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "schemas/builtin/ironhub_install.input.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "IronHub tool or skill name." },
+                "kind": { "type": "string", "enum": ["tool", "skill"] },
+                "force": { "type": "boolean", "default": false },
+                "expected_version": { "type": "string" },
+                "expected_artifact_digest": { "type": "string" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "schemas/builtin/ironhub_search.output.v1.json"
+        | "schemas/builtin/ironhub_info.output.v1.json"
+        | "schemas/builtin/ironhub_install.output.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "phase": { "type": "string", "enum": ["discovered", "installed"] },
+                "total_entries": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "How many catalog entries MATCHED the request. With a query this is the size of the match, not the catalog."
+                },
+                "returned_entries": { "type": "integer", "minimum": 0 },
+                "catalog_total": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Total entries in the signed catalog, ignoring any query filter. When it exceeds total_entries the result is a filtered subset — say so rather than presenting it as everything available."
+                },
+                "truncated": {
+                    "type": "boolean",
+                    "description": "True when entries is an incomplete prefix of the matching signed catalog. Never infer absence from an incomplete result."
+                },
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["tool", "skill"] },
+                            "name": { "type": "string" },
+                            "version": { "type": "string" },
+                            "description": { "type": "string" },
+                            "provenance": {
+                                "type": "string",
+                                "enum": ["official", "trusted", "verified", "new"]
+                            },
+                            "artifact_digest": { "type": "string" }
+                        },
+                        "required": ["kind", "name", "version", "description", "provenance"],
+                        "additionalProperties": false
+                    }
+                },
+                "lifecycle": { "type": "object" },
+                "message": { "type": "string" }
+            },
+            "required": [
+                "phase",
+                "total_entries",
+                "returned_entries",
+                "catalog_total",
+                "truncated",
+                "entries"
+            ],
             "additionalProperties": false
         }),
         "schemas/builtin/admin_configuration_replace.input.v1.json" => json!({
@@ -885,6 +1018,73 @@ mod tests {
     }
 
     #[test]
+    fn ironhub_schemas_require_explicit_catalog_completeness_metadata() {
+        let input =
+            resolve_builtin_input_schema_ref("schemas/builtin/ironhub_install.input.v1.json")
+                .expect("IronHub install input schema is registered");
+        let install_output =
+            resolve_builtin_input_schema_ref("schemas/builtin/ironhub_install.output.v1.json")
+                .expect("IronHub install output schema is registered");
+        let search_output =
+            resolve_builtin_input_schema_ref("schemas/builtin/ironhub_search.output.v1.json")
+                .expect("IronHub search output schema is registered");
+
+        assert!(input["properties"].get("acknowledge_unverified").is_none());
+        assert!(
+            input["properties"].get("private_manifest_url").is_none(),
+            "model-visible IronHub install must not choose a private manifest source"
+        );
+        assert_eq!(input["additionalProperties"], false);
+        assert_eq!(
+            install_output["properties"]["phase"]["enum"],
+            serde_json::json!(["discovered", "installed"])
+        );
+        assert_eq!(
+            search_output["required"],
+            serde_json::json!([
+                "phase",
+                "total_entries",
+                "returned_entries",
+                "catalog_total",
+                "truncated",
+                "entries"
+            ])
+        );
+        assert_eq!(
+            search_output["properties"]["total_entries"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            search_output["properties"]["returned_entries"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            search_output["properties"]["catalog_total"]["type"],
+            "integer"
+        );
+        assert_eq!(search_output["properties"]["truncated"]["type"], "boolean");
+        assert_eq!(search_output["additionalProperties"], false);
+    }
+
+    #[test]
+    fn hosted_mcp_registration_schema_requires_explicit_non_auto_auth() {
+        let input = resolve_builtin_input_schema_ref(
+            "schemas/builtin/extension_register_hosted_mcp.input.v1.json",
+        )
+        .expect("hosted MCP registration input schema is registered");
+
+        assert_eq!(
+            input["required"],
+            serde_json::json!(["desired_id", "desired_name", "endpoint", "auth_type"])
+        );
+        assert_eq!(
+            input["properties"]["auth_type"]["enum"],
+            serde_json::json!(["no_auth", "bearer", "oauth"])
+        );
+        assert_eq!(input["additionalProperties"], false);
+    }
+
+    #[test]
     fn outbound_preferences_set_schemas_are_registered() {
         let input = resolve_builtin_input_schema_ref(
             "schemas/builtin/outbound_preferences_set.input.v1.json",
@@ -907,6 +1107,31 @@ mod tests {
                 "default_modality"
             ])
         );
+    }
+
+    #[test]
+    fn reply_attachment_output_schema_exposes_only_opaque_identity_and_safe_metadata() {
+        let output = resolve_builtin_input_schema_ref(
+            "schemas/builtin/attach_workspace_file_to_reply.output.v1.json",
+        )
+        .expect("reply attachment output schema is registered");
+
+        assert!(output["properties"].get("path").is_none());
+        assert_eq!(
+            output["properties"]["attachment_ref"]["pattern"],
+            "^att_[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            output["required"],
+            serde_json::json!([
+                "attached",
+                "attachment_ref",
+                "filename",
+                "mime_type",
+                "size_bytes"
+            ])
+        );
+        assert_eq!(output["additionalProperties"], false);
     }
 
     #[test]

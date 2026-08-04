@@ -18,7 +18,8 @@ import {
   resetToolActivityState,
 } from "./tool-activity-state";
 import {
-  CONNECTION_LOST_RUN_FAILURE_MESSAGE,
+  CONNECTION_LOST_RUN_FAILURE_KEY,
+  failureMessageForRequestError,
   rewriteConnectionLostRunFailures,
   upsertConnectionLostRunFailure,
 } from "./failureMessages";
@@ -33,6 +34,11 @@ import {
   isRequestFailureForMessage,
   requestFailureIdForMessage,
 } from "./message-types";
+import {
+  RECORD_STATUS,
+  uiStatusFromRecordStatus,
+} from "./message-status";
+import { buildOptimisticMessage } from "./optimistic-message";
 import {
   channelConnectionContinuationMessage,
   connectionEventMatchesOnboarding,
@@ -54,6 +60,22 @@ const STATE_SLOT = Object.freeze({
   busyGateNotice: 6,
   stateThreadId: 7,
 });
+
+const ENGLISH_FAILURE_COPY = {
+  "chat.failure.connectionLost":
+    "Connection to the server was lost. Please reconnect and try again.",
+  "chat.failure.request": "The request failed before it could be sent.",
+  "chat.commandFailed": "Couldn't run that command.",
+};
+
+function testTranslator(copy = ENGLISH_FAILURE_COPY) {
+  return (key, params = {}) =>
+    (copy[key] || key).replace(/\{(\w+)\}/g, (match, name) =>
+      Object.hasOwn(params, name) ? String(params[name]) : match,
+    );
+}
+
+const t = testTranslator();
 
 function stateUpdatesFor(updates, slot) {
   return updates.filter((update) => update.index === slot);
@@ -109,6 +131,9 @@ function runUseChatSource(context) {
     normalizeConnectionChannel,
     rememberChannelConnectionWaiter,
     requestFailureIdForMessage,
+    RECORD_STATUS,
+    uiStatusFromRecordStatus,
+    buildOptimisticMessage,
   });
   if (!context.subscribeChannelConnected) {
     context.subscribeChannelConnected = subscribeChannelConnected;
@@ -126,7 +151,7 @@ function runUseChatSource(context) {
   if (!context.startExtensionOauth) {
     context.startExtensionOauth = async () => ({ success: false });
   }
-  if (!context.useT) context.useT = () => (key) => key;
+  if (!context.useT) context.useT = () => t;
   if (!("touchThreadInCache" in context)) context.touchThreadInCache = () => {};
   if (!("upsertThreadInCache" in context)) context.upsertThreadInCache = () => {};
   vm.runInNewContext(useChatSourceForTest(), context);
@@ -284,7 +309,10 @@ test("useChat: disconnected SSE rewrites an active driver_unavailable error", ()
 
   assert.equal(chat.sseStatus, CONNECTION_STATUS.DISCONNECTED);
   assert.equal(renderedMessages.length, 1);
-  assert.equal(renderedMessages[0].content, CONNECTION_LOST_RUN_FAILURE_MESSAGE);
+  assert.equal(
+    renderedMessages[0].content,
+    t(CONNECTION_LOST_RUN_FAILURE_KEY),
+  );
   assert.equal(
     stateUpdatesFor(setCalls, STATE_SLOT.isProcessing).at(-1)?.value,
     false,
@@ -364,7 +392,10 @@ test("useChat: disconnected SSE surfaces connection error before run id is known
   assert.equal(renderedMessages.length, 2);
   assert.equal(renderedMessages[0].content, historicalFailure);
   assert.equal(renderedMessages[1].id, "err-connection-lost");
-  assert.equal(renderedMessages[1].content, CONNECTION_LOST_RUN_FAILURE_MESSAGE);
+  assert.equal(
+    renderedMessages[1].content,
+    t(CONNECTION_LOST_RUN_FAILURE_KEY),
+  );
   assert.equal(
     stateUpdatesFor(setCalls, STATE_SLOT.isProcessing).at(-1)?.value,
     false,
@@ -1006,9 +1037,13 @@ test("useChat.send: pending approval blocks before sendMessage", async () => {
   assert.equal(sendCalls, 0);
 });
 
-test("useChat.send: request failure appends inline error in the active thread", async () => {
+test("useChat.send: request failures use safe copy in the selected language", async () => {
   const threadId = "thread-1";
   let renderedMessages = [];
+  let sendAttempt = 0;
+  const zh = testTranslator({
+    "chat.failure.request": "请求在发送前失败。",
+  });
 
   const context = {
     AbortController,
@@ -1025,8 +1060,7 @@ test("useChat.send: request failure appends inline error in the active thread", 
     createThreadRequest: async () => {
       throw new Error("thread should already exist");
     },
-    failureMessageForRequestError: (error) =>
-      `inline:${error?.message || "unknown"}`,
+    failureMessageForRequestError,
     globalThis: {},
     queryClient: {
       fetchQuery: async () => {
@@ -1039,7 +1073,16 @@ test("useChat.send: request failure appends inline error in the active thread", 
     timelineMessageIdFromAcceptedRef,
     resolveGateRequest: async () => {},
     sendMessage: async () => {
-      throw new Error("AI provider account is out of credits");
+      sendAttempt += 1;
+      if (sendAttempt === 1) throw new TypeError("Failed to fetch");
+      throw {
+        name: "ApiError",
+        message: "Provider secret leaked",
+        payload: {
+          error: "customer email alice@example.com and token super-secret",
+          field: "api_key=super-secret",
+        },
+      };
     },
     setInterval,
     setTimeout,
@@ -1058,25 +1101,34 @@ test("useChat.send: request failure appends inline error in the active thread", 
       },
     }),
     useSSE: () => ({ status: "idle" }),
+    useT: () => zh,
   };
 
   runUseChatSource(context);
 
   const chat = context.globalThis.__testExports.useChat(threadId);
-  await assert.rejects(chat.send("please answer"), /out of credits/);
+  await assert.rejects(chat.send("please answer"), /Failed to fetch/);
 
   assert.equal(renderedMessages.length, 2);
   assert.equal(renderedMessages[0].role, "user");
   assert.equal(renderedMessages[0].status, "error");
-  assert.equal(
-    renderedMessages[0].error,
-    "inline:AI provider account is out of credits",
-  );
+  assert.equal(renderedMessages[0].error, "请求在发送前失败。");
   assert.equal(renderedMessages[1].role, "error");
   assert.equal(renderedMessages[1].requestForMessageId, renderedMessages[0].id);
-  assert.equal(
-    renderedMessages[1].content,
-    "inline:AI provider account is out of credits",
+  assert.equal(renderedMessages[1].content, "请求在发送前失败。");
+
+  await assert.rejects(chat.send("do not leak provider details"));
+
+  assert.equal(renderedMessages.length, 4);
+  assert.equal(renderedMessages[2].role, "user");
+  assert.equal(renderedMessages[2].status, "error");
+  assert.equal(renderedMessages[2].error, "请求在发送前失败。");
+  assert.equal(renderedMessages[3].role, "error");
+  assert.equal(renderedMessages[3].requestForMessageId, renderedMessages[2].id);
+  assert.equal(renderedMessages[3].content, "请求在发送前失败。");
+  assert.doesNotMatch(
+    renderedMessages.map((message) => message.content || message.error).join(" "),
+    /alice@example\.com|super-secret|api_key/,
   );
 });
 
@@ -4691,7 +4743,10 @@ test("useChat.send: rejected_busy without notice still clears isProcessing", asy
   assert.equal(lastIsProcessing?.value, false);
 });
 
-test("useChat.send: active run refuses duplicate submit before network call", async () => {
+test("useChat.send: admits a follow-up while a run is active and renders it queued", async () => {
+  // Queued-message UX: an active run no longer blocks a local send. The
+  // follow-up must reach the backend so Reborn can queue it (deferred_busy),
+  // and the optimistic bubble renders as "queued" (not an error).
   const threadId = "thread-busy-local";
   let renderedMessages = [];
   let sendCalls = 0;
@@ -4723,7 +4778,11 @@ test("useChat.send: active run refuses duplicate submit before network call", as
     resolveGateRequest: async () => {},
     sendMessage: async () => {
       sendCalls += 1;
-      throw new Error("busy send should not reach API");
+      return {
+        outcome: "deferred_busy",
+        thread_id: threadId,
+        accepted_message_ref: "msg:queued-1",
+      };
     },
     setInterval,
     setTimeout,
@@ -4748,12 +4807,13 @@ test("useChat.send: active run refuses duplicate submit before network call", as
   const chat = context.globalThis.__testExports.useChat(threadId);
   const response = await chat.send("second message while first run is active");
 
-  assert.equal(response, null);
-  assert.equal(sendCalls, 0);
-  assert.deepEqual(renderedMessages, []);
+  assert.equal(response.outcome, "deferred_busy");
+  assert.equal(sendCalls, 1);
+  assert.equal(renderedMessages.length, 1);
+  assert.equal(renderedMessages[0].status, "queued");
 });
 
-test("useChat.send: accepted run blocks another submit until settlement", async () => {
+test("useChat.send: admits a follow-up submit while a prior run is still active", async () => {
   const threadId = "thread-1";
   let renderedMessages = [];
   let sendCalls = 0;
@@ -4818,30 +4878,26 @@ test("useChat.send: accepted run blocks another submit until settlement", async 
 
   const chat = context.globalThis.__testExports.useChat(threadId);
   const first = await chat.send("first message");
+  // The previous send's POST has already settled (awaited), so the
+  // re-entrancy guard is released. Queued-message UX: the still-active run no
+  // longer blocks the follow-up — it reaches the backend to be queued.
   const second = await chat.send("draft while the reply is still running");
 
   assert.equal(first.run_id, "run-1");
-  assert.equal(second, null);
-  assert.equal(sendCalls, 1);
-  assert.equal(renderedMessages.length, 1);
-  assert.equal(renderedMessages[0].content, "first message");
-
-  context.chatEventsArgs.setIsProcessing(false);
-  context.chatEventsArgs.setActiveRun(null);
-  context.chatEventsArgs.onRunSettled("run-1", { success: true });
-
-  const third = await chat.send("message after settlement");
-
-  assert.equal(third.run_id, "run-2");
+  assert.equal(second.run_id, "run-2");
   assert.equal(sendCalls, 2);
+  assert.equal(renderedMessages.length, 2);
+  assert.equal(renderedMessages[0].content, "first message");
+  assert.equal(renderedMessages[1].content, "draft while the reply is still running");
 });
 
-test("useChat.send: created thread stays blocked until accepted run settles", async () => {
+test("useChat.send: created thread admits a follow-up send while its run is active", async () => {
   const createdThreadId = "thread-created";
   let renderedMessages = [];
   let createThreadCalls = 0;
   let sendCalls = 0;
   const seededByThread = new Map();
+  const stateSlots = new Map();
 
   const context = {
     AbortController,
@@ -4849,7 +4905,7 @@ test("useChat.send: created thread stays blocked until accepted run settles", as
     Error,
     Map,
     Math,
-    React: createReactStub(),
+    React: createReactStub({ stateSlots }),
     addPending,
     toRenderAttachment,
     toWireAttachment,
@@ -4872,12 +4928,21 @@ test("useChat.send: created thread stays blocked until accepted run settles", as
     resolveGateRequest: async () => {},
     sendMessage: async ({ content, threadId }) => {
       sendCalls += 1;
+      if (sendCalls === 1) {
+        return {
+          accepted_message_ref: "msg:created-1",
+          run_id: "run-1",
+          status: "queued",
+          thread_id: threadId,
+          content,
+        };
+      }
+      // The created thread's first run is still active, so Reborn queues the
+      // follow-up behind it instead of starting a new run.
       return {
-        accepted_message_ref: `msg:created-${sendCalls}`,
-        run_id: `run-${sendCalls}`,
-        status: "queued",
+        outcome: "deferred_busy",
         thread_id: threadId,
-        content,
+        accepted_message_ref: "msg:created-2",
       };
     },
     setInterval,
@@ -4916,22 +4981,25 @@ test("useChat.send: created thread stays blocked until accepted run settles", as
   assert.equal(first.run_id, "run-1");
   assert.equal(first.thread_id, createdThreadId);
 
-  context.chatEventsArgs.setIsProcessing(false);
-  context.chatEventsArgs.setActiveRun(null);
+  // The first run is deliberately left active: this is the state a
+  // reintroduced local busy rejection would trip over.
+  assert.equal(stateSlots.get(STATE_SLOT.isProcessing).value, true);
+  assert.equal(stateSlots.get(STATE_SLOT.activeRun).value?.runId, "run-1");
 
+  // Queued-message UX: the still-active run on the just-created thread no
+  // longer blocks a follow-up — it reaches the backend, which queues it
+  // (deferred_busy), and the optimistic bubble renders as "queued".
   const second = await chat.send("draft while the reply is still running", {
     threadId: createdThreadId,
   });
-  assert.equal(second, null);
-  assert.equal(sendCalls, 1);
-
-  context.chatEventsArgs.onRunSettled("run-1", { success: true });
-
-  const third = await chat.send("message after settlement", {
-    threadId: createdThreadId,
-  });
-  assert.equal(third.run_id, "run-2");
+  assert.equal(second.outcome, "deferred_busy");
   assert.equal(sendCalls, 2);
+  assert.equal(renderedMessages.length, 2);
+  assert.equal(renderedMessages[1].status, "queued");
+  const seededMessages = seededByThread.get(createdThreadId);
+  assert.equal(seededMessages[seededMessages.length - 1].status, "queued");
+  // deferred_busy keeps the active run processing — it was queued, not dropped.
+  assert.equal(stateSlots.get(STATE_SLOT.isProcessing).value, true);
 });
 
 test("useChat.send: clears local busy when run settles before send response", async () => {
@@ -5627,10 +5695,11 @@ test("useChat.send: addresses a second thread in parallel while viewing a runnin
   assert.ok(result, "send must resolve with a response, not null");
 });
 
-test("useChat.send: still blocks a duplicate send into the already-running thread", async () => {
-  // The one case the gate must keep blocking: a second send into the SAME
-  // thread that already has a run in flight (both activeRun and isProcessing
-  // set — the real busy state).
+test("useChat.send: admits a follow-up into the already-running thread (queued)", async () => {
+  // Queued-message UX: a second send into the SAME thread that already has a
+  // run in flight (both activeRun and isProcessing set — the real busy state)
+  // is no longer blocked locally. It must reach the backend so Reborn can
+  // queue it behind the active run.
   const { context, sentBody, createThreadCalls } = createParallelSendContext({
     threadId: "thread-a",
     activeRun: { runId: "run-a", threadId: "thread-a", status: "running" },
@@ -5640,21 +5709,20 @@ test("useChat.send: still blocks a duplicate send into the already-running threa
   runUseChatSource(context);
 
   const chat = context.globalThis.__testExports.useChat("thread-a");
-  const result = await chat.send("duplicate into the busy thread", {
+  const result = await chat.send("follow-up into the busy thread", {
     threadId: "thread-a",
   });
 
-  assert.equal(result, null, "duplicate send into the busy thread is rejected");
-  assert.equal(sentBody(), null, "sendMessage must not be called for a busy thread");
+  assert.ok(result, "the follow-up send resolves with a response, not null");
+  assert.ok(sentBody(), "sendMessage is called so the backend can queue it");
+  assert.equal(sentBody().threadId, "thread-a");
   assert.equal(createThreadCalls(), 0);
 });
 
-test("useChat.send: blocks a send addressed to a busy thread that is NOT the viewed one", async () => {
-  // The block must key on the *destination* thread, not the viewed one:
-  // viewing thread-a, but the active run is on thread-b, and the send is
-  // addressed to thread-b — that destination is busy, so it must be blocked.
-  // This complements the parallel-send test (viewed busy, different target →
-  // allowed) so the pair pins the block on destination identity alone.
+test("useChat.send: admits a send addressed to a busy thread that is NOT the viewed one", async () => {
+  // The destination thread being busy no longer blocks the send: viewing
+  // thread-a, active run on thread-b, send addressed to thread-b — it must
+  // still reach the backend to be queued.
   const { context, sentBody, createThreadCalls } = createParallelSendContext({
     threadId: "thread-a",
     activeRun: { runId: "run-b", threadId: "thread-b", status: "running" },
@@ -5667,7 +5735,275 @@ test("useChat.send: blocks a send addressed to a busy thread that is NOT the vie
     threadId: "thread-b",
   });
 
-  assert.equal(result, null, "send into the busy destination thread is rejected");
-  assert.equal(sentBody(), null, "sendMessage must not be called for the busy destination");
+  assert.ok(result, "send into the busy destination reaches the backend, not blocked");
+  assert.ok(sentBody(), "sendMessage is called for the busy destination");
+  assert.equal(sentBody().threadId, "thread-b");
   assert.equal(createThreadCalls(), 0);
+});
+
+test("useChat.runCommand: shows the localized chat.commandFailed notice on a client-side error", async () => {
+  const threadId = "thread-1";
+  let renderedMessages = [];
+
+  const context = {
+    AbortController,
+    Date,
+    Error,
+    Map,
+    Math,
+    React: createReactStub(),
+    addPending,
+    toRenderAttachment,
+    toWireAttachment,
+    cancelRunRequest: async () => {},
+    clearTimeout,
+    createThreadRequest: async () => {
+      throw new Error("thread should already exist");
+    },
+    // The REAL helper — not a stand-in. runCommand's catch no longer routes
+    // through it (see the fix below), but binding the production
+    // implementation here means a future regression that reintroduces a call
+    // to it exercises real logic instead of a hand-rolled fake that could
+    // hardcode away the very failure this test exists to catch.
+    failureMessageForRequestError,
+    globalThis: {},
+    queryClient: {
+      fetchQuery: async () => {
+        throw new Error("commands should not fetch connectable channels");
+      },
+      invalidateQueries: () => {},
+    },
+    recordAcceptedMessageRef,
+    removePending,
+    timelineMessageIdFromAcceptedRef,
+    resolveGateRequest: async () => {},
+    sendMessage: async () => {
+      throw new Error("runCommand must not submit a turn");
+    },
+    executeChatCommand: async () => {
+      // A client-side/network failure before the request reaches the server.
+      throw new TypeError("Failed to fetch");
+    },
+    renderCommandResultMarkdown: () => "unused on the failure path",
+    // No `useT` override: `runUseChatSource` defaults it to the shared
+    // module-level `t = testTranslator()`, which resolves
+    // "chat.commandFailed" to real English copy (`ENGLISH_FAILURE_COPY`
+    // above) rather than echoing the bare key back — so a regression that
+    // forgets to call `t(...)` at all (and just appends the raw key string)
+    // fails this assertion instead of accidentally matching it.
+    setInterval,
+    setTimeout,
+    submitManualToken: async () => {},
+    useChatEvents: () => () => {},
+    useHistory: () => ({
+      messages: renderedMessages,
+      hasMore: false,
+      nextCursor: null,
+      isLoading: false,
+      loadHistory: async () => {},
+      setMessages: (updater) => {
+        renderedMessages =
+          typeof updater === "function" ? updater(renderedMessages) : updater;
+      },
+    }),
+    useSSE: () => ({ status: CONNECTION_STATUS.IDLE }),
+  };
+
+  runUseChatSource(context);
+
+  const chat = context.globalThis.__testExports.useChat(threadId);
+  // Must resolve to null (graceful), not reject.
+  const result = await chat.runCommand("/status");
+  assert.equal(result, null);
+  assert.equal(renderedMessages.length, 1);
+  assert.equal(renderedMessages[0].role, CHAT_MESSAGE_ROLES.SYSTEM);
+  assert.equal(renderedMessages[0].content, t("chat.commandFailed"));
+  assert.equal(renderedMessages[0].content, "Couldn't run that command.");
+  assert.equal(
+    renderedMessages[0].commandResult,
+    undefined,
+    "a client-side/network failure has no server response to render richly — MessageBubble must fall back to the plain markdown notice, not an empty CommandResult",
+  );
+});
+
+test("useChat.runCommand: fences the success notice to the thread it executed against", async () => {
+  // Regression (item 2): switching threads mid-flight must not render the
+  // command's result into the destination conversation. Mirrors the
+  // `threadIdRef`-mutation trick "rejected busy seeds notice when active
+  // thread changed in flight" uses above to simulate a real navigation
+  // committing while the request is in flight.
+  const threadId = "thread-a";
+  const nextThreadId = "thread-b";
+  const refs = [];
+  let renderedMessages = [];
+  const seededByThread = new Map();
+
+  const context = {
+    AbortController,
+    Date,
+    Error,
+    Map,
+    Math,
+    React: createReactStub({ refs }),
+    addPending,
+    toRenderAttachment,
+    toWireAttachment,
+    cancelRunRequest: async () => {},
+    clearTimeout,
+    createThreadRequest: async () => {
+      throw new Error("thread should already exist");
+    },
+    globalThis: {},
+    queryClient: {
+      fetchQuery: async () => {
+        throw new Error("commands should not fetch connectable channels");
+      },
+      invalidateQueries: () => {},
+    },
+    recordAcceptedMessageRef,
+    removePending,
+    timelineMessageIdFromAcceptedRef,
+    resolveGateRequest: async () => {},
+    sendMessage: async () => {
+      throw new Error("runCommand must not submit a turn");
+    },
+    executeChatCommand: async () => {
+      // refs[0] is threadIdRef — the first `useRef` call in useChat.ts.
+      // Mutating it here simulates the layout effect committing a real
+      // navigation to `nextThreadId` while this request is still in flight.
+      refs[0].current = nextThreadId;
+      return {
+        command: "status",
+        result: { title: "Status", fields: [], lines: [] },
+      };
+    },
+    renderCommandResultMarkdown: (response) => `**${response.result.title}**`,
+    setInterval,
+    setTimeout,
+    submitManualToken: async () => {},
+    useChatEvents: () => () => {},
+    useHistory: () => ({
+      messages: renderedMessages,
+      hasMore: false,
+      nextCursor: null,
+      isLoading: false,
+      loadHistory: async () => {},
+      seedThreadMessages: (seedThreadId, updater) => {
+        const previous = seededByThread.get(seedThreadId) || [];
+        seededByThread.set(
+          seedThreadId,
+          typeof updater === "function" ? updater(previous) : updater,
+        );
+      },
+      setMessages: (updater) => {
+        renderedMessages =
+          typeof updater === "function" ? updater(renderedMessages) : updater;
+      },
+    }),
+    useSSE: () => ({ status: CONNECTION_STATUS.IDLE }),
+  };
+
+  runUseChatSource(context);
+
+  const chat = context.globalThis.__testExports.useChat(threadId);
+  await chat.runCommand("/status");
+
+  assert.equal(
+    renderedMessages.length,
+    0,
+    "the notice must not appear in the thread the user switched to",
+  );
+  const seeded = seededByThread.get(threadId);
+  assert.equal(
+    seeded?.length,
+    1,
+    "the notice belongs to the thread the command actually executed against",
+  );
+  assert.equal(seeded[0].role, CHAT_MESSAGE_ROLES.SYSTEM);
+  assert.equal(seeded[0].content, "**Status**");
+});
+
+test("useChat.runCommand: fences the failure notice to the thread it executed against", async () => {
+  // Same fence as above, on the catch/failure path.
+  const threadId = "thread-a";
+  const nextThreadId = "thread-b";
+  const refs = [];
+  let renderedMessages = [];
+  const seededByThread = new Map();
+
+  const context = {
+    AbortController,
+    Date,
+    Error,
+    Map,
+    Math,
+    React: createReactStub({ refs }),
+    addPending,
+    toRenderAttachment,
+    toWireAttachment,
+    cancelRunRequest: async () => {},
+    clearTimeout,
+    createThreadRequest: async () => {
+      throw new Error("thread should already exist");
+    },
+    failureMessageForRequestError,
+    globalThis: {},
+    queryClient: {
+      fetchQuery: async () => {
+        throw new Error("commands should not fetch connectable channels");
+      },
+      invalidateQueries: () => {},
+    },
+    recordAcceptedMessageRef,
+    removePending,
+    timelineMessageIdFromAcceptedRef,
+    resolveGateRequest: async () => {},
+    sendMessage: async () => {
+      throw new Error("runCommand must not submit a turn");
+    },
+    executeChatCommand: async () => {
+      refs[0].current = nextThreadId;
+      throw new TypeError("Failed to fetch");
+    },
+    renderCommandResultMarkdown: () => "unused on the failure path",
+    setInterval,
+    setTimeout,
+    submitManualToken: async () => {},
+    useChatEvents: () => () => {},
+    useHistory: () => ({
+      messages: renderedMessages,
+      hasMore: false,
+      nextCursor: null,
+      isLoading: false,
+      loadHistory: async () => {},
+      seedThreadMessages: (seedThreadId, updater) => {
+        const previous = seededByThread.get(seedThreadId) || [];
+        seededByThread.set(
+          seedThreadId,
+          typeof updater === "function" ? updater(previous) : updater,
+        );
+      },
+      setMessages: (updater) => {
+        renderedMessages =
+          typeof updater === "function" ? updater(renderedMessages) : updater;
+      },
+    }),
+    useSSE: () => ({ status: CONNECTION_STATUS.IDLE }),
+  };
+
+  runUseChatSource(context);
+
+  const chat = context.globalThis.__testExports.useChat(threadId);
+  const result = await chat.runCommand("/status");
+
+  assert.equal(result, null);
+  assert.equal(
+    renderedMessages.length,
+    0,
+    "the failure notice must not appear in the thread the user switched to",
+  );
+  const seeded = seededByThread.get(threadId);
+  assert.equal(seeded?.length, 1);
+  assert.equal(seeded[0].role, CHAT_MESSAGE_ROLES.SYSTEM);
+  assert.equal(seeded[0].content, t("chat.commandFailed"));
 });

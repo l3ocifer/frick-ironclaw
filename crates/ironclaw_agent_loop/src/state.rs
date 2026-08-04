@@ -5,10 +5,11 @@ mod bounded_ring;
 mod model_recovery;
 mod signature;
 mod slots;
+mod terminal_warning;
 
 pub use bounded_ring::BoundedRing;
-pub use ironclaw_turns::LoopFailureKind;
-pub use ironclaw_turns::run_profile::AuthResumeApprovalIdentity;
+pub use ironclaw_loop_contracts::AuthResumeApprovalIdentity;
+pub use ironclaw_loop_contracts::LoopFailureKind;
 pub use model_recovery::{ModelErrorRecoveryObservation, PendingModelRetryDirective};
 pub use signature::{
     ArgsHash, CapabilityCallSignature, CapabilityCallSignatureError, CapabilityOutputObservation,
@@ -21,14 +22,15 @@ pub use slots::{
     RepeatedCallWarningPhase, RepeatedCallWarningState, ReplyAdmissionRejection,
     ReplyAdmissionRejectionReason, ReplyAdmissionStrategyState, StopStrategyState,
 };
+pub use terminal_warning::TerminalWarningState;
+pub(crate) use terminal_warning::{TerminalWarningKind, TerminalWarningObservation};
 
-use ironclaw_host_api::{ApprovalRequestId, CapabilityId, CorrelationId};
-use ironclaw_turns::{
-    LoopGateRef, LoopMessageRef, LoopResultRef,
-    run_profile::{
-        CapabilityActivityId, CapabilityApprovalResume, CapabilityInputRef, CapabilityResumeToken,
-        CapabilitySurfaceVersion, LoopInputCursor, LoopRunContext, ProviderToolCallReplay,
-    },
+use ironclaw_host_api::ids::{ApprovalRequestId, CapabilityId, CorrelationId};
+use ironclaw_host_api::turn::CapabilityActivityId;
+use ironclaw_host_api::turn::{LoopGateRef, LoopMessageRef, LoopResultRef};
+use ironclaw_loop_contracts::{
+    CapabilityApprovalResume, CapabilityInputRef, CapabilityResumeToken, CapabilitySurfaceVersion,
+    LoopInputCursor, LoopRunContext, ProviderToolCallReplay,
 };
 
 /// Checkpoint payload schema for the default Reborn loop.
@@ -78,22 +80,14 @@ pub struct LoopExecutionState {
     /// OpenAI-compatible surfaces. `None` until the first call that reports
     /// usage (replay stubs and usage-less providers leave it `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cumulative_model_usage: Option<ironclaw_turns::run_profile::LoopModelUsage>,
-
-    /// Count of final-answer nudges issued this run (driver-specific nudge,
-    /// gated by `SteeringPolicy.allow_driver_specific_nudges`). Capped so the
-    /// loop can't issue unbounded extra model calls. `#[serde(default)]` keeps
-    /// older checkpoints decodable.
-    #[serde(default)]
-    pub final_answer_nudges_used: u32,
+    pub cumulative_model_usage: Option<ironclaw_loop_contracts::LoopModelUsage>,
 
     /// Count of tools-capable completion nudges issued this run (driver-specific
-    /// nudge, gated by `SteeringPolicy.allow_driver_specific_nudges`). Unlike the
-    /// tool-free `final_answer_nudges_used` rescue, this one re-enters the loop
-    /// with the full tool surface so the model can finish the task (e.g. write a
-    /// required output file) before answering. Capped so the loop can't issue
-    /// unbounded extra iterations. `#[serde(default)]` keeps older checkpoints
-    /// decodable.
+    /// nudge, gated by `SteeringPolicy.allow_driver_specific_nudges`). It
+    /// re-enters the loop with the full tool surface so the model can finish the
+    /// task (e.g. write a required output file) before answering. Capped so the
+    /// loop can't issue unbounded extra iterations. `#[serde(default)]` keeps
+    /// older checkpoints decodable.
     #[serde(default)]
     pub completion_nudges_used: u32,
 
@@ -116,6 +110,12 @@ pub struct LoopExecutionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_model_retry_directive: Option<PendingModelRetryDirective>,
 
+    /// One-shot warning state for otherwise-terminal no-progress and iteration
+    /// limit conditions. Pending prompt context and the consumed budget remain
+    /// checkpointed until the executor issues the recovery model request.
+    #[serde(default)]
+    pub terminal_warning_state: TerminalWarningState,
+
     /// Whether the most recent admitted assistant reply "trailed off" without a
     /// real closing answer (empty after trim, or ends with a colon — a narrated
     /// next step with no follow-through). Populated by `AssistantReplyStage`; read
@@ -137,6 +137,15 @@ pub struct LoopExecutionState {
     #[serde(default)]
     pub goal_refresh_state: GoalRefreshStrategyState,
     pub recovery_state: RecoveryStrategyState,
+    /// Monotonic identity source for durable recovery evidence.
+    ///
+    /// The next recovery append uses this value, then advances it only after
+    /// the host accepts the event. Because the counter is checkpointed with
+    /// the recovery state, replay after an append/checkpoint interruption
+    /// reuses the same logical event identity instead of minting a second
+    /// recovery numerator.
+    #[serde(default)]
+    pub recovery_event_sequence: u64,
     #[serde(default)]
     pub reply_admission_state: ReplyAdmissionStrategyState,
     pub stop_state: StopStrategyState,
@@ -169,7 +178,7 @@ pub struct PendingApprovalResume {
     /// model-visible failure for the parked call instead of re-dispatching.
     /// See the field-name note on `PendingAuthResume::disposition`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disposition: Option<ironclaw_turns::GateResumeDisposition>,
+    pub disposition: Option<ironclaw_host_api::turn::GateResumeDisposition>,
 }
 
 impl PendingApprovalResume {
@@ -249,7 +258,7 @@ pub struct PendingAuthResume {
     /// Set when the user denied this auth gate. The loop surfaces a
     /// model-visible failure for the parked call instead of re-dispatching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disposition: Option<ironclaw_turns::GateResumeDisposition>,
+    pub disposition: Option<ironclaw_host_api::turn::GateResumeDisposition>,
 }
 
 impl PendingAuthResume {
@@ -281,7 +290,7 @@ pub struct PendingExternalToolResume {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_replay: Option<ProviderToolCallReplay>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disposition: Option<ironclaw_turns::GateResumeDisposition>,
+    pub disposition: Option<ironclaw_host_api::turn::GateResumeDisposition>,
 }
 
 impl PendingExternalToolResume {
@@ -296,7 +305,7 @@ impl LoopExecutionState {
     /// providers), leaving any prior total intact.
     pub(crate) fn accumulate_model_usage(
         &mut self,
-        usage: Option<ironclaw_turns::run_profile::LoopModelUsage>,
+        usage: Option<ironclaw_loop_contracts::LoopModelUsage>,
     ) {
         if let Some(usage) = usage {
             self.cumulative_model_usage
@@ -326,11 +335,11 @@ impl LoopExecutionState {
             recent_failure_kinds: BoundedRing::new(),
             recent_output_token_counts: BoundedRing::new(),
             cumulative_model_usage: None,
-            final_answer_nudges_used: 0,
             completion_nudges_used: 0,
             completion_nudge_pending: false,
             pending_model_error_observation: None,
             pending_model_retry_directive: None,
+            terminal_warning_state: TerminalWarningState::default(),
             last_reply_trailed_off: false,
             context_state: ContextStrategyState::default(),
             capability_state: CapabilityStrategyState::default(),
@@ -340,6 +349,7 @@ impl LoopExecutionState {
             post_capability_state: PostCapabilityStageState::default(),
             goal_refresh_state: GoalRefreshStrategyState::default(),
             recovery_state: RecoveryStrategyState::default(),
+            recovery_event_sequence: 0,
             reply_admission_state: ReplyAdmissionStrategyState::default(),
             stop_state: StopStrategyState::default(),
             gate_state: GateStrategyState::default(),
@@ -354,8 +364,8 @@ impl LoopExecutionState {
     /// The bytes are the raw JSON-serialized `LoopExecutionState` — i.e. what
     /// the executor produced via `serde_json::to_vec(&state)` before passing
     /// the bytes to `LoopCheckpointPort::stage_checkpoint_payload`. The payload
-    /// contains **no outer envelope**: schema-id and kind live in store-side
-    /// metadata, validated by `CheckpointStateStorePort::get_checkpoint_state`
+    /// contains **no outer envelope**: schema-id and kind live in journal
+    /// metadata, validated by the process-backed checkpoint projection
     /// before the bytes ever reach this function. The `kind` argument is
     /// accepted for API symmetry (the call site can document what boundary the
     /// checkpoint belongs to) but is not used to authenticate the bytes.
@@ -437,17 +447,16 @@ pub enum CheckpointPayloadError {
 
 #[cfg(test)]
 mod tests {
-    use ironclaw_host_api::{CapabilityId, TenantId, ThreadId};
-    use ironclaw_turns::{
-        AgentLoopDriverDescriptor, GateResumeDisposition, RunProfileId, RunProfileVersion, TurnId,
-        TurnRunId, TurnScope,
-        run_profile::{
-            CancellationPolicy, CapabilitySurfaceProfileId, CheckpointPolicy, CheckpointSchemaId,
-            ConcurrencyClass, ContextProfileId, LoopDriverId, ModelProfileId,
-            RedactedRunProfileProvenance, ResolvedRunProfile, ResourceBudgetPolicy,
-            ResourceBudgetTier, RunClassId, RunProfileFingerprint, RuntimeProfileConstraints,
-            SchedulingClass, SteeringPolicy,
-        },
+    use ironclaw_host_api::ids::{CapabilityId, TenantId, ThreadId};
+    use ironclaw_host_api::turn::{
+        GateResumeDisposition, RunProfileId, RunProfileVersion, TurnId, TurnRunId, TurnScope,
+    };
+    use ironclaw_loop_contracts::{
+        AgentLoopDriverDescriptor, CancellationPolicy, CapabilitySurfaceProfileId,
+        CheckpointPolicy, CheckpointSchemaId, ConcurrencyClass, ContextProfileId, LoopDriverId,
+        ModelProfileId, RedactedRunProfileProvenance, ResolvedRunProfile, ResourceBudgetPolicy,
+        ResourceBudgetTier, RunClassId, RunProfileFingerprint, RuntimeProfileConstraints,
+        SchedulingClass, SteeringPolicy,
     };
     use serde_json::json;
 
@@ -508,7 +517,7 @@ mod tests {
                 max_model_calls: 32,
                 max_capability_invocations: 64,
             },
-            personal_context_policy: ironclaw_turns::run_profile::PersonalContextPolicy::Excluded,
+            personal_context_policy: ironclaw_loop_contracts::PersonalContextPolicy::Excluded,
             runtime_constraints: RuntimeProfileConstraints {
                 allow_raw_runtime_backend_selection: false,
                 allow_broad_capability_surface: false,
@@ -528,8 +537,8 @@ mod tests {
 
     /// Encode a checkpoint payload the same way the executor does:
     /// `serde_json::to_vec(&state)` — no outer envelope.
-    /// Schema-id and kind are stored as side-channel metadata by
-    /// `CheckpointStateStorePort::put_checkpoint_state`, not inside the bytes.
+    /// Schema-id and kind are stored as process checkpoint metadata, not inside
+    /// the bytes.
     fn encode_payload(state: &LoopExecutionState) -> Vec<u8> {
         serde_json::to_vec(state).expect("encode payload")
     }
@@ -703,7 +712,7 @@ mod tests {
             .seen_capability_output_digests
             .push(CapabilityOutputObservation {
                 signature,
-                output_digest: ironclaw_turns::run_profile::ContentDigest(42),
+                output_digest: ironclaw_loop_contracts::ContentDigest(42),
             });
 
         let payload = encode_payload(&state);
@@ -730,7 +739,7 @@ mod tests {
             .seen_capability_output_digests
             .push(CapabilityOutputObservation {
                 signature,
-                output_digest: ironclaw_turns::run_profile::ContentDigest(42),
+                output_digest: ironclaw_loop_contracts::ContentDigest(42),
             });
 
         let payload = encode_payload(&state);
@@ -811,8 +820,8 @@ mod tests {
         assert_eq!(gate_restored, gate);
     }
 
-    /// Schema-id and kind validation now live in the store layer
-    /// (`CheckpointStateStorePort::get_checkpoint_state`) — not in the payload
+    /// Schema-id and kind validation live in the process checkpoint projection,
+    /// not in the payload
     /// bytes. `from_checkpoint_payload` therefore succeeds for any
     /// well-formed `LoopExecutionState` regardless of what kind is passed.
     #[test]
@@ -848,17 +857,16 @@ mod tests {
         let mut state = LoopExecutionState::initial_for_run(&source_context);
         state.input_cursor = LoopInputCursor::from_host_token(
             &source_context,
-            ironclaw_turns::run_profile::LoopInputCursorToken::new("input-cursor:source-seen")
-                .unwrap(),
+            ironclaw_loop_contracts::LoopInputCursorToken::new("input-cursor:source-seen").unwrap(),
         );
         state
             .assistant_refs
             .push(LoopMessageRef::new("msg:source-run").unwrap());
         state
             .result_refs
-            .push(ironclaw_turns::LoopResultRef::new("result:source-run").unwrap());
+            .push(ironclaw_host_api::turn::LoopResultRef::new("result:source-run").unwrap());
         state.iteration = 4;
-        state.cumulative_model_usage = Some(ironclaw_turns::run_profile::LoopModelUsage {
+        state.cumulative_model_usage = Some(ironclaw_loop_contracts::LoopModelUsage {
             input_tokens: 100,
             output_tokens: 50,
             cache_read_input_tokens: 0,
@@ -924,19 +932,18 @@ mod tests {
         let mut state = LoopExecutionState::initial_for_run(&context);
         state.input_cursor = LoopInputCursor::from_host_token(
             &context,
-            ironclaw_turns::run_profile::LoopInputCursorToken::new("input-cursor:gate-seen")
-                .unwrap(),
+            ironclaw_loop_contracts::LoopInputCursorToken::new("input-cursor:gate-seen").unwrap(),
         );
         state
             .assistant_refs
             .push(LoopMessageRef::new("msg:same-run").unwrap());
         state
             .result_refs
-            .push(ironclaw_turns::LoopResultRef::new("result:same-run").unwrap());
+            .push(ironclaw_host_api::turn::LoopResultRef::new("result:same-run").unwrap());
         state.iteration = 3;
         // A same-run gate resume must preserve the run's accumulated token
         // total; the full-equality assertion below locks that in.
-        state.cumulative_model_usage = Some(ironclaw_turns::run_profile::LoopModelUsage {
+        state.cumulative_model_usage = Some(ironclaw_loop_contracts::LoopModelUsage {
             input_tokens: 100,
             output_tokens: 50,
             cache_read_input_tokens: 0,
@@ -1135,39 +1142,9 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_payload_without_final_answer_nudges_slot_decodes_to_zero() {
-        // A checkpoint produced before `final_answer_nudges_used` was added would
-        // lack the field entirely. The `#[serde(default)]` contract must decode it
-        // to 0 rather than failing, so a resumed run still has its one-shot budget.
-        let context = test_run_context();
-        let state = LoopExecutionState::initial_for_run(&context);
-        assert_eq!(
-            state.final_answer_nudges_used, 0,
-            "initial state must start with zero nudges used"
-        );
-
-        let payload = encode_payload(&state);
-        let mut value: serde_json::Value = serde_json::from_slice(&payload).expect("parse");
-        value
-            .as_object_mut()
-            .expect("state serializes as object")
-            .remove("final_answer_nudges_used");
-        let stripped_payload = serde_json::to_vec(&value).expect("re-encode");
-        let from_legacy = LoopExecutionState::from_checkpoint_payload(
-            &stripped_payload,
-            CheckpointKind::BeforeBlock,
-        )
-        .expect("decode legacy checkpoint payload without final_answer_nudges_used");
-        assert_eq!(
-            from_legacy.final_answer_nudges_used, 0,
-            "legacy checkpoint missing final_answer_nudges_used must decode to 0"
-        );
-    }
-
-    #[test]
     fn pending_auth_resume_optional_fields_round_trip_through_checkpoint_payload() {
-        use ironclaw_host_api::{ApprovalRequestId, CorrelationId};
-        use ironclaw_turns::run_profile::{AuthResumeApprovalIdentity, CapabilityResumeToken};
+        use ironclaw_host_api::ids::{ApprovalRequestId, CorrelationId};
+        use ironclaw_loop_contracts::{AuthResumeApprovalIdentity, CapabilityResumeToken};
 
         let context = test_run_context();
         let mut state = LoopExecutionState::initial_for_run(&context);
@@ -1232,8 +1209,8 @@ mod tests {
         // The `Some(Denied)` disposition stamped on `pending_approval_resume` before the
         // capability stage must survive the checkpoint encode/decode cycle so that a
         // resumed run still sees the approval denial.
-        use ironclaw_host_api::{ApprovalRequestId, CorrelationId};
-        use ironclaw_turns::run_profile::CapabilityResumeToken;
+        use ironclaw_host_api::ids::{ApprovalRequestId, CorrelationId};
+        use ironclaw_loop_contracts::CapabilityResumeToken;
 
         let context = test_run_context();
         let mut state = LoopExecutionState::initial_for_run(&context);

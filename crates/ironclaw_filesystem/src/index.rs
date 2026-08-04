@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use ironclaw_host_api::HostApiError;
+use ironclaw_host_api::error::HostApiError;
 use serde::{Deserialize, Serialize};
 
 /// Name of an index registered on a mount prefix.
@@ -348,9 +348,205 @@ impl Default for Page {
     }
 }
 
+/// Stable ordering for an indexed keyset query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+/// Last row returned by an indexed keyset query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderedQueryCursor {
+    pub value: IndexValue,
+    pub tie_breaker: IndexValue,
+}
+
+/// Bounded keyset page over one declared indexed projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderedPage {
+    pub index: IndexName,
+    pub key: IndexKey,
+    pub tie_breaker: IndexKey,
+    pub direction: SortDirection,
+    pub after: Option<OrderedQueryCursor>,
+    pub limit: u32,
+}
+
+impl OrderedPage {
+    pub fn new(
+        index: IndexName,
+        key: IndexKey,
+        tie_breaker: IndexKey,
+        direction: SortDirection,
+        limit: u32,
+    ) -> Self {
+        Self {
+            index,
+            key,
+            tie_breaker,
+            direction,
+            after: None,
+            limit: limit.clamp(1, Page::MAX_LIMIT),
+        }
+    }
+
+    pub fn after(mut self, cursor: OrderedQueryCursor) -> Self {
+        self.after = Some(cursor);
+        self
+    }
+}
+
+/// Number of projected key columns (`k0`..`k7`) an ordered index carries.
+///
+/// One definition for both SQL backends' projection DDL and the query-side
+/// tie-breaker guard: a second copy that drifts silently stops projecting the
+/// extra key.
+pub(crate) const MAX_ORDERED_INDEX_KEYS: usize = 8;
+
+/// All ancestor prefixes of `path`, **most specific first**, ending at `/`.
+///
+/// Index-spec resolution walks this chain so a caller may declare an index on
+/// a higher prefix and query a child path (the "declare high, query low"
+/// contract the FTS path already documented). The walk is bounded by path
+/// depth — never a catalog scan — and "most specific first" is what gives
+/// callers most-specific-spec-wins when several ancestors declare the same
+/// index name.
+pub(crate) fn ancestor_prefixes(path: &str) -> Vec<&str> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return vec!["/"];
+    }
+    let mut out = vec![trimmed];
+    let mut end = trimmed.len();
+    // `rfind('/')` can only return the offset of an ASCII '/', so every index
+    // here is already a char boundary and neither `get` can yield `None`.
+    // Going through `get` keeps this a total function — a path segment holding
+    // multi-byte characters can never be split into a panic.
+    while let Some(index) = trimmed.get(..end).and_then(|head| head.rfind('/')) {
+        if index == 0 {
+            out.push("/");
+            break;
+        }
+        let Some(parent) = trimmed.get(..index) else {
+            break;
+        };
+        out.push(parent);
+        end = index;
+    }
+    out
+}
+
+/// Whether `candidate` is `prefix` itself or lies in its subtree.
+///
+/// Ordered-index rows are keyed by spec name and path only, with no record of
+/// which declaration prefix projected them. Once resolution can match an
+/// ancestor spec, every backend must re-apply this containment check to the
+/// matched rows, or a query would return rows from sibling subtrees that the
+/// caller's scope does not cover.
+pub(crate) fn path_within_prefix(candidate: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return true;
+    }
+    candidate == prefix
+        || (candidate.len() > prefix.len()
+            && candidate.starts_with(prefix)
+            && candidate.as_bytes()[prefix.len()] == b'/')
+}
+
+pub(crate) fn ordered_query_prefix_values(
+    spec: &IndexSpec,
+    filter: &Filter,
+    page: &OrderedPage,
+) -> Option<Vec<IndexValue>> {
+    if spec.name != page.index || !matches!(spec.kind, IndexKind::Exact | IndexKind::Prefix) {
+        return None;
+    }
+    let sort_position = spec.keys.iter().position(|key| key == &page.key)?;
+    if spec.keys.get(sort_position.saturating_add(1)) != Some(&page.tie_breaker) {
+        return None;
+    }
+    let mut equality_values = std::collections::BTreeMap::new();
+    if !collect_equality_values(filter, &mut equality_values) {
+        return None;
+    }
+    let prefix = spec.keys.get(..sort_position)?;
+    let prefix_keys = prefix
+        .iter()
+        .map(IndexKey::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if equality_values
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        != prefix_keys
+    {
+        return None;
+    }
+    prefix
+        .iter()
+        .map(|key| equality_values.get(key.as_str()).cloned())
+        .collect()
+}
+
+fn collect_equality_values<'a>(
+    filter: &'a Filter,
+    values: &mut std::collections::BTreeMap<&'a str, IndexValue>,
+) -> bool {
+    match filter {
+        Filter::All => true,
+        Filter::Eq { key, value } => values.insert(key.as_str(), value.clone()).is_none(),
+        Filter::And(filters) => filters
+            .iter()
+            .all(|filter| collect_equality_values(filter, values)),
+        Filter::PrefixOn { .. }
+        | Filter::Range { .. }
+        | Filter::Fts { .. }
+        | Filter::VectorNearest { .. }
+        | Filter::Or(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ancestor_prefixes_walk_from_most_to_least_specific() {
+        // Order is the precedence rule: spec resolution takes the first match,
+        // so the most specific declaration must come first.
+        assert_eq!(
+            ancestor_prefixes("/threads/agents/a/owners/u/threads/t-1/messages"),
+            vec![
+                "/threads/agents/a/owners/u/threads/t-1/messages",
+                "/threads/agents/a/owners/u/threads/t-1",
+                "/threads/agents/a/owners/u/threads",
+                "/threads/agents/a/owners/u",
+                "/threads/agents/a/owners",
+                "/threads/agents/a",
+                "/threads/agents",
+                "/threads",
+                "/",
+            ]
+        );
+        assert_eq!(ancestor_prefixes("/threads"), vec!["/threads", "/"]);
+        assert_eq!(ancestor_prefixes("/"), vec!["/"]);
+        // A trailing separator must not produce a distinct candidate.
+        assert_eq!(ancestor_prefixes("/threads/"), vec!["/threads", "/"]);
+    }
+
+    #[test]
+    fn path_within_prefix_requires_a_segment_boundary() {
+        assert!(path_within_prefix("/a/b", "/a/b"));
+        assert!(path_within_prefix("/a/b/c", "/a/b"));
+        // The classic prefix-matching bug: a sibling sharing a textual prefix
+        // is not in the subtree, and must not be returned by a scoped query.
+        assert!(!path_within_prefix("/a/bc", "/a/b"));
+        assert!(!path_within_prefix("/a", "/a/b"));
+        assert!(path_within_prefix("/anything", "/"));
+    }
 
     #[test]
     fn index_name_rejects_empty_and_separators() {

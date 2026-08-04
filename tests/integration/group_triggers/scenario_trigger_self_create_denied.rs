@@ -10,7 +10,7 @@
 //! (`trigger_list` stays visible).
 //!
 //! Traced, not assumed: denial happens at the model-gateway seam
-//! (`ironclaw_runner::model_gateway`'s `validate_provider_tool_call`, via
+//! (`ironclaw_loop_host::model_gateway`'s `validate_provider_tool_call`, via
 //! `CapabilitySurfaceDenyFilter`), BEFORE a `CapabilityCallCandidate` is ever
 //! constructed — so `CapabilityStage` never runs and nothing is appended via
 //! `append_tool_result_reference` (confirmed empirically: persisted history is
@@ -33,16 +33,14 @@ use std::sync::Arc;
 
 use super::reborn_support::group::{HarnessResult, RebornIntegrationGroup};
 use super::reborn_support::reply::RebornScriptedReply;
-use ironclaw_host_api::{CapabilityId, Resolution};
-use ironclaw_runner::planned_driver_factory::default_planned_run_profile_resolver;
-use ironclaw_turns::run_profile::{
+use ironclaw_host_api::{ids::CapabilityId, resolution::Resolution};
+use ironclaw_loop_contracts::{
     InMemoryLoopHostMilestoneSink, LoopCapabilityPort, LoopRequest, LoopRunContext,
     ProviderToolCall, RegisterProviderToolCallRequest, RunProfileResolutionRequest,
     RunProfileResolver,
 };
-use ironclaw_turns::{
-    GetRunStateRequest, RunProfileRequest, TurnOriginKind, TurnStateStore, TurnStatus,
-};
+use ironclaw_runner::planned_driver_factory::default_planned_run_profile_resolver;
+use ironclaw_turns::{GetRunStateRequest, RunProfileRequest, TurnOriginKind, TurnStatus};
 use serde_json::json;
 
 /// Distinctive enough that a false-positive match against another scenario's
@@ -115,7 +113,7 @@ pub async fn run(g: &RebornIntegrationGroup) -> HarnessResult<()> {
     // After the fix, the first-party trigger handler sees the typed origin and
     // rejects create and pause independently of model/provider/tool naming.
     let state = h
-        .turn_state_store_for_test()
+        .agent_turn_runtime_for_test()
         .get_run_state(GetRunStateRequest {
             scope: submission.turn_scope.clone(),
             run_id: submission.run_id,
@@ -257,7 +255,8 @@ async fn assert_capability_denied(
         // `Resolution::Denied` channel (not a failed `Done` verdict); pin the
         // redacted reason kind so a different denial class cannot pass.
         Resolution::Denied(denial)
-            if denial.reason_kind == Some(ironclaw_host_api::DenyReason::PolicyDenied) =>
+            if denial.reason_kind
+                == Some(ironclaw_host_api::decision::DenyReason::PolicyDenied) =>
         {
             Ok(())
         }

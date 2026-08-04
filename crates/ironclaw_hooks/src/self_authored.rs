@@ -28,13 +28,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::SanitizedReason;
 use crate::identity::HookId;
-use crate::kinds::gate::BeforeCapabilityHookDecision;
 use crate::points::BeforeCapabilityHookContext;
 use crate::predicate::CapabilityPredicate;
-use crate::sink::GateSinkState;
-use ironclaw_turns::{TurnId, TurnRunId};
+use ironclaw_host_api::turn::{TurnId, TurnRunId};
 
 /// Closed vocabulary of static labels the agent may use as a reason when
 /// authoring a hook. Free-text reasons are intentionally not allowed — the
@@ -165,50 +162,6 @@ pub trait SelfAuthoredHookSink: Send {
     fn pass(&mut self);
 }
 
-/// Dispatcher-internal sink for self-authored hooks. Records the decision
-/// (if any) into a [`GateSinkState`] so the dispatcher can plug into the
-/// existing `before_capability` composition with no extra plumbing. Made
-/// `pub(crate)` so the dispatcher slice that wires self-authored hooks
-/// into the gate composer can construct it directly without rebuilding
-/// the GateSinkState mapping. Tests construct it via the same path.
-#[allow(dead_code)] // dispatcher wiring lands alongside #3564
-pub(crate) struct RecordingSelfAuthoredSink {
-    pub(crate) state: GateSinkState,
-}
-
-impl RecordingSelfAuthoredSink {
-    #[allow(dead_code)] // see struct-level note
-    pub(crate) fn new() -> Self {
-        Self {
-            state: GateSinkState::Unset,
-        }
-    }
-}
-
-impl SelfAuthoredHookSink for RecordingSelfAuthoredSink {
-    fn deny(&mut self, reason: SelfAuthoredReason) {
-        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::deny(
-            SanitizedReason::from_static(reason.label()),
-        ));
-    }
-
-    fn pause_approval(&mut self, reason: SelfAuthoredReason) {
-        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::pause_approval(
-            SanitizedReason::from_static(reason.label()),
-        ));
-    }
-
-    fn pause_auth(&mut self, reason: SelfAuthoredReason) {
-        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::pause_auth(
-            SanitizedReason::from_static(reason.label()),
-        ));
-    }
-
-    fn pass(&mut self) {
-        self.state = GateSinkState::Passed;
-    }
-}
-
 /// Stateless evaluator for self-authored specs. Unlike the
 /// [`crate::evaluator::PredicateEvaluator`], the self-authored evaluator
 /// holds no sliding-window state: the run-scoped slice supports only
@@ -288,10 +241,49 @@ impl SelfAuthoredBeforeCapabilityHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SanitizedReason;
     use crate::identity::{ExtensionId, HookLocalId, HookVersion};
+    use crate::kinds::gate::BeforeCapabilityHookDecision;
+    use crate::sink::GateSinkState;
 
-    fn tenant() -> ironclaw_host_api::TenantId {
-        ironclaw_host_api::TenantId::new("alpha").expect("tenant")
+    struct RecordingSelfAuthoredSink {
+        state: GateSinkState,
+    }
+
+    impl RecordingSelfAuthoredSink {
+        fn new() -> Self {
+            Self {
+                state: GateSinkState::Unset,
+            }
+        }
+    }
+
+    impl SelfAuthoredHookSink for RecordingSelfAuthoredSink {
+        fn deny(&mut self, reason: SelfAuthoredReason) {
+            self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::deny(
+                SanitizedReason::from_static(reason.label()),
+            ));
+        }
+
+        fn pause_approval(&mut self, reason: SelfAuthoredReason) {
+            self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::pause_approval(
+                SanitizedReason::from_static(reason.label()),
+            ));
+        }
+
+        fn pause_auth(&mut self, reason: SelfAuthoredReason) {
+            self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::pause_auth(
+                SanitizedReason::from_static(reason.label()),
+            ));
+        }
+
+        fn pass(&mut self) {
+            self.state = GateSinkState::Passed;
+        }
+    }
+
+    fn tenant() -> ironclaw_host_api::ids::TenantId {
+        ironclaw_host_api::ids::TenantId::new("alpha").expect("tenant")
     }
 
     fn hook_id() -> HookId {
