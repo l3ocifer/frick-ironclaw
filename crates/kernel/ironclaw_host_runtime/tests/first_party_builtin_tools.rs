@@ -136,6 +136,15 @@ async fn builtin_first_party_package_declares_expected_capabilities() {
     {
         assert_coding_manifest_contract(descriptor);
     }
+    let json = package
+        .capabilities
+        .iter()
+        .find(|descriptor| descriptor.id.as_str() == JSON_CAPABILITY_ID)
+        .expect("JSON manifest");
+    assert_eq!(
+        json.effects,
+        vec![EffectKind::DispatchCapability, EffectKind::ReadFilesystem]
+    );
     let skill_install = package
         .capabilities
         .iter()
@@ -4198,6 +4207,130 @@ async fn builtin_json_parse_query_stringify_and_validate_work() {
     .await
     .unwrap();
     assert!(stringified.as_str().unwrap().contains("\"ok\": true"));
+}
+
+#[tokio::test]
+async fn builtin_json_parse_and_stringify_report_actionable_invalid_json() {
+    for (operation, data) in [
+        ("parse", "/workspace/source.json"),
+        ("stringify", "100 * 1.25"),
+    ] {
+        let runtime = runtime();
+        let failure = invoke_failure_with_context(
+            &runtime,
+            JSON_CAPABILITY_ID,
+            json!({"operation": operation, "data": data}),
+            execution_context([JSON_CAPABILITY_ID]),
+        )
+        .await;
+
+        assert_eq!(failure.kind, FailureKind::InputEncode, "{operation}");
+        assert_eq!(
+            failure.message.as_deref(),
+            Some("JSON input is not valid JSON"),
+            "{operation}"
+        );
+        let issue = failure_input_issue(
+            &failure,
+            "data",
+            DispatchInputIssueCode::InvalidValue,
+            operation,
+        );
+        assert_eq!(issue.expected.as_deref(), Some("valid JSON"), "{operation}");
+        assert!(
+            issue
+                .received
+                .as_deref()
+                .is_some_and(|received| received.starts_with("invalid JSON at line ")),
+            "{operation}: expected bounded parser location, got {:?}",
+            issue.received
+        );
+        assert!(
+            issue
+                .received
+                .as_ref()
+                .is_some_and(|received| received.len() < 80),
+            "{operation}: parser diagnostic must remain bounded"
+        );
+    }
+}
+
+#[tokio::test]
+async fn builtin_json_queries_authorized_workspace_file_with_adjacent_indices() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("source.json"),
+        serde_json::to_vec(&json!({
+            "nodes": [null, null, {"data": vec![vec!["value"]; 16]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (filesystem, mounts) = mounted_filesystem(root.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+
+    let queried = invoke_with_context(
+        &runtime,
+        JSON_CAPABILITY_ID,
+        json!({
+            "operation": "query",
+            "file_path": "/workspace/source.json",
+            "path": "nodes[2].data[15][0]"
+        }),
+        execution_context_with_mounts([JSON_CAPABILITY_ID], mounts),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(queried, json!("value"));
+}
+
+#[tokio::test]
+async fn builtin_json_file_query_accepts_eight_mib_and_rejects_one_byte_over() {
+    const MAX_JSON_FILE_BYTES: usize = 8 * 1_024 * 1_024;
+    let root = tempfile::tempdir().unwrap();
+    let file_path = root.path().join("source.json");
+    let mut exact_limit_json = br#"{"value":"ok"}"#.to_vec();
+    exact_limit_json.resize(MAX_JSON_FILE_BYTES, b' ');
+    std::fs::write(&file_path, exact_limit_json).unwrap();
+    let (filesystem, mounts) = mounted_filesystem(root.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts([JSON_CAPABILITY_ID], mounts);
+    let input = json!({
+        "operation": "query",
+        "file_path": "/workspace/source.json",
+        "path": "value"
+    });
+
+    let queried = invoke_with_context(&runtime, JSON_CAPABILITY_ID, input.clone(), context.clone())
+        .await
+        .unwrap();
+    assert_eq!(queried, json!("ok"));
+
+    std::fs::write(&file_path, vec![b' '; MAX_JSON_FILE_BYTES + 1]).unwrap();
+    let failure = invoke_failure_with_context(&runtime, JSON_CAPABILITY_ID, input, context).await;
+    assert_eq!(failure.kind, FailureKind::Resource);
+    assert_eq!(
+        failure.safe_summary().as_deref(),
+        Some("JSON query file exceeds the 8388608-byte limit")
+    );
+}
+
+#[tokio::test]
+async fn builtin_json_file_query_denies_unmounted_workspace_path() {
+    let failure = invoke_failure_with_context(
+        &runtime(),
+        JSON_CAPABILITY_ID,
+        json!({
+            "operation": "query",
+            "file_path": "/workspace/source.json",
+            "path": "value"
+        }),
+        execution_context([JSON_CAPABILITY_ID]),
+    )
+    .await;
+
+    assert_eq!(failure.kind, FailureKind::FilesystemDenied);
 }
 
 #[tokio::test]
