@@ -767,7 +767,11 @@ fn reborn_contracts_crates_carry_a_checked_size_ceiling() {
         // thread, carried through the wire contract), net of the ephemeral-per-ping
         // remodel that DELETED `ResolvedBinding.owner_user_id` (owner-vs-actor
         // retired). Declaration only. Count read from failure.
-        ("ironclaw_product_contracts", 15_909),
+        // Raised 15_909 -> 16_024 by #7419 (tenant model allowlist): the
+        // growth is limited to the policy persistence port, user-safe DTOs,
+        // and transport-consumed descriptors; validation, storage, and request
+        // enforcement stay in owning crates.
+        ("ironclaw_product_contracts", 16_024),
         ("ironclaw_prompt_envelope", 832),
     ];
 
