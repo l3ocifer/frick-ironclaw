@@ -163,7 +163,13 @@ fn make_service_with_lifecycle(
     memory_service: Arc<MockMemoryService>,
     lifecycle: Vec<MemoryLifecycleHook>,
 ) -> ProductionMemoryPromptContextService {
-    ProductionMemoryPromptContextService::new(memory_service, MemoryDescriptor { lifecycle })
+    ProductionMemoryPromptContextService::new(
+        memory_service,
+        MemoryDescriptor {
+            lifecycle,
+            ..MemoryDescriptor::default()
+        },
+    )
 }
 
 /// A raw provider candidate scoped to `(tenant-a, user-x)` with no agent/project,
