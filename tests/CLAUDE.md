@@ -207,7 +207,7 @@ One thread, whole real turn. Grouped by what the user experiences.
 | Shell commands dispatch through the real path without spawning an OS process | `process_port.rs` |
 | A sandbox-profile shell turn executes as an unprivileged user in a real Docker worker and keeps its workspace across calls | `reborn_sandbox_shell_turn.rs` |
 | MCP tools work over a real loopback HTTP MCP server | `mcp.rs` |
-| User-registered and bundled hosted MCP servers register, authenticate, project active, restore, and invoke | `hosted_mcp_registration.rs` |
+| User-registered and bundled hosted MCP servers register, admit exact or narrowly compatible origin-scoped OAuth resources, authenticate, project active, restore, and invoke | `hosted_mcp_registration.rs` |
 | Web search/fetch runs the real Exa MCP handshake | `web_access.rs` |
 | Outbound HTTP crosses the real security pipeline (network policy + leak scan) | `real_egress_pipeline.rs` |
 | Tools marked host-internal are never advertised to the model, and calls to them are rejected | `extension_visibility.rs`, `surface_disclosure.rs` |
@@ -227,7 +227,7 @@ One thread, whole real turn. Grouped by what the user experiences.
 **Auth** (`tests/integration/auth/`)
 | Behavior | Evidence |
 |---|---|
-| A full OAuth connect → callback → stored account round trip | `auth/oauth_connect.rs` |
+| A full OAuth connect → callback → stored account round trip; conflicting shared-vendor OAuth resource or metadata bindings fail resolution closed | `auth/oauth_connect.rs` |
 | Abandoning the OAuth popup, late callbacks, and retrying cleanly | `auth/oauth_popup_journeys.rs` |
 | Idle credentials get refreshed by the background sweep | `auth/oauth_refresh.rs` |
 | A missing credential parks a sign-in gate; denying it ends the run cleanly | `auth/auth_gate.rs` |
