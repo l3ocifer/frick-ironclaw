@@ -849,21 +849,17 @@ fn reborn_contracts_crates_carry_a_checked_size_ceiling() {
         // version-plural `StandardOpContract` (`StandardSchemaVersion`,
         // `PublishedSchema`, `output_schema_for`) that keeps `.v1` resolving
         // forever, and `RuntimeCredentialAccountSetup::DeviceLink`.
-        // Declaration + version-lookup only: schema *enforcement* stays in
-        // ironclaw_host_runtime's `standard_op_output`, and the device-link
-        // flow itself lives in ironclaw_auth and the telegram package. About
-        // two thirds of the delta is the inline `#[cfg(test)]` module this
-        // ratchet also counts — the superset property (`.v2` accepts every
-        // `.v1`-valid output) has to be pinned because the runtime validator
-        // is keyed by op, not by version.
-        //
-        // 19_483 -> 19_718 (2026-08-14, merge main / #7532): add the
-        // provider-neutral turn execution
+        // 19_483 -> 19_718 (#7532): the provider-neutral turn execution
         // policy and validated required-skill identity shared by trusted
-        // trigger ingress and the runner. Resolution, activation, and
-        // capability enforcement remain in their owning implementation crates.
-        // Count read from this test's own failure message after the merge.
-        ("ironclaw_host_api", 19_718),
+        // trigger ingress and the runner.
+        // + (2026-08-13, unbound turns): the `prepared_context` module —
+        // `PreparedTurnDeclarations`, `OutputContract`, `TurnLimits`, the
+        // `PreparedContextSource` admission-probe trait, and the
+        // structured-result capability id constants. Neutral authority
+        // vocabulary only.
+        // Union re-measured on the merged tree (2026-08-14); count read from
+        // this test's own failure message.
+        ("ironclaw_host_api", 19_966),
         // 14_479 -> 13_949 (2026-08-07, #7157): downward re-capture after the
         // delivery-heuristic vocabulary (stored trigger delivery targets and
         // their run-profile plumbing) left this crate with the two-lane
