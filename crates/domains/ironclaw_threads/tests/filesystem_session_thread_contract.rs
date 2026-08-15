@@ -3852,7 +3852,8 @@ async fn filesystem_list_threads_orders_by_last_activity_not_creation() {
 
     let backend = Arc::new(InMemoryBackend::new());
     let scoped = scoped_threads_fs_at(backend, "tenant-activity-fs", "alice");
-    let service = FilesystemSessionThreadService::new(scoped);
+    let service = FilesystemSessionThreadService::new(scoped)
+        .with_thread_index_touch_flush_interval(std::time::Duration::from_millis(20));
     let scope_a = scope("activity");
 
     // Create "older" first, then "newer" — newer has the later
@@ -3980,14 +3981,27 @@ async fn filesystem_list_threads_orders_by_last_activity_not_creation() {
         .await
         .unwrap();
 
-    let final_list = service
-        .list_threads_for_scope(ListThreadsForScopeRequest {
-            scope: scope_a,
-            limit: None,
-            cursor: None,
-        })
-        .await
-        .unwrap();
+    // This touch follows earlier activity on the same thread inside the
+    // coalescing window. Poll until the detached trailing flush makes the
+    // expected cross-thread order observable.
+    let final_list = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let listed = service
+                .list_threads_for_scope(ListThreadsForScopeRequest {
+                    scope: scope_a.clone(),
+                    limit: None,
+                    cursor: None,
+                })
+                .await
+                .unwrap();
+            if listed.threads[0].thread_id.as_str() == "t-older" {
+                break listed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the trailing touch reaches the sidebar after the flush interval");
     let final_ids: Vec<&str> = final_list
         .threads
         .iter()
@@ -3995,6 +4009,203 @@ async fn filesystem_list_threads_orders_by_last_activity_not_creation() {
         .collect();
     // Recency wins over transcript length.
     assert_eq!(final_ids, ["t-older", "t-newer"]);
+}
+
+/// Regression for #7596: the message/draft/finalize path used to rewrite the
+/// complete thread-index row once at every activity call site. A single turn
+/// should coalesce that burst while still making the finalized thread lead the
+/// activity-sorted sidebar.
+#[tokio::test]
+async fn filesystem_thread_activity_burst_coalesces_index_touches_and_orders_after_finalize() {
+    let backend = Arc::new(QueryCountingBackend::new());
+    let scoped = scoped_threads_fs_at(
+        Arc::clone(&backend),
+        "tenant-coalesced-index-touch",
+        "alice",
+    );
+    let service = FilesystemSessionThreadService::new(scoped)
+        .with_thread_index_touch_flush_interval(std::time::Duration::from_millis(500));
+    let request_scope = scope("coalesced-index-touch");
+
+    let older = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: request_scope.clone(),
+            thread_id: Some(ThreadId::new("thread-coalesced-older").unwrap()),
+            created_by_actor_id: "actor-a".into(),
+            title: Some("older".into()),
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: request_scope.clone(),
+            thread_id: older.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: Some("binding-coalesced-touch".into()),
+            reply_target_binding_id: None,
+            external_event_id: Some("event-coalesced-touch".into()),
+            content: MessageContent::text("start the turn"),
+        })
+        .await
+        .unwrap();
+    let draft = service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: request_scope.clone(),
+            thread_id: older.thread_id.clone(),
+            turn_run_id: "run-coalesced-touch".into(),
+            content: MessageContent::text("working"),
+        })
+        .await
+        .unwrap();
+    wait_until_after(draft.updated_at.expect("draft activity stamp")).await;
+    let newer = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: request_scope.clone(),
+            thread_id: Some(ThreadId::new("thread-coalesced-newer").unwrap()),
+            created_by_actor_id: "actor-a".into(),
+            title: Some("newer".into()),
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    wait_until_after(newer.updated_at.expect("newer creation stamp")).await;
+    backend.reset_thread_index_put_count();
+
+    service
+        .update_assistant_draft(UpdateAssistantDraftRequest {
+            scope: request_scope.clone(),
+            thread_id: older.thread_id.clone(),
+            message_id: draft.message_id,
+            content: MessageContent::text("still working"),
+        })
+        .await
+        .unwrap();
+    service
+        .finalize_assistant_message(
+            &request_scope,
+            &older.thread_id,
+            draft.message_id,
+            MessageContent::text("done"),
+        )
+        .await
+        .unwrap();
+
+    let listed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let listed = service
+                .list_threads_for_scope(ListThreadsForScopeRequest {
+                    scope: request_scope.clone(),
+                    limit: None,
+                    cursor: None,
+                })
+                .await
+                .unwrap();
+            if listed.threads[0].thread_id == older.thread_id {
+                break listed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("finalized activity reaches the sidebar after the flush interval");
+    let burst_puts = backend.thread_index_put_count();
+    assert!(
+        burst_puts <= 1,
+        "one turn must write the thread-index touch at most once per flush interval; saw {burst_puts} writes"
+    );
+    assert_eq!(
+        listed.threads[0].thread_id, older.thread_id,
+        "the finalized thread must lead the activity-sorted sidebar"
+    );
+}
+
+#[tokio::test]
+async fn filesystem_failed_deferred_thread_index_touch_is_retried() {
+    let backend = Arc::new(FaultInjecting::new(InMemoryBackend::new()));
+    let scoped = scoped_threads_fs_at(Arc::clone(&backend), "tenant-deferred-index-retry", "alice");
+    let service = FilesystemSessionThreadService::new(scoped)
+        .with_thread_index_touch_flush_interval(std::time::Duration::from_secs(1));
+    let request_scope = scope("deferred-index-retry");
+    let older = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: request_scope.clone(),
+            thread_id: Some(ThreadId::new("thread-deferred-retry-older").unwrap()),
+            created_by_actor_id: "actor-a".into(),
+            title: Some("older".into()),
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: request_scope.clone(),
+            thread_id: older.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: Some("binding-deferred-index-retry".into()),
+            reply_target_binding_id: None,
+            external_event_id: Some("event-deferred-index-retry".into()),
+            content: MessageContent::text("start activity tracking"),
+        })
+        .await
+        .unwrap();
+    let draft = service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: request_scope.clone(),
+            thread_id: older.thread_id.clone(),
+            turn_run_id: "run-deferred-index-retry".into(),
+            content: MessageContent::text("working"),
+        })
+        .await
+        .unwrap();
+    wait_until_after(draft.updated_at.expect("draft activity stamp")).await;
+    let newer = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: request_scope.clone(),
+            thread_id: Some(ThreadId::new("thread-deferred-retry-newer").unwrap()),
+            created_by_actor_id: "actor-a".into(),
+            title: Some("newer".into()),
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    wait_until_after(newer.updated_at.expect("newer creation stamp")).await;
+    backend.add_fault(
+        Fault::on(FilesystemOperation::WriteFile)
+            .path("/thread_index/")
+            .nth(1)
+            .backend("deferred thread-index write fails once"),
+    );
+
+    service
+        .update_assistant_draft(UpdateAssistantDraftRequest {
+            scope: request_scope.clone(),
+            thread_id: older.thread_id.clone(),
+            message_id: draft.message_id,
+            content: MessageContent::text("newest activity"),
+        })
+        .await
+        .unwrap();
+
+    let listed = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            let listed = service
+                .list_threads_for_scope(ListThreadsForScopeRequest {
+                    scope: request_scope.clone(),
+                    limit: None,
+                    cursor: None,
+                })
+                .await
+                .unwrap();
+            if listed.threads[0].thread_id == older.thread_id {
+                break listed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the failed deferred touch is retried");
+    assert_eq!(listed.threads[0].thread_id, older.thread_id);
 }
 
 #[tokio::test]
@@ -4655,6 +4866,7 @@ struct QueryCountingBackend {
     inner: InMemoryBackend,
     query_count: AtomicUsize,
     get_count: AtomicUsize,
+    thread_index_put_count: AtomicUsize,
 }
 
 struct MigrationRaceBackend {
@@ -4689,6 +4901,7 @@ impl QueryCountingBackend {
             inner: InMemoryBackend::new(),
             query_count: AtomicUsize::new(0),
             get_count: AtomicUsize::new(0),
+            thread_index_put_count: AtomicUsize::new(0),
         }
     }
 
@@ -4698,6 +4911,14 @@ impl QueryCountingBackend {
 
     fn get_count(&self) -> usize {
         self.get_count.load(Ordering::SeqCst)
+    }
+
+    fn thread_index_put_count(&self) -> usize {
+        self.thread_index_put_count.load(Ordering::SeqCst)
+    }
+
+    fn reset_thread_index_put_count(&self) {
+        self.thread_index_put_count.store(0, Ordering::SeqCst);
     }
 }
 
@@ -4830,6 +5051,9 @@ impl RootFilesystem for QueryCountingBackend {
         entry: Entry,
         cas: CasExpectation,
     ) -> Result<RecordVersion, FilesystemError> {
+        if path.as_str().contains("/thread_index/") {
+            self.thread_index_put_count.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.put(path, entry, cas).await
     }
 
