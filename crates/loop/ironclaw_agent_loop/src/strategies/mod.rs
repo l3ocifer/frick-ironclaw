@@ -49,7 +49,9 @@ pub(crate) use gate::{
     DefaultGateHandlingStrategy, GateHandlingStrategy, GateKind, GateNotSupportedStrategy,
     GateOutcome, GateSummary,
 };
-pub(crate) use model::{DefaultModelStrategy, ModelPreference, ModelStrategy};
+pub(crate) use model::{
+    DefaultModelStrategy, ModelPreference, ModelStrategy, StructuredResultModelStrategy,
+};
 pub(crate) use recovery::{
     BackoffDelayMs, CapabilityErrorSummary, DefaultRecoveryStrategy, ModelErrorClass,
     ModelErrorSummary, RecoveryOutcome, RecoveryStrategy, RetryAlteration, RetryScope,
@@ -186,6 +188,7 @@ mod tests {
                 tier: ResourceBudgetTier::new("strategy_composition_test_tier").expect("valid"),
                 max_model_calls: 32,
                 max_capability_invocations: 64,
+                max_wall_clock_seconds: None,
             },
             personal_context_policy: ironclaw_loop_contracts::PersonalContextPolicy::Excluded,
             runtime_constraints: RuntimeProfileConstraints {

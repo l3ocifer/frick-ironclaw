@@ -2182,6 +2182,12 @@ fn provider_tool_names_stay_at_model_protocol_boundaries() {
         // ids and rebuild provider calls for the resolved target.
         "crates/ironclaw_loop_host/src/tool_disclosure.rs",
         "crates/ironclaw_loop_host/src/tool_disclosure_port.rs",
+        // Tool search stores the provider-encoded alias as an exact-match
+        // identifier so a query using the advertised provider name resolves to
+        // its capability. It consumes the single encoding owner
+        // (`ProviderToolName::encode_capability_str`) instead of re-deriving
+        // the `.` -> `__` mapping inline (unbound-turns follow-up, PR #7634).
+        "crates/ironclaw_loop_host/src/tool_search.rs",
         // Composition-local protocol surfaces that reconstruct provider-shaped
         // output or synthetic provider tools.
         "crates/ironclaw_composition/src/llm_admin/openai_compat_serve.rs",
@@ -2190,6 +2196,11 @@ fn provider_tool_names_stay_at_model_protocol_boundaries() {
         // stored replay metadata for the Trace Commons envelope; it moved out
         // of composition into the turn-runner observer seam (WS6, §6.10.1).
         "crates/ironclaw_turn_runner/src/trace_capture.rs",
+        // Prepared-context seeding is a replay boundary: caller-supplied tool
+        // history persists as provider-shaped tool-call reference envelopes
+        // under the seed sentinel identity so the gateway replays it exactly
+        // like live provider history (unbound-turns follow-up, PR #7634).
+        "crates/ironclaw_threads/src/prepared_context.rs",
     ]
     .into_iter()
     .map(|entry| resolve_crate_relative(&root, entry))
@@ -4235,7 +4246,14 @@ fn boundary_rules() -> Vec<BoundaryRule> {
                 "ironclaw_secrets",
                 "ironclaw_skills",
                 "ironclaw_storage",
-                "ironclaw_threads",
+                // `ironclaw_threads` is permitted (unbound-turns, PR #7634):
+                // the prepared chat-completions lane maps wire messages onto
+                // the accept door's seed vocabulary (`agent_message`) and runs
+                // the door's own `validate_prepared_seed_content` BEFORE the
+                // idempotency reservation — one validator, no mirrored bounds
+                // to drift. Thread/turn SERVICES still arrive as
+                // composition-built ports; the edge is vocabulary + the door
+                // validator only (`ironclaw_webui` holds the same edge).
                 "ironclaw_trust",
                 "ironclaw_tui",
                 "ironclaw_turns",

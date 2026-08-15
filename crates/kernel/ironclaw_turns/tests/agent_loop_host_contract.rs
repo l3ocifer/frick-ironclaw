@@ -288,6 +288,7 @@ async fn host_managed_model_port_routes_gateway_and_emits_model_milestones() {
             fallback_index: 0,
             iteration: 0,
             capability_view: None,
+            tool_choice: None,
         })
         .await
         .unwrap();
@@ -348,6 +349,7 @@ async fn host_managed_model_port_returns_response_when_model_started_milestone_f
             fallback_index: 0,
             iteration: 0,
             capability_view: None,
+            tool_choice: None,
         })
         .await
         .unwrap();
@@ -394,6 +396,7 @@ async fn host_managed_model_port_returns_response_when_model_completed_milestone
             fallback_index: 0,
             iteration: 0,
             capability_view: None,
+            tool_choice: None,
         })
         .await
         .unwrap();
@@ -437,6 +440,7 @@ async fn host_managed_model_port_sanitizes_gateway_errors() {
             fallback_index: 0,
             iteration: 0,
             capability_view: None,
+            tool_choice: None,
         })
         .await
         .unwrap_err();
@@ -2990,6 +2994,7 @@ impl AgentLoopDriver for ReplyDriver {
                 fallback_index: 0,
                 iteration: 0,
                 capability_view: None,
+                tool_choice: None,
             })
             .await
             .map_err(driver_error)?;
@@ -3283,6 +3288,7 @@ async fn host_managed_model_port_times_out_a_hung_gateway() {
             fallback_index: 0,
             iteration: 0,
             capability_view: None,
+            tool_choice: None,
         })
         .await
         .expect_err("a hung gateway must surface a timeout error");
@@ -3322,6 +3328,7 @@ async fn host_managed_model_port_allows_long_calls_that_keep_streaming_progress(
             fallback_index: 0,
             iteration: 0,
             capability_view: None,
+            tool_choice: None,
         })
         .await
         .expect("progress must reset the model-call idle timeout");
@@ -3939,6 +3946,7 @@ fn simple_model_request(context: &LoopRunContext) -> LoopModelRequest {
         fallback_index: 0,
         iteration: 0,
         capability_view: None,
+        tool_choice: None,
     }
 }
 

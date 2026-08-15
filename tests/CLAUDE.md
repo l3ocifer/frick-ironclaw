@@ -57,13 +57,13 @@ Tier-selection rule: `.claude/rules/testing.md`.
 | Tools & tool dispatch | — | 11 | ✓ | ✓ |
 | Turn lifecycle (cancel/steer/retry/restart) | — | 8 | ✓ | ✓ |
 | WebUI surfaces & APIs | 2 | 2 | — | ✓ (largest) |
-| Durability & restart | 4 | 6 | ✓ | ✓ |
+| Durability & restart | 4 | 5 | ✓ | ✓ |
 | Security & redaction | — | 3 | ✓ | ✓ |
 | Providers (Google/Slack/GitHub contracts) | — | — | ✓ | ✓ |
 | Coverage/meta gates | — | 2 | ✓ | ✓ |
 
-Totals: **59** group scenarios · **57** flat integration bins (51 in
-`tests/integration/`, 6 in `tests/integration/auth/`) · **39** top-level Rust bins ·
+Totals: **59** group scenarios · **59** flat integration bins (52 in
+`tests/integration/`, 7 in `tests/integration/auth/`) · **39** top-level Rust bins ·
 **102** Python scenario files (**869** test functions) registered in the active
 Reborn coverage map below. Section 6 separately inventories retained and legacy
 Python scenarios, so its exhaustive totals are intentionally broader.
@@ -181,7 +181,7 @@ ones speak MTProto over a raw socket with no injectable seam.
 
 ---
 
-## 4. Flat integration bins — `tests/integration/*.rs` and `tests/integration/auth/*.rs` (57)
+## 4. Flat integration bins — `tests/integration/*.rs` and `tests/integration/auth/*.rs` (59)
 
 One thread, whole real turn. Grouped by what the user experiences.
 
@@ -198,7 +198,7 @@ One thread, whole real turn. Grouped by what the user experiences.
 | Repeating the same inbound message does not start a second run | `idempotent_replay.rs` |
 | Spend accounting fires on a real turn | `budget.rs` |
 | Sub-agents spawn and awaiting them behaves at the edges | `subagent_await_edge.rs` |
-| An unbound prepared context accepts, submits reflessly, derives its profile from the journaled declarations, and completes (structured result with repair loop, plain final, idempotent replay, ownerless-listing exclusion) | `unbound_turns.rs` |
+| A caller hands the engine a prepared prompt and gets its outcome back: a schema-validated JSON result (invalid attempts are retried and the corrected payload is durably recorded) or a plain answer; seeded tool history is honored by the run; resubmitting the same request is replay-safe; the private work thread belongs to the calling user (stored under their owner scope, foreign-owner run-state reads rejected) yet never appears in conversation listings | `unbound_turns.rs` |
 
 **Tools**
 | Behavior | Evidence |
@@ -208,7 +208,7 @@ One thread, whole real turn. Grouped by what the user experiences.
 | Shell commands dispatch through the real path without spawning an OS process | `process_port.rs` |
 | A sandbox-profile shell turn executes as an unprivileged user in a real Docker worker and keeps its workspace across calls | `reborn_sandbox_shell_turn.rs` |
 | MCP tools work over a real loopback HTTP MCP server | `mcp.rs` |
-| User-registered and bundled hosted MCP servers register, admit exact or narrowly compatible origin-scoped OAuth resources, authenticate, project active, restore, and invoke | `hosted_mcp_registration.rs` |
+| User-registered and bundled hosted MCP servers register, authenticate, project active, restore, and invoke | `hosted_mcp_registration.rs` |
 | Web search/fetch runs the real Exa MCP handshake | `web_access.rs` |
 | Outbound HTTP crosses the real security pipeline (network policy + leak scan) | `real_egress_pipeline.rs` |
 | Tools marked host-internal are never advertised to the model, and calls to them are rejected | `extension_visibility.rs`, `surface_disclosure.rs` |
@@ -228,7 +228,7 @@ One thread, whole real turn. Grouped by what the user experiences.
 **Auth** (`tests/integration/auth/`)
 | Behavior | Evidence |
 |---|---|
-| A full OAuth connect → callback → stored account round trip; conflicting shared-vendor OAuth resource or metadata bindings fail resolution closed | `auth/oauth_connect.rs` |
+| A full OAuth connect → callback → stored account round trip | `auth/oauth_connect.rs` |
 | Abandoning the OAuth popup, late callbacks, and retrying cleanly | `auth/oauth_popup_journeys.rs` |
 | Idle credentials get refreshed by the background sweep | `auth/oauth_refresh.rs` |
 | A missing credential parks a sign-in gate; denying it ends the run cleanly | `auth/auth_gate.rs` |
@@ -257,7 +257,6 @@ One thread, whole real turn. Grouped by what the user experiences.
 | Outbound preferences survive a process-level reopen | `outbound_store_durability.rs` |
 | Restart sequences over a gated run recover correctly | `generated_restart_sequences.rs` |
 | Odd gate sequences (double-resolve, cancel-after-finish, approve-a-done-run) behave | `generated_gate_sequences.rs` |
-| A ten-tool agent turn completes with its final reply while durable-write measurement captures process heartbeats, milestone events, and filesystem writes on libSQL and Postgres | `db_write_canonical.rs` |
 
 **Platform / wiring**
 | Behavior | Evidence |
@@ -270,8 +269,9 @@ One thread, whole real turn. Grouped by what the user experiences.
 | WebUI v2 routes work over the real services facade | `webui_v2_product_api.rs`, `webui_v2_router_smoke.rs` |
 | Enroll/refresh/remove a browser for web push over the real routes — advertised VAPID key, endpoint redacted to its push-service host, undeclared push hosts rejected, and the `web-app` catalog row selectable through the same notification-channels wire as every vendor channel | `webui_v2_product_api.rs::browser_channel_notification_setup_round_trip_through_production_facade` |
 | Identity resolution runs on the coverage lane | `identity_resolution_smoke.rs` |
+| A canonical 10-tool-call agent turn's database write volume is measured and reported (for tracking, not gated) on both libSQL and Postgres, and custom-actor group threads are rejected from canonical durable milestones | `db_write_canonical.rs` |
 
-One of the 57 registered bins, `delivery_user_journeys.rs`, holds the explicit
+One of the 59 registered bins, `delivery_user_journeys.rs`, holds the explicit
 channel-delivery journeys (two-lane model):
 
 | A user can… | Scenario |
