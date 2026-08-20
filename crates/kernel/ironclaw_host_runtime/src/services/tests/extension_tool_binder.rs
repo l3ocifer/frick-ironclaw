@@ -9,8 +9,8 @@ use ironclaw_extension_contracts::tool_adapter::{
     ToolCall, ToolCallResources, ToolError, ToolPorts,
 };
 use ironclaw_host_api::{
-    path::VirtualPath, resource::RuntimeResourceBudget, runtime::TrustClass,
-    trust::RequestedTrustClass,
+    dispatch::DispatchAuthRequirement, path::VirtualPath, resource::RuntimeResourceBudget,
+    runtime::TrustClass, trust::RequestedTrustClass,
 };
 
 use super::super::ExtensionToolBindError;
@@ -172,10 +172,8 @@ async fn binder_preserves_the_auth_gate_payload_across_the_tool_abi() {
         .unwrap_err();
 
     match err {
-        ToolError::AuthRequired {
-            required_secrets, ..
-        } => assert_eq!(
-            required_secrets,
+        ToolError::AuthRequired { requirement } => assert_eq!(
+            requirement.required_secrets,
             vec![SecretHandle::new("fixture_token").unwrap()]
         ),
         other => panic!("expected AuthRequired, got {other:?}"),
@@ -189,25 +187,26 @@ fn binder_preserves_the_raw_auth_diagnostic_across_the_tool_abi() {
     let error = crate::services::extension_tool_binder::tool_error_from_dispatch(
         DispatchError::AuthRequired {
             capability: CapabilityId::new("github.list_issues").unwrap(),
-            required_secrets: Vec::new(),
-            credential_requirements: Vec::new(),
-            model_visible_cause: Some(Box::new(ironclaw_host_api::dispatch::ProviderDiagnostic {
-                code: None,
-                message: Some(ironclaw_host_api::dispatch::UntrustedProviderMessage::new(
-                    diagnostic,
-                )),
-                retry_after: None,
-            })),
+            requirement: Box::new(DispatchAuthRequirement {
+                required_secrets: Vec::new(),
+                credential_requirements: Vec::new(),
+                model_visible_cause: Some(ironclaw_host_api::dispatch::ProviderDiagnostic {
+                    code: None,
+                    message: Some(ironclaw_host_api::dispatch::UntrustedProviderMessage::new(
+                        diagnostic,
+                    )),
+                    retry_after: None,
+                }),
+            }),
         },
     );
 
-    let ToolError::AuthRequired {
-        model_visible_cause: Some(cause),
-        ..
-    } = error
-    else {
+    let ToolError::AuthRequired { requirement } = error else {
         panic!("binder must preserve the auth diagnostic");
     };
+    let cause = requirement
+        .model_visible_cause
+        .expect("binder must preserve the auth diagnostic");
     assert_eq!(
         cause.message.as_ref().map(|message| message.as_str()),
         Some(diagnostic)
@@ -225,13 +224,13 @@ fn binder_preserves_provider_rejection_across_the_tool_abi() {
         crate::services::extension_tool_binder::tool_error_from_dispatch(DispatchError::Rejected {
             runtime: Some(ironclaw_host_api::runtime::RuntimeKind::Mcp),
             kind: DispatchFailureKind::Runtime(RuntimeDispatchErrorKind::Client),
-            diagnostic: Some(ironclaw_host_api::dispatch::ProviderDiagnostic {
+            diagnostic: Some(Box::new(ironclaw_host_api::dispatch::ProviderDiagnostic {
                 code: Some(ProviderErrorCode::new("mcp_tool_rejected")),
                 message: Some(ironclaw_host_api::dispatch::UntrustedProviderMessage::new(
                     "Bad credentials",
                 )),
                 retry_after: None,
-            }),
+            })),
             detail: None,
         });
 
