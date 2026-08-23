@@ -7,18 +7,18 @@ metadata:
   labels:
     app.kubernetes.io/name: frick
 spec:
-  entryPoints: [websecure]
+  # Cloudflare terminates TLS and the tunnel speaks plain HTTP to Traefik's
+  # `web` entrypoint; a websecure-only router, a `tls:` block (TLS-only
+  # routers on every entrypoint) or a cross-namespace middleware ref
+  # (allowCrossNamespace is off) each make Traefik drop the router -> 404.
+  entryPoints: [web]
   routes:
     - match: Host(`frick.leopaska.xyz`)
       kind: Rule
       services:
         - { name: frick, port: 3000 }
       middlewares:
-        - { name: authelia, namespace: authelia }
-  tls:
-    secretName: frick-leopaska-tls
-    domains:
-      - main: frick.leopaska.xyz
+        - { name: authelia }   # agents-shared copy (homelab infrastructure/authelia-middleware.yaml)
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
