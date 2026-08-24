@@ -950,27 +950,32 @@ fn reborn_contracts_crates_carry_a_checked_size_ceiling() {
         // union — the #7147 parallel-baseline lesson applied. Framing/render
         // vocabulary only — scope filtering stays in the memory providers
         // and host runtime. Count read from this test's own failure message.
-        // 13_306 -> 13_316 (2026-08-12, #7416 hook-aware parallel batches):
+        // 13_306 -> 13_390 (2026-08-11, #6985 prompt-prefix stability): typed
+        // leading inline roles keep subagent framing ahead of persisted
+        // conversation history. Role vocabulary and its partition only —
+        // provider assembly stays in ironclaw_llm. Count read from this test's
+        // own failure message.
+        // 13_390 -> 13_400 (2026-08-12, #7416 hook-aware parallel batches):
         // one defaulted port capability declares when ordered batch middleware
         // must retain batch entry. Scheduling and hook behavior remain in their
         // owning loop crates. Count read from this test's own failure message.
-        // 13_316 -> 13_326 (2026-08-12, merge with #7484 context eviction):
+        // 13_400 -> 13_410 (2026-08-12, merge with #7484 context eviction):
         // one bounded truncation-watermark DTO carried across the existing
         // context and prompt contracts. Window selection and task-pinning
         // behavior remain in ironclaw_threads and ironclaw_loop_host.
-        // 13_326 -> 13_334 (2026-08-11, #7484 eviction compaction): typed
+        // 13_410 -> 13_418 (2026-08-11, #7484 eviction compaction): typed
         // tool-result compaction metadata plus window-eviction initiator/mode
         // variants. Cut-point policy and execution remain in agent_loop and
         // loop_host. Count read from this test's own failure message.
-        // 13_334 -> 13_345 (2026-08-12, #7416 fail-closed batch ordering):
+        // 13_418 -> 13_429 (2026-08-12, #7416 fail-closed batch ordering):
         // the batch-ordering port contract now defaults to ordered entry and
         // documents the explicit opt-in required for concurrent singles.
         // Scheduling and wrapper behavior remain in their owning loop crates.
-        // 13_345 -> 13_524 (2026-08-12, #7509 prompt recovery hardening):
+        // 13_429 -> 13_608 (2026-08-12, #7509 prompt recovery hardening):
         // production prompt validation checks structural limits and control
         // characters only; decoded Basic-auth samples remain test-only. Count
-        // read from this test's own failure message after merging #7416.
-        ("ironclaw_loop_contracts", 13_524),
+        // read from this test's own failure message after merging #7416 and #6985.
+        ("ironclaw_loop_contracts", 13_608),
         // Raised 15_685 -> 15_758 by #7220 (operator inspector API): the growth
         // is bounded, output-only read-view descriptors. Capture, retention,
         // authorization, and transport behavior remain in their owning
