@@ -4,6 +4,7 @@ import { Button } from "../../../design-system/button";
 import { Input } from "../../../design-system/input";
 import { InlineNotice } from "../../../design-system/inline-notice";
 import { Panel } from "../../../design-system/primitives";
+import { Skeleton } from "../../../design-system/skeleton";
 import { clientActionId } from "../../../lib/api";
 import { useT } from "../../../lib/i18n";
 import { useAdminConfiguration } from "../hooks/useAdminConfiguration";
@@ -12,7 +13,7 @@ export function AdminConfigurationTab() {
   const t = useT();
   const state = useAdminConfiguration();
   if (state.query.isLoading) {
-    return <div className="v2-skeleton h-48 rounded-xl" aria-label={t("admin.configuration.loading")} />;
+    return <Skeleton className="h-48 rounded-xl" aria-label={t("admin.configuration.loading")} />;
   }
   if (state.query.error) {
     return (

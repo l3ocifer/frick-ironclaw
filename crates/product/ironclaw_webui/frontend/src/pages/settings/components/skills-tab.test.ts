@@ -62,6 +62,7 @@ function createHarness({ queryError = null, removeResult = { success: true } } =
       },
     },
     SettingsSearchEmpty() {},
+    Skeleton() {},
     SkillCard,
     SkillInstallPanel() {},
     matchesSearch: () => true,
