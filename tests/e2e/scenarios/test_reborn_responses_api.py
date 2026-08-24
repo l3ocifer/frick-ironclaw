@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from hermetic_process import forward_hermetic_process_env
 from helpers import REBORN_V2_AUTH_TOKEN, wait_for_ready
 
 USER_ID = "reborn-responses-e2e-user"
@@ -37,6 +38,7 @@ def _forward_coverage_env(env: dict[str, str]) -> None:
             "CARGO_INCREMENTAL",
         }:
             env[key] = value
+    forward_hermetic_process_env(env)
 
 
 async def _stop_process(proc, *, sig=signal.SIGINT, timeout: float = 10) -> None:
@@ -119,10 +121,13 @@ async def reborn_responses_server(
             "IRONCLAW_REBORN_PROFILE": PROFILE,
             "IRONCLAW_REBORN_WEBUI_TOKEN": REBORN_V2_AUTH_TOKEN,
             "IRONCLAW_REBORN_WEBUI_USER_ID": USER_ID,
+            # External-tool response fixtures assert the pre-disclosure tool
+            # surface; keep this deterministic server explicit.
+            "REBORN_TOOL_DISCLOSURE": "off",
             "MOCK_LLM_API_KEY": "mock-api-key",
             "NO_PROXY": "127.0.0.1,localhost,::1",
             "no_proxy": "127.0.0.1,localhost,::1",
-            "RUST_LOG": "ironclaw=warn,ironclaw_runner=warn",
+            "RUST_LOG": "ironclaw=warn,ironclaw_turn_runner=warn",
             "RUST_BACKTRACE": "1",
         }
         _forward_coverage_env(env)

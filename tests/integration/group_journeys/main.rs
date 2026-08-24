@@ -38,8 +38,10 @@
 //! - **Multi-actor GATED journey** (`multi_actor_gate_isolation`): runs on
 //!   `RebornIntegrationGroup::multiuser_approvals()`, whose C-MULTIUSER
 //!   `scope_capability_by_run_owner` seam scopes each actor's gated write to
-//!   its own run owner. Plain (non-gated) distinct-actor isolation is covered
-//!   by `reborn_group_multiuser::two_actors_own_threads`.
+//!   its own run owner. Plain (non-gated) distinct-actor coverage lives in
+//!   `reborn_group_multiuser`: `shared_route_refuses_direct_reclassification`
+//!   (Shared-route run-as-pinger + Direct-route refusal) plus the per-actor
+//!   isolation scenarios.
 
 #[allow(dead_code)]
 #[path = "../support/mod.rs"]
@@ -51,6 +53,7 @@ mod support;
 mod scenario_auth_deny_then_retry_journey;
 mod scenario_auth_gate_grant_resume;
 mod scenario_auth_then_approval_journey;
+mod scenario_expired_credential_resume;
 mod scenario_interactive_approval_journey;
 mod scenario_multi_actor_gate_isolation;
 
@@ -107,6 +110,17 @@ async fn journeys_group_auth_convergence_e2e() {
     report.record(
         "auth_gate_grant_resume",
         scenario_auth_gate_grant_resume::run(&g_grant).await,
+    );
+
+    // The EXPIRED arm: a stored credential the provider rejects, reconnected
+    // mid-run. Fresh group for the same reason as `g_grant` — a shared group's
+    // already-seeded credential would resolve immediately and never park.
+    let g_expired = RebornIntegrationGroup::live_auth_and_approval()
+        .await
+        .expect("expired-credential resume group builds");
+    report.record(
+        "expired_credential_resume",
+        scenario_expired_credential_resume::run(&g_expired).await,
     );
     report.assert_all_passed();
 }
