@@ -22,6 +22,14 @@ pub(super) enum RebornCapabilityBackend {
     /// Echo recorder: records capability invocations, executes nothing. Default —
     /// a text-only turn invokes no tool.
     Echo,
+    /// Echo-shaped capability whose successful results are typed `NoChange`,
+    /// used to drive the production no-progress detector deterministically.
+    NoProgressEcho,
+    /// Echo-shaped capability whose port returns a caller-shaped
+    /// `AgentLoopHostError` (`InvalidInvocation`) instead of a resolution. Drives
+    /// the #6284 capability-stage contract: a port error the model can act on
+    /// surfaces as a tool error and the run continues, rather than ending it.
+    RecoverablePortErrorEcho,
     /// Real first-party tool runtime (`builtin.http` + friends) with the recording
     /// `RuntimeHttpEgress` (scripted body, no network) — the §3.7 Tier-2 capture.
     BuiltinHttpTools,
@@ -66,6 +74,8 @@ pub(super) enum RebornCapabilityBackend {
     /// without a confirmed host-home mount) is observable at the
     /// integration tier.
     BuiltinHttpToolsConfirmedHostMount,
+    /// `builtin.shell` through the production Docker sandbox composition.
+    SandboxShellTools,
 }
 
 /// Which process port the built `BuiltinHttpTools` runtime installs for
@@ -92,7 +102,7 @@ pub(super) enum ShellMode {
 pub(super) struct CapabilityScriptingInputs {
     pub(super) keyed_http_responses: Vec<ScriptedHttpResponse>,
     pub(super) web_access_response_bodies: Vec<Vec<u8>>,
-    pub(super) github_network_statuses: Vec<u16>,
+    pub(super) github_network_responses: Vec<(u16, Option<Vec<u8>>)>,
     pub(super) real_egress_response_bodies: Vec<Vec<u8>>,
 }
 
@@ -124,11 +134,15 @@ impl RebornCapabilityBackend {
         let CapabilityScriptingInputs {
             keyed_http_responses,
             web_access_response_bodies,
-            github_network_statuses,
+            github_network_responses,
             real_egress_response_bodies,
         } = scripting;
         Ok(match self {
             RebornCapabilityBackend::Echo => GroupCapability::Recording,
+            RebornCapabilityBackend::NoProgressEcho => GroupCapability::RecordingNoProgress,
+            RebornCapabilityBackend::RecoverablePortErrorEcho => {
+                GroupCapability::RecordingRecoverablePortError
+            }
             RebornCapabilityBackend::BuiltinHttpTools => {
                 // Slice 5: `.with_live_shell()` opts into the real HostProcessPort;
                 // `Inert`/`Scripted` both use the inert RecordingProcessPort (the
@@ -198,8 +212,12 @@ impl RebornCapabilityBackend {
                 // port — see `reborn_integration_secret_injection.rs`'s module
                 // doc), so a runtime-401-after-injection scenario scripts the
                 // status here instead. A no-op (empty vec) for existing callers.
-                for status in github_network_statuses {
-                    host_runtime.install_network_status_script(status)?;
+                for (status, body) in github_network_responses {
+                    if let Some(body) = body {
+                        host_runtime.install_network_response_script(status, body)?;
+                    } else {
+                        host_runtime.install_network_status_script(status)?;
+                    }
                 }
                 GroupCapability::HostRuntime(Arc::new(host_runtime))
             }
@@ -227,6 +245,18 @@ impl RebornCapabilityBackend {
                 let host_runtime =
                     core_builtin::core_builtin_tools_with_confirmed_host_mount().await?;
                 host_runtime.install_http_responses(keyed_http_responses)?;
+                GroupCapability::HostRuntime(Arc::new(host_runtime))
+            }
+            RebornCapabilityBackend::SandboxShellTools => {
+                if !matches!(shell_mode, ShellMode::Inert) {
+                    return Err(
+                        "sandbox shell harness executes real containers and does not support \
+                         shell mode overrides"
+                            .into(),
+                    );
+                }
+                let host_runtime =
+                    super::harness::profiles::sandbox_shell::sandbox_shell_tools().await?;
                 GroupCapability::HostRuntime(Arc::new(host_runtime))
             }
         })
