@@ -153,7 +153,22 @@ fn reborn_dockerfile_keeps_bundled_skills_in_build_context() {
 #[test]
 fn reborn_dockerfile_uses_feature_matched_cache_and_loopback_default() {
     let dockerfile = read_repo_file("Dockerfile");
+    let chef_stage = dockerfile
+        .split_once(" AS chef\n")
+        .and_then(|(_, remainder)| remainder.split_once("\nFROM "))
+        .map(|(stage, _)| stage)
+        .expect("Dockerfile must define a chef stage");
+    let cargo_config_copy = chef_stage
+        .find("COPY .cargo/config.toml .cargo/config.toml")
+        .expect("chef stage must copy the repo-wide Cargo configuration");
+    let first_cargo_command = chef_stage
+        .find("cargo ")
+        .expect("chef stage must install cargo-chef");
 
+    assert!(
+        cargo_config_copy < first_cargo_command,
+        "chef stage must copy the Cargo network configuration before running Cargo"
+    );
     assert!(
         dockerfile.contains(
             "cargo chef cook \\\n    --profile dist \\\n    --package ironclaw \\\n    --recipe-path recipe.json"
@@ -185,6 +200,29 @@ fn reborn_runtime_image_includes_sql_debug_clients() {
     assert!(
         dockerfile.contains("sqlite3"),
         "runtime image must include sqlite3 for volume-backed libSQL/SQLite inspection"
+    );
+}
+
+#[test]
+fn reborn_runtime_image_can_run_the_orchestrator_healthcheck() {
+    // Earlier build stages install curl for downloads, so inspect only the
+    // shipped runtime stage used by container healthchecks.
+    let dockerfile = read_repo_file("Dockerfile");
+    let runtime_stage = dockerfile
+        .rsplit_once(" AS runtime\n")
+        .map(|(_, stage)| stage)
+        .expect("Dockerfile must define a runtime stage");
+    let runtime_packages = runtime_stage
+        .split_once("install -y --no-install-recommends \\\n")
+        .and_then(|(_, packages)| packages.split_once("    && rm -rf /var/lib/apt/lists/*"))
+        .map(|(packages, _)| packages)
+        .expect("runtime stage must install its package list before apt cleanup");
+
+    assert!(
+        runtime_packages
+            .lines()
+            .any(|line| line.trim() == "curl \\"),
+        "runtime image must include an HTTP client for orchestrator healthchecks"
     );
 }
 
@@ -274,7 +312,7 @@ fn reborn_dockerfile_build_is_covered_by_ci() {
 
 #[test]
 fn reborn_deployment_docs_keep_webui_sso_separate_from_product_auth() {
-    let docs = read_repo_file("docs/reborn/deploy-reborn-cli-docker.md");
+    let docs = read_repo_file("docs/internal/reborn/deploy-reborn-cli-docker.md");
 
     assert!(
         docs.contains("https://<railway-domain>/auth/callback/google"),
