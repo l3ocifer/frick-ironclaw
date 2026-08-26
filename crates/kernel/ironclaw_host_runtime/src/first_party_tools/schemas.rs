@@ -266,7 +266,7 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
         "schemas/builtin/shell.input.v1.json" => json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "Shell command to execute. Prefer ONE command that does the whole job: combine steps with '&&' or pipes, or write and run a single script (awk/python) — do NOT issue one command per metric/day/line, and don't re-read files you already have." },
+                "command": { "type": "string", "description": "Shell command to execute. Prefer one command that completes the whole job; combine local steps with shell syntax or a script." },
                 "workdir": { "type": "string", "description": "Optional scoped working directory" },
                 "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds" }
             },
@@ -1228,6 +1228,23 @@ mod tests {
                 && branch["required"]
                     == serde_json::json!(["operation", "data", "path", "function"])
         }));
+    }
+
+    #[test]
+    fn base_shell_schema_keeps_managed_credentials_out_of_local_profiles() {
+        let schema = resolve_builtin_input_schema_ref("schemas/builtin/shell.input.v1.json")
+            .expect("shell schema is registered");
+
+        assert!(
+            schema["properties"].get("credential_contexts").is_none(),
+            "base shell schema must omit managed credential contexts"
+        );
+        assert_eq!(schema["required"], serde_json::json!(["command"]));
+        assert!(
+            schema["properties"]["command"]["description"]
+                .as_str()
+                .is_some_and(|description| !description.contains("credential_contexts"))
+        );
     }
 
     #[test]
