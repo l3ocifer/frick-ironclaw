@@ -69,6 +69,29 @@ if [ "$(id -u)" = "0" ]; then
   # $IRONCLAW_REBORN_HOME/ssh staying root-owned.
   mkdir -p "$IRONCLAW_REBORN_HOME" /workspace
   chown ironclaw:ironclaw "$IRONCLAW_REBORN_HOME" /workspace
+  # Repair ownership of pre-existing home CONTENTS, not just the directory.
+  # A persistent volume outlives the image, and this image ran as `ironclaw`
+  # until in-worker SSH required a root entrypoint -- so a volume can carry
+  # files a root-run wrote. One unreadable file is fatal rather than
+  # degraded: the provider-registry overlay is fail-closed, so a root-owned
+  # `providers.json` crash-loops the container with
+  # "failed to read provider registry overlay ...: Permission denied", while
+  # a sibling `config.toml` written earlier still loads fine.
+  #
+  # `ssh` is excluded deliberately: start-sshd.sh refuses to start when its
+  # state directory is not root-owned, so recursing into it would trade this
+  # crash loop for a broken SSH listener.
+  # `-H` follows the start path only: $IRONCLAW_REBORN_HOME may itself be a
+  # symlink (find's default physical walk would then match nothing under
+  # -mindepth 1 and silently repair nothing), while symlinks encountered
+  # *during* the walk are still never followed -- combined with `chown -h`,
+  # a symlink planted in the home cannot redirect ownership outside it.
+  # Deliberately NOT filtered with `! -user ironclaw`: that predicate resolves
+  # the name at find time and aborts the whole boot under `set -e` wherever it
+  # does not resolve, trading a rare ownership repair for a guaranteed crash.
+  find -H "$IRONCLAW_REBORN_HOME" -mindepth 1 \
+    -path "$IRONCLAW_REBORN_HOME/ssh" -prune -o \
+    -exec chown -h ironclaw:ironclaw {} +
   # ...but ONLY when the override provably lives inside a directory this
   # entrypoint already manages. The Railway containment check that validates an
   # operator-supplied workspace root runs after the privilege drop (it needs
