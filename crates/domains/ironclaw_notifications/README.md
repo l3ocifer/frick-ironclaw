@@ -41,6 +41,11 @@ unbounded content. New notification kinds, source fields, actions, API shapes,
 and WebUI behavior are separate contract changes; producer onboarding alone
 must reuse the existing grammar.
 
+Authentication-required sources carry the credential-authority providers from
+the committed suspension. Provider-scoped recovery may settle only records
+whose persisted provider set contains that provider; legacy records without
+the metadata remain open until an authoritative run transition resolves them.
+
 ## Validation
 
 ```bash
