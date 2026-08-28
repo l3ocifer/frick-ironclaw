@@ -31,7 +31,8 @@
         "language": "en",
         "tabs": [
           {
-            "tab": " ",
+            "tab": "Docs",
+            "icon": "book-open",
             "groups": [
               {
                 "group": " ",
@@ -39,6 +40,15 @@
                   "index",
                   "quickstart",
                   "onboard"
+                ]
+              },
+              {
+                "group": "Using IronClaw",
+                "icon": "play",
+                "pages": [
+                  "using/webui",
+                  "using/cli",
+                  "using/service"
                 ]
               },
               {
@@ -77,7 +87,7 @@
                       },
                       "capabilities/skills",
                       "capabilities/sandboxed-tools",
-                      "capabilities/mcp"
+                      "capabilities/traces"
                     ]
                   }
                 ]
@@ -87,19 +97,17 @@
                 "icon": "message",
                 "pages": [
                   "channels/overview",
-                  {
-                    "group": "Built-in Channels",
-                    "pages": [
-                      "tunnel",
-                      "channels/local",
-                      "channels/telegram",
-                      "channels/signal",
-                      "channels/discord",
-                      "channels/wechat",
-                      "channels/wecom",
-                      "channels/webhook"
-                    ]
-                  }
+                  "channels/slack",
+                  "channels/telegram"
+                ]
+              },
+              {
+                "group": "IronHub",
+                "icon": "archive",
+                "pages": [
+                  "hub/overview",
+                  "hub/installing",
+                  "hub/contributing"
                 ]
               },
               {
@@ -154,6 +162,13 @@
                   }
                 ]
               }
+            ]
+          },
+          {
+            "tab": "Changelog",
+            "icon": "clock-rotate-left",
+            "pages": [
+              "changelog"
             ]
           }
         ]
@@ -227,18 +242,16 @@
                 "icon": "message",
                 "pages": [
                   "zh/channels/overview",
-                  {
-                    "group": "内置渠道",
-                    "pages": [
-                      "zh/tunnel",
-                      "zh/channels/local",
-                      "zh/channels/telegram",
-                      "zh/channels/signal",
-                      "zh/channels/wechat",
-                      "zh/channels/wecom",
-                      "zh/channels/webhook"
-                    ]
-                  }
+                  "zh/channels/telegram"
+                ]
+              },
+              {
+                "group": "IronHub",
+                "icon": "archive",
+                "pages": [
+                  "zh/hub/overview",
+                  "zh/hub/installing",
+                  "zh/hub/contributing"
                 ]
               },
               {
@@ -323,5 +336,75 @@
       "github": "https://github.com/nearai",
       "linkedin": "https://linkedin.com/company/near-ai"
     }
-  }
+  },
+  "redirects": [
+    {
+      "source": "/capabilities/mcp",
+      "destination": "/extensions/mcp"
+    },
+    {
+      "source": "/tunnel",
+      "destination": "/using/webui"
+    },
+    {
+      "source": "/channels/discord",
+      "destination": "/channels/overview"
+    },
+    {
+      "source": "/channels/signal",
+      "destination": "/channels/overview"
+    },
+    {
+      "source": "/channels/wechat",
+      "destination": "/channels/overview"
+    },
+    {
+      "source": "/channels/wecom",
+      "destination": "/channels/overview"
+    },
+    {
+      "source": "/channels/local",
+      "destination": "/channels/overview"
+    },
+    {
+      "source": "/channels/webhook",
+      "destination": "/channels/overview"
+    },
+    {
+      "source": "/zh/channels/discord",
+      "destination": "/zh/channels/overview"
+    },
+    {
+      "source": "/zh/channels/signal",
+      "destination": "/zh/channels/overview"
+    },
+    {
+      "source": "/zh/channels/wechat",
+      "destination": "/zh/channels/overview"
+    },
+    {
+      "source": "/zh/channels/wecom",
+      "destination": "/zh/channels/overview"
+    },
+    {
+      "source": "/zh/channels/local",
+      "destination": "/zh/channels/overview"
+    },
+    {
+      "source": "/zh/channels/webhook",
+      "destination": "/zh/channels/overview"
+    },
+    {
+      "source": "/zh/tunnel",
+      "destination": "/zh/index"
+    },
+    {
+      "source": "/zh/capabilities/jobs",
+      "destination": "/zh/capabilities/jobs/jobs"
+    },
+    {
+      "source": "/zh/extensions/google-calendar",
+      "destination": "/zh/extensions/google/calendar"
+    }
+  ]
 }
