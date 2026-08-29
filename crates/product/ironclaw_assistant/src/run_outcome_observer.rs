@@ -87,7 +87,7 @@ impl RunOutcomeProcessCommitObserver {
                 kind,
                 severity,
                 source: NotificationSource {
-                    thread_id: thread_id.clone(),
+                    thread_id: Some(thread_id.clone()),
                     turn_run_id: Some(run_id),
                     lifecycle_ref: Some(outcome_lifecycle_ref("process-terminal")?),
                     credential_providers: Vec::new(),
@@ -161,7 +161,7 @@ impl RunOutcomeProcessCommitObserver {
                 kind: NotificationKind::AuthenticationRequired,
                 severity: NotificationSeverity::Warning,
                 source: NotificationSource {
-                    thread_id: thread_id.clone(),
+                    thread_id: Some(thread_id.clone()),
                     turn_run_id: Some(run_id),
                     lifecycle_ref: Some(lifecycle_ref),
                     credential_providers: suspension
@@ -399,7 +399,7 @@ impl RunOutcomeProcessCommitObserver {
                 kind: NotificationKind::RunBlocked,
                 severity: NotificationSeverity::Warning,
                 source: NotificationSource {
-                    thread_id: thread_id.clone(),
+                    thread_id: Some(thread_id.clone()),
                     turn_run_id: Some(run_id),
                     lifecycle_ref: Some(lifecycle_ref),
                     credential_providers: Vec::new(),
@@ -1393,7 +1393,7 @@ mod tests {
         assert_eq!(page.notifications.len(), 1);
         let notification = &page.notifications[0];
         assert_eq!(notification.kind, NotificationKind::AuthenticationRequired);
-        assert_eq!(notification.source.thread_id, thread());
+        assert_eq!(notification.source.thread_id, Some(thread()));
         assert_eq!(notification.source.turn_run_id, Some(run_id));
         assert_eq!(
             notification
@@ -1935,7 +1935,7 @@ mod tests {
                     kind: NotificationKind::RunBlocked,
                     severity: NotificationSeverity::Warning,
                     source: NotificationSource {
-                        thread_id: thread(),
+                        thread_id: Some(thread()),
                         turn_run_id: Some(run_id),
                         lifecycle_ref: Some(
                             LifecycleRef::new(crate::run_delivery::TIMEOUT_LIFECYCLE_REF)

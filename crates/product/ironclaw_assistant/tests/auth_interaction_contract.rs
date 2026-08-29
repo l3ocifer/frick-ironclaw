@@ -651,7 +651,7 @@ async fn credential_provided_resumes_completed_auth_gate() {
             kind: NotificationKind::AuthenticationRequired,
             severity: NotificationSeverity::Warning,
             source: NotificationSource {
-                thread_id: scope.thread_id.clone(),
+                thread_id: Some(scope.thread_id.clone()),
                 turn_run_id: Some(run_id),
                 lifecycle_ref: Some(
                     LifecycleRef::new(gate_ref.as_str()).expect("auth lifecycle reference"),
@@ -967,7 +967,7 @@ async fn denied_auth_on_parked_gate_cancels_flow_and_resumes_with_denial_disposi
             kind: NotificationKind::AuthenticationRequired,
             severity: NotificationSeverity::Warning,
             source: NotificationSource {
-                thread_id: scope.thread_id.clone(),
+                thread_id: Some(scope.thread_id.clone()),
                 turn_run_id: Some(run_id),
                 lifecycle_ref: Some(
                     LifecycleRef::new(gate_ref.as_str()).expect("auth lifecycle reference"),

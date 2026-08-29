@@ -14720,7 +14720,7 @@ async fn a_repeated_notification_mutation_reports_that_nothing_changed() {
             kind: NotificationKind::ApprovalRequired,
             severity: NotificationSeverity::Warning,
             source: NotificationSource {
-                thread_id: thread_id.clone(),
+                thread_id: Some(thread_id.clone()),
                 turn_run_id: None,
                 lifecycle_ref: None,
                 credential_providers: Vec::new(),
@@ -15177,7 +15177,7 @@ async fn notifications_backfill_open_legacy_automation_approval_once() {
         "the migration must use the producer's stable id so normal gate resolution settles it",
     );
     assert_eq!(notification.kind, ProductNotificationKind::ApprovalRequired);
-    assert_eq!(notification.thread_id, thread_id.to_string());
+    assert_eq!(notification.thread_id, Some(thread_id.to_string()));
     assert_eq!(notification.turn_run_id, Some(run_id.to_string()));
     assert!(notification.read_at.is_none());
     assert!(notification.resolved_at.is_none());
@@ -15279,7 +15279,7 @@ async fn notification_list_survives_a_failed_legacy_approval_backfill_once() {
             kind: NotificationKind::RunCompleted,
             severity: NotificationSeverity::Success,
             source: NotificationSource {
-                thread_id: thread_id.clone(),
+                thread_id: Some(thread_id.clone()),
                 turn_run_id: None,
                 lifecycle_ref: None,
                 credential_providers: Vec::new(),

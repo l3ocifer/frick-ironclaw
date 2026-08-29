@@ -241,7 +241,7 @@ async fn standalone_oauth_turn_gate_callback_resumes_default_turn_coordinator() 
             kind: NotificationKind::AuthenticationRequired,
             severity: NotificationSeverity::Warning,
             source: NotificationSource {
-                thread_id: scope.thread_id.clone(),
+                thread_id: Some(scope.thread_id.clone()),
                 turn_run_id: Some(run_id),
                 lifecycle_ref: Some(LifecycleRef::new(gate_ref.as_str()).expect("lifecycle ref")),
                 credential_providers: Vec::new(),
@@ -499,7 +499,7 @@ async fn production_libsql_oauth_callback_fans_out_to_all_owner_provider_blocked
                 kind: NotificationKind::AuthenticationRequired,
                 severity: NotificationSeverity::Warning,
                 source: NotificationSource {
-                    thread_id: scope.thread_id.clone(),
+                    thread_id: Some(scope.thread_id.clone()),
                     turn_run_id: Some(run_id),
                     lifecycle_ref: Some(
                         LifecycleRef::new(gate_ref).expect("fan-out lifecycle ref"),

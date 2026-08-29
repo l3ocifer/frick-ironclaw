@@ -168,12 +168,19 @@ pub enum NotificationInitialState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NotificationAction {
-    OpenThread { thread_id: ThreadId },
+    /// Present the notification without linking to a workflow surface.
+    None,
+    OpenThread {
+        thread_id: ThreadId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationSource {
-    pub thread_id: ThreadId,
+    /// Canonical workflow thread when one was materialized. A terminal fact
+    /// that settles before submission has no thread and must not reuse the
+    /// trigger route key as one.
+    pub thread_id: Option<ThreadId>,
     pub turn_run_id: Option<TurnRunId>,
     pub lifecycle_ref: Option<LifecycleRef>,
     /// Trusted credential-authority namespaces associated with an auth

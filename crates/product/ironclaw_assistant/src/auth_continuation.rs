@@ -879,7 +879,7 @@ mod tests {
                 kind: NotificationKind::AuthenticationRequired,
                 severity: NotificationSeverity::Warning,
                 source: NotificationSource {
-                    thread_id: ThreadId::new("thread-auth").expect("thread"),
+                    thread_id: Some(ThreadId::new("thread-auth").expect("thread")),
                     turn_run_id: Some(run_id),
                     lifecycle_ref: Some(
                         LifecycleRef::new(gate_ref.as_str()).expect("lifecycle ref"),
@@ -972,7 +972,7 @@ mod tests {
                 kind: NotificationKind::AuthenticationRequired,
                 severity: NotificationSeverity::Warning,
                 source: NotificationSource {
-                    thread_id: ThreadId::new("thread-auth").expect("thread"),
+                    thread_id: Some(ThreadId::new("thread-auth").expect("thread")),
                     turn_run_id: Some(run_id),
                     lifecycle_ref: Some(
                         LifecycleRef::new(stale_gate_ref.as_str()).expect("lifecycle ref"),
