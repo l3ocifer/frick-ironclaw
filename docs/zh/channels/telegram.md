@@ -4,331 +4,145 @@ description: "通过 Telegram 与智能体交互"
 icon: telegram
 ---
 
-您可以创建 Telegram 机器人并将 IronClaw 智能体连接到它。配置完成后，您可以在私信中与智能体对话，也可以将其添加到群聊中参与讨论。
+将 IronClaw 连接到 Telegram 机器人，即可在私信和群聊中与智能体收发消息。
 
-<Note>
-如果您还没有设置智能体，请先查看我们的[快速开始指南](../quickstart)
-</Note>
+## 前提条件
+
+- 一个 Telegram 账号
+- 一个可通过公网 HTTPS（含有效证书）从 Telegram 访问到的 IronClaw 实例。本地安装同样可用 —— 在实例前架设一个隧道（例如 [ngrok](https://ngrok.com) 或 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)），详见下文的 Webhook 步骤。
 
 ---
 
-## 设置 Telegram 频道
+## 设置
 
 <Steps>
 
-<Step title="使用 BotFather 创建新机器人">
+<Step title="创建机器人">
 
-要创建新的 Telegram 机器人，您需要与 [BotFather](https://t.me/botfather) 对话，这是帮助您创建和管理机器人的官方 Telegram 机器人。
+在 Telegram 中与 [BotFather](https://t.me/botfather) 对话并发送 `/newbot`。为机器人选择名称和以 `bot` 结尾的用户名。BotFather 会返回类似 `123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ` 的令牌。请同时记下令牌和用户名 —— 配置表单中两者都需要填写。
 
-<Steps>
-    <Step title="与 BotFather 开始对话">
-    在 Telegram 应用中搜索"BotFather"并开始对话。您也可以使用此链接：[https://t.me/botfather](https://t.me/botfather)
-    </Step>
-    <Step title="创建新机器人">
-    向 BotFather 发送 `/newbot` 命令，然后按照说明创建新机器人。您需要为机器人选择一个名称和用户名。用户名必须以"bot"结尾，例如"my_agent_bot"。
-    </Step>
-    <Step title="获取机器人令牌">
-    创建机器人后，BotFather 会给您一个类似这样的令牌：`123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ`。此令牌用于认证您的机器人并允许其访问 Telegram API。请妥善保管此令牌，不要与任何人分享。稍后您将需要它来在 IronClaw 中配置 Telegram 频道。
-    </Step>
-</Steps>
+<Warning>
+机器人令牌等同于该机器人的完整凭据。持有它的人可以以您的智能体身份读取和发送消息。请勿粘贴到共享频道或提交到代码仓库。
+</Warning>
 
 </Step>
-<Step title="在 IronClaw 中配置 Telegram 频道">
 
-    使用 `--channels-only` 标志调用 IronClaw CLI 引导向导，仅配置频道而无需再次执行整个引导过程：
-
-    ```
-    ironclaw onboard --channels-only
-    ```
-
-    <Steps>
-        <Step title="配置隧道">
-            如果您尚未设置`隧道`，向导会要求您选择隧道提供商并进行设置。我们推荐使用 [ngrok](https://dashboard.ngrok.com/)，因为它易于使用且可靠。
-
-            ![ngrok setup](/images/channels/tunnel.png)
-        </Step>
-        <Step title="安装 Telegram 频道">
-        从可用频道列表中选择 Telegram 频道进行安装。
-        ![select channel](/images/channels/telegram-channel.png)
-        </Step>
-        <Step title="添加机器人令牌">
-            输入您在上一步中从 BotFather 获取的机器人令牌。
-        </Step>
-    </Steps>
-</Step>
-
-<Step title="测试 Telegram 频道">
-    配置完 Telegram 频道后，是时候测试一下了。如果智能体尚未运行，请先启动 `ironclaw`：
-
-    ```
-    ironclaw
-    ```
-
-    在 Telegram 中向您的机器人发送一条消息。它会回复一个命令，您需要在终端中执行该命令以完成频道设置：
-
-    ```
-    ironclaw pairing approve telegram <PAIRING_CODE>
-    ```
-</Step>
-
-</Steps>
-
----
-
-## Telegram 端设置
-
-<Accordion title="隐私模式和群组可见性">
-Telegram 机器人默认启用隐私模式，这限制了它们接收的群组消息。如果机器人必须查看所有群组消息，可以：
-
-    - 通过 `/setprivacy` 禁用隐私模式，或
-    - 将机器人设为群组管理员。
-
-切换隐私模式后，在每个群组中移除并重新添加机器人，以便 Telegram 应用更改。
-</Accordion>
-<Accordion title="群组权限">
-    管理员状态在 Telegram 群组设置中控制。管理员机器人可接收所有群组消息，适用于需要始终在线的群组行为。
-</Accordion>
-<Accordion title="实用的 BotFather 设置">
-    - `/setjoingroups` 允许/禁止加入群组
-    - `/setprivacy` 设置群组可见性行为
-
-</Accordion>
-
----
-
-## 配置选项
-
-您可以通过 `.ironclaw/channels/telegram.capabilities.json` 文件配置 Telegram 频道的行为，该文件在首次设置频道后自动创建。
-
-<Accordion title="选项概览">
-
-| 选项                          | 值                         | 默认值   | 描述                                                                     |
-|---------------------------------|--------------------------------|-----------|---------------------------------------------------------------------------------|
-| `dm_policy`                     | `open`, `allowlist`, `pairing` | `pairing` | 控制谁可以向机器人发送私信                                |
-| `allow_from`                    | 用户 ID                       | `[]`      | 当 `dm_policy` 设为 `allowlist` 时允许私信机器人的用户              |
-| `owner_id`                      | Telegram 用户 ID               | —         | 如果设置，只有此用户可以与机器人交互（私信和群组消息）       |
-| `respond_to_all_group_messages` | 布尔值                           | `false`   | 回复所有群组消息                                                   |
-| `bot_username`                  | 用户名                       | —         | 当 `respond_to_all_group_messages` 为 `false` 时用于群组提及检测 |
-| `polling_enabled`               | 布尔值                           | `false`   | 使用轮询代替 webhook                                                 |
-| `poll_interval_ms`              | 数字                         | `30000`   | 轮询间隔（毫秒），仅在 `polling_enabled` 为 `true` 时使用     |
-</Accordion>
-
-<Note>
-
-更改配置文件后请记得重启智能体以使更改生效
-
-</Note>
-
-### 私信策略
-
-`dm_policy` 选项控制谁可以向机器人发送私信：
-
-- `open`：任何人都可以无限制地私信机器人
-- `allowlist`：只有 `allow_from` 列表中的用户可以私信机器人
-- `pairing`**（默认）**：机器人会向联系它的任何用户回复一个配对命令，需要在终端中执行
-
-相关选项：
-- `allow_from` 选项是当 `dm_policy` 设为 `allowlist` 时允许私信机器人的 Telegram 用户 ID 列表
-- `owner_id` 选项将机器人限制为仅回复特定 Telegram 用户 ID 的消息
-
-<Tip>
-
-**用户 ID**
-
-向 [@userinfobot](https://t.me/userinfobot) 发消息以获取您的 Telegram 用户 ID。
-
-</Tip>
-
-### 回复所有群组消息
-默认情况下，Telegram 频道只回复群组中提及机器人的消息。
-如果您希望机器人回复所有群组消息，请设置 `respond_to_all_group_messages`
-
-相关选项：
-- 如果 `respond_to_all_group_messages` 设为 `false`，机器人只回复提及它的消息。
-此时请确保在 `bot_username` 选项中设置机器人的用户名（不带 `@`）
-
-### 轮询
-
-如果您不想配置`隧道`，可以设置 Telegram 频道每隔一定时间轮询新消息。
-
-为此，将 `polling_enabled` 选项设为 `true`，并将 `poll_interval_ms` 选项配置为所需的轮询间隔（毫秒），默认为 30000 毫秒（30 秒）。
-
-### 配置示例
-
-**私人团队助手** — 仅提及触发，私信需配对：
-```json
-{
-  "bot_username": "TeamBot",
-  "respond_to_all_group_messages": false,
-  "dm_policy": "pairing"
-}
-```
-
-**全天候专家** — 回复所有消息：
-```json
-{
-  "bot_username": "DevOpsBot",
-  "respond_to_all_group_messages": true,
-  "allow_from": ["*"]
-}
-```
-
-**仅限所有者** — 共享群组中的个人助手：
-```json
-{
-  "bot_username": "MyBot",
-  "respond_to_all_group_messages": false,
-  "owner_id": "12345678"
-}
-```
-
----
-
-## 群聊参与
-
-IronClaw 可以配置为参与 Telegram 群聊。默认情况下，机器人只回复命令（使用 `/help` 查看可用命令列表）。如果您希望机器人回复提及或所有群组消息，需要进行配置。
-
-### 将机器人添加到群组
-
-1. **在 @BotFather 中启用群组隐私**：
-   - 向 [@BotFather](https://t.me/BotFather) 发消息
-   - 发送 `/mybots` → 选择您的机器人
-   - 点击"Bot Settings" → "Group Privacy"
-   - 关闭"Privacy mode"（允许机器人查看所有消息）
-
-2. **将机器人添加到群组**：
-   - 在 Telegram 中打开群组
-   - 添加成员 → 搜索您的机器人用户名
-   - 授予管理员权限（可选但推荐）
-
-3. **在 IronClaw 中配置 `bot_username`**：
-   ```json
-   {
-     "bot_username": "MyIronClawBot"
-   }
-   ```
-
-### 群组触发模式
-
-#### 命令和提及
-
-当使用命令（如 `/skills`）或提及机器人（如 `@MyIronClawBot 天气怎么样？`）时，机器人会响应。
-
-配置：
-
-- 在 @BotFather 中将"Privacy mode"设为 `OFF`，或将机器人设为群组管理员
-- 配置 `bot_username`：
-
-```json
-{
-  "bot_username": "MyIronClawBot",
-  "respond_to_all_group_messages": false
-}
-```
-
-优点：
-- 尊重群组对话流程
-- 不会因未经请求的回复而产生垃圾信息
-- 用户明确选择与智能体交互
-
-#### 回复所有消息
-
-机器人处理并回复群组中的每条消息。
-
-- 在 @BotFather 中将"Privacy mode"设为 OFF，或将机器人设为群组管理员
-- 同时配置 `bot_username` 和 `respond_to_all_group_messages`：
-
-配置：
-```json
-{
-  "bot_username": "MyIronClawBot",
-  "respond_to_all_group_messages": true
-}
-```
-
-使用场景：
-- 智能体始终提供帮助的小型团队房间
-- 自动审核或摘要
-- 智能体提供专业知识的特定主题群组
-
----
-
-## 消息隐私
-
-<AccordionGroup>
-  <Accordion title="机器人可以看到什么" icon="eye">
-    - 禁用隐私模式的群组中的所有消息
-    - 用户名和显示名称
-    - 消息时间戳
-    - 回复链（对话上下文）
-  </Accordion>
-
-  <Accordion title="发送给 LLM 的内容" icon="message">
-    - 消息文本（已去除 @提及）
-    - 发送者标识（用户名或名字）
-    - 该对话中的近期对话历史
-  </Accordion>
-
-</AccordionGroup>
-
----
-
-## Webhook 密钥（可选）
-
-当 IronClaw 在 webhook 模式下运行时，Telegram 通过向您的公共 URL 发送 HTTP 请求来传递消息。由于该 URL 可从互联网访问，任何第三方都可以向其发送伪造请求。
-
-Webhook 密钥是您在 IronClaw 中配置的共享令牌。Telegram 在每个请求中包含该令牌。IronClaw 拒绝不携带正确令牌的任何请求，因此只有真正的 Telegram 流量才能到达您的智能体。
-
-要启用此功能，在 `.ironclaw/channels/telegram.capabilities.json` 中添加 `telegram_webhook_secret`：
-
-```json
-{
-  "telegram_webhook_secret": "your-secret-here"
-}
-```
-
-生成合适的值：
+<Step title="启动 IronClaw">
 
 ```bash
-openssl rand -hex 16
+ironclaw serve
 ```
 
+</Step>
+
+<Step title="通过 HTTPS 暴露本地实例（仅本地安装需要）">
+
+如果您的实例已有公网 HTTPS 地址，请跳过此步。否则需要在实例前架设隧道。最省心的方案是 ngrok —— 免费账号会自动获得一个开发域名（名称由系统分配，可在控制台和 agent 输出中看到）：
+
+```bash
+brew install ngrok                          # 或参见 ngrok.com/download
+ngrok config add-authtoken <your-token>     # 令牌来自 dashboard.ngrok.com
+ngrok http 3000
+```
+
+请使用 IronClaw 实际监听的端口 —— 未修改 `listen_port` 时为 `3000`。复制 ngrok 输出的 HTTPS 地址（形如 `https://<assigned-name>.ngrok-free.app`），拼接 Webhook 路径，即为下一步要填写的 Webhook URL：
+
+```
+https://<assigned-name>.ngrok-free.app/webhooks/extensions/telegram/updates
+```
+
+如果隧道的主机名发生变化（随机的 `trycloudflare.com` 快速隧道，或更换了保留域名），需要更新 **Public webhook URL** 字段并重新保存 —— 保存后会自动向 Telegram 重新注册 Webhook。ngrok 付费套餐可通过 `ngrok http --url=https://<your-domain> 3000` 固定保留域名。
+
 <Note>
-Webhook 密钥仅在 `polling_enabled` 为 `false` 时有效。如果您使用轮询，此选项无效。
+其他选择：已使用 Tailscale 的话，`tailscale funnel 3000` 可提供稳定的 `https://<machine>.<tailnet>.ts.net` 地址；`cloudflared tunnel --url http://localhost:3000` 无需注册，适合快速测试（每次启动主机名随机）。注意隧道会暴露整个 IronClaw 实例，而不仅是 Webhook 路径 —— WebUI 仍需访问令牌，Telegram 路由也会拒绝缺少 Webhook 密钥的调用，但请勿将主机名扩散给不必要的人。
+</Note>
+
+</Step>
+
+<Step title="填写部署配置（运维人员，每个实例一次）">
+
+在 [Web 界面](/using/webui)中打开 **Admin → Configuration**，找到 **Telegram deployment configuration** 卡片。它包含四个必填字段：
+
+| 字段 | 填写内容 |
+| --- | --- |
+| **Bot token** | 第 1 步中 BotFather 签发的令牌。 |
+| **Webhook secret token** | 由**您自行生成**的值 —— 任意 1–256 位的字母、数字、`_` 或 `-` 组成的随机字符串（例如 `openssl rand -hex 32` 的输出）。IronClaw 会将其注册到 Telegram，Telegram 在每次投递时原样带回，用于拒绝伪造的 Webhook 调用。 |
+| **Public webhook URL** | Telegram 投递更新的完整 HTTPS 地址：`https://your-host/webhooks/extensions/telegram/updates`。本地安装请使用隧道的公网主机名。 |
+| **Bot username** | 机器人的用户名，**不含开头的 @**（5–32 个字符，以 `bot` 结尾）。用于配对深链接和群聊提及。 |
+
+保存配置。这些值会保存在加密的密钥存储中，Webhook 会在扩展激活时向 Telegram 注册。
+
+<Note>
+Telegram 只向可公网访问、证书有效、端口为 443、80、88 或 8443 的 HTTPS 端点投递 Webhook，不会向自签名端点或内网地址投递 —— 这就是本地安装需要隧道的原因。
+</Note>
+
+</Step>
+
+<Step title="安装扩展">
+
+打开 **Extensions**，找到 **Telegram** 并安装 —— 也可以直接在聊天中让智能体设置 Telegram。激活时会使用您保存的配置向 Telegram 注册 Webhook；若四个字段中有任何缺失或无效，激活会以明确的错误失败。
+
+</Step>
+
+<Step title="配对您的账号（每位用户各自完成）">
+
+配置机器人并不等于把**您**连接上去。配对是独立的一步，用于确定哪个 Telegram 用户对应哪个 IronClaw 用户。在 Web 界面中打开配对面板，通过其链接或二维码完成配对；也可以与机器人开始对话，发送 `/start` 加上面板显示的配对码。
+
+配对可以防止陌生人找到您的机器人后，以您的身份与智能体对话。
+
+</Step>
+
+<Step title="开始对话">
+
+向机器人发送私信即可。若要在群聊中使用，请将机器人加入群组 —— 默认情况下 Telegram 机器人只能看到提及自己的消息。
+
+</Step>
+
+</Steps>
+
+---
+
+## 配置
+
+Telegram 在 `config.toml` 中没有任何设置，也没有用于启用的 CLI 配置键。
+入口路由已编译进程序并始终挂载；只有在保存部署配置并激活 Telegram 扩展
+之后（见上文步骤），它才会开始正常服务，在此之前返回 `503`。
+
+机器人令牌和 Webhook 密钥保存在加密的密钥存储中，而不是 `config.toml` 里。参见[配置](/capabilities/configuration)（暂仅提供英文版）。
+
+<Note>
+  旧版本遗留的 `[telegram]` 配置段仍可被解析，但不会被读取——`ironclaw serve`
+  启动时会记录一条弃用提示。删除该配置段即可消除该提示。
 </Note>
 
 ---
 
-## 故障排除
+## 故障排查
 
 <AccordionGroup>
-  <Accordion title="消息未送达">
-    **轮询：** 检查日志中的 `getUpdates` 错误，并验证机器人令牌有效。
 
-    **Webhook：** 验证 HTTPS URL 可访问且隧道正在运行。
-  </Accordion>
+<Accordion title="机器人没有任何回复">
+Telegram 通过 Webhook 投递更新，因此您的实例必须可通过 HTTPS 访问、证书有效，且端口为 443、80、88 或 8443。Telegram 不会向自签名端点或内网地址投递消息。本地安装请确认隧道正在运行，且 **Public webhook URL** 字段与隧道当前的公网主机名一致 —— 免费隧道的主机名在重启后经常会变化。
+</Accordion>
 
-  <Accordion title="配对码未发送">
-    - 确保 `dm_policy` 设为 `pairing` 而非 `allowlist`
-    - 验证您的实例可以访问 `api.telegram.org`
-  </Accordion>
+<Accordion title="私信可用但群聊不可用">
+请直接提及机器人，或通过 BotFather 关闭隐私模式（`/setprivacy`），使其能够看到全部群消息。
+</Accordion>
 
-  <Accordion title="群组提及不工作">
-    - 确认 `bot_username` 已设置且与机器人用户名完全匹配（不带 `@`）
-    - 验证机器人有读取群组消息的权限
-  </Accordion>
+<Accordion title='出现 "An administrator must configure the Telegram bot first"'>
+说明实例级的部署配置尚未保存，或您在保存之前进入了配对面板。请打开 **Admin → Configuration**，在 **Telegram deployment configuration** 卡片中填写全部四个字段并保存。
+</Accordion>
 
-  <Accordion title="机器人看不到群组消息">
-    - 在 @BotFather 中禁用隐私模式：`/mybots` → Bot Settings → Group Privacy → 关闭
-    - 更改隐私设置后在群组中移除并重新添加机器人
-  </Accordion>
+<Accordion title="保存配置后激活失败">
+激活会向 Telegram 注册 Webhook，任何取值错误都会导致激活直接失败。请检查：机器人令牌与 BotFather 签发的完全一致；Webhook 密钥只包含字母、数字、`_` 或 `-`；Public webhook URL 是完整的 `https://…/webhooks/extensions/telegram/updates` 地址；机器人用户名不含开头的 `@` 且以 `bot` 结尾。
+</Accordion>
 
-  <Accordion title="机器人意外回复所有群组消息">
-    - 将 `respond_to_all_group_messages` 设为 `false`
-    - 验证配置已保存并重启智能体
-  </Accordion>
+<Accordion title="我让智能体连接 Telegram，它说做不到">
+运维部分 —— 填写部署配置 —— 有意不交由智能体执行，请按上文步骤在 Web 界面中自行完成。配置保存后，让智能体处理属于您个人的部分是可行的：它会安装并激活扩展，并弹出配对面板供您绑定 Telegram 账号。
+</Accordion>
 
-  <Accordion title="设置时所有者绑定超时">
-    向导等待 120 秒接收第一条消息。如果超时，请在 Telegram 中向您的机器人发送 `/start`，然后重新运行 `ironclaw onboard --channels-only`。
-  </Accordion>
+<Accordion title="有其他人给我的机器人发消息">
+任何知道机器人用户名的人都可以与它对话。未完成配对的用户不会被视为您本人 —— 请完成配对，确保智能体只以您的身份代表您行事。
+</Accordion>
+
 </AccordionGroup>
