@@ -117,7 +117,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-auth-smoke
           path: artifacts/live-canary/
@@ -148,7 +148,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-auth-full
           path: artifacts/live-canary/
@@ -179,7 +179,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-auth-channels
           path: artifacts/live-canary/
@@ -268,7 +268,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-auth-live-seeded
           path: artifacts/live-canary/
@@ -369,7 +369,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-auth-browser-consent
           path: artifacts/live-canary/
@@ -434,7 +434,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-workflow-canary
           path: artifacts/live-canary/
@@ -485,7 +485,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-deterministic-replay
           path: artifacts/live-canary/
@@ -541,7 +541,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-public-smoke
           path: artifacts/live-canary/
@@ -840,7 +840,7 @@ jobs:
           echo "source=canary-fallback" >> "${GITHUB_OUTPUT}"
 
       - name: Upload prepared Reborn WebUI v2 binary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: prepared-reborn-webui-v2-binary-${{ steps.target.outputs.checkout_ref }}
           path: artifacts/prepared-reborn-webui-v2-binary/
@@ -1096,7 +1096,7 @@ jobs:
 
       - name: Download prepared Reborn WebUI v2 binary
         if: steps.filter_reborn_webui_v2_google_cases.outputs.skip_shard != '1'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: prepared-reborn-webui-v2-binary-${{ needs.prepare-reborn-webui-v2-live-qa.outputs.checkout_ref }}
           path: .live-qa-binary
@@ -1213,7 +1213,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always() && steps.filter_reborn_webui_v2_google_cases.outputs.skip_shard != '1'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-reborn-webui-v2-live-qa-${{ matrix.shard_id }}
           path: |
@@ -1283,7 +1283,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-persona-rotating
           path: artifacts/live-canary/
@@ -1333,7 +1333,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload summaries only
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-private-oauth-summary
           # results.json is emitted by scripts/live-canary/emit_results_json.py
@@ -1423,7 +1423,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-provider-${{ matrix.provider }}
           path: artifacts/live-canary/
@@ -1478,7 +1478,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-release-public-full
           path: artifacts/live-canary/
@@ -1526,7 +1526,7 @@ jobs:
         run: scripts/live-canary/scrub-artifacts.sh artifacts/live-canary
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-canary-upgrade
           path: artifacts/live-canary/
@@ -1565,7 +1565,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Download all lane artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           # Each upstream lane uploads to `live-canary-<lane>` / `live-canary-provider-<provider>`.
           # Merging into a single artifacts/live-canary/ tree lets notify_slack.py

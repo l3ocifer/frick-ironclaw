@@ -99,7 +99,7 @@ jobs:
 
       - name: Upload stress suite artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ironclaw-stress-libsql-suite
           path: |
@@ -150,7 +150,7 @@ jobs:
 
       - name: Upload stress ramp artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ironclaw-stress-libsql-ramp
           path: |
@@ -320,7 +320,7 @@ jobs:
 
       - name: Upload Postgres API capacity artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ironclaw-stress-postgres-api-capacity
           path: |
