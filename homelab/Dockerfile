@@ -23,7 +23,7 @@
 # syntax=docker/dockerfile:1
 
 # ─── Node toolchain (WebUI frontend) ─────────────────────────────────
-FROM node:22-bookworm-slim AS node_toolchain
+FROM node:24.20.0-bookworm-slim AS node_toolchain
 
 # ─── Chef base ───────────────────────────────────────────────────────
 # Floating 1.x tag (same convention as vetinari-openfang): upstream
