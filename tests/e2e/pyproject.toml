@@ -45,3 +45,17 @@ timeout = 360
 # but must be deliberate, not the default. See `.claude/rules/testing.md`
 # for the policy.
 xfail_strict = true
+# `shared_world` marks the reverse replay that deliberately keeps provider
+# mutations between journeys. The ordinary lane filters it out with
+# `-m "not shared_world"`. A marker rather than `--deselect`: the deselect
+# matched nothing once the step passed several files, and silently ran the
+# test anyway.
+markers = [
+    "shared_world: replays journeys against one shared, un-reset provider world",
+    # The autouse `assert_prompt_cache_reuse` fixture fails any test whose
+    # system prompt changes without a tool-surface change. A test that
+    # deliberately reconfigures the prompt mid-conversation opts out here —
+    # and must say why at the marker, so the exemption stays reviewable.
+    "allow_prompt_cache_churn(reason): deliberately rewrite the cached system prefix with one non-empty reviewable reason",
+    "disable_prompt_cache_gate(reason): intentionally stop or replace the mock LLM with one non-empty reviewable reason",
+]

@@ -7,13 +7,19 @@ via TOOL_CALL_PATTERNS.
 
 import argparse
 import asyncio
-from copy import deepcopy
+import hashlib
 import json
 import os
 import re
 import time
 import uuid
+
 from aiohttp import web
+from mock_llm_trace import (
+    is_host_reminder_text,
+    next_llm_trace_response,
+    register_llm_trace_routes,
+)
 
 DENIAL_PATTERN = re.compile(
     r"user denied action|user denied tool|denied:\s*",
@@ -40,8 +46,8 @@ CANNED_RESPONSES = [
     # already-run writes).
     (
         re.compile(r"produce a downloadable csv and pdf", re.IGNORECASE),
-        "Done — I saved /workspace/report.csv and /workspace/report.pdf. "
-        "Both are ready to download.",
+        "Done — I saved [report.csv](/workspace/report.csv) and "
+        "[report.pdf](sandbox:/workspace/report.pdf). Both are ready to download.",
     ),
     (
         re.compile(r"reborn write approval file (?P<label>[a-z0-9_-]+)", re.IGNORECASE),
@@ -117,335 +123,6 @@ EMULATE_GITHUB_BEARER = "ghp_emulate_github_token"
 EMULATE_SLACK_BEARER = "emulate-slack-token"
 
 
-def _new_llm_trace_state() -> dict:
-    return {
-        "source": None,
-        "responses": [],
-        "next_response": 0,
-        "expected_user_inputs": {},
-        "request_hints": [],
-        "error": None,
-    }
-
-
-def _parse_llm_trace(trace: object, source: str | None = None) -> dict:
-    """Validate a recorded Reborn trace and make it executable by this mock."""
-    if not isinstance(trace, dict):
-        raise ValueError("trace must be an object")
-    steps = trace.get("steps")
-    if not isinstance(steps, list) or not steps:
-        raise ValueError("trace.steps must be a non-empty list")
-
-    first = steps[0]
-    if not isinstance(first, dict) or not isinstance(first.get("response"), dict):
-        raise ValueError("trace.steps[0].response must be an object")
-    first_response = first["response"]
-    if first_response.get("type") != "user_input" or not isinstance(
-        first_response.get("content"), str
-    ):
-        raise ValueError("trace must start with a user_input response")
-
-    responses = []
-    expected_user_inputs = {0: first_response["content"]}
-    request_hints = []
-    pending_user_input = True
-    for index, step in enumerate(steps[1:], start=1):
-        if not isinstance(step, dict) or not isinstance(step.get("response"), dict):
-            raise ValueError(f"trace.steps[{index}].response must be an object")
-        response = step["response"]
-        response_type = response.get("type")
-        if response_type == "user_input":
-            if not isinstance(response.get("content"), str):
-                raise ValueError(
-                    f"trace.steps[{index}] user_input content must be a string"
-                )
-            if pending_user_input:
-                raise ValueError(
-                    f"trace.steps[{index}] has consecutive user_input responses"
-                )
-            expected_user_inputs[len(responses)] = response["content"]
-            pending_user_input = True
-            continue
-        if response_type == "text":
-            if not isinstance(response.get("content"), str):
-                raise ValueError(f"trace.steps[{index}] text content must be a string")
-        elif response_type == "tool_calls":
-            tool_calls = response.get("tool_calls")
-            if not isinstance(tool_calls, list) or not tool_calls:
-                raise ValueError(
-                    f"trace.steps[{index}] tool_calls must be a non-empty list"
-                )
-            for tool_index, tool_call in enumerate(tool_calls):
-                if (
-                    not isinstance(tool_call, dict)
-                    or not isinstance(tool_call.get("name"), str)
-                    or not isinstance(tool_call.get("arguments"), dict)
-                ):
-                    raise ValueError(
-                        f"trace.steps[{index}].tool_calls[{tool_index}] is invalid"
-                    )
-        else:
-            raise ValueError(
-                f"trace.steps[{index}] has unsupported response type {response_type!r}"
-            )
-        request_hint = step.get("request_hint", {})
-        if not isinstance(request_hint, dict):
-            raise ValueError(f"trace.steps[{index}].request_hint must be an object")
-        last_user_message_contains = request_hint.get("last_user_message_contains")
-        if last_user_message_contains is not None and not isinstance(
-            last_user_message_contains, str
-        ):
-            raise ValueError(
-                f"trace.steps[{index}].request_hint.last_user_message_contains "
-                "must be a string"
-            )
-        min_message_count = request_hint.get("min_message_count")
-        if min_message_count is not None and (
-            isinstance(min_message_count, bool)
-            or not isinstance(min_message_count, int)
-            or min_message_count < 0
-        ):
-            raise ValueError(
-                f"trace.steps[{index}].request_hint.min_message_count "
-                "must be a non-negative integer"
-            )
-        expected_failed_result = request_hint.get(
-            "expected_failed_tool_result_contains"
-        )
-        if expected_failed_result is not None and (
-            not isinstance(expected_failed_result, str) or not expected_failed_result
-        ):
-            raise ValueError(
-                f"trace.steps[{index}].request_hint."
-                "expected_failed_tool_result_contains must be a non-empty string"
-            )
-        responses.append(response)
-        request_hints.append(request_hint)
-        pending_user_input = False
-
-    if not responses:
-        raise ValueError("trace must contain at least one model response")
-    if pending_user_input:
-        raise ValueError("trace must not end with a user_input response")
-    return {
-        "source": source,
-        "responses": responses,
-        "next_response": 0,
-        "expected_user_inputs": expected_user_inputs,
-        "request_hints": request_hints,
-        "error": None,
-    }
-
-
-def _next_llm_trace_response(
-    state: dict,
-    messages: list[dict],
-    available_tool_names: set[str],
-) -> dict | None:
-    """Return the next recorded response, failing loudly on replay drift."""
-    responses = state.get("responses") or []
-    if not responses:
-        return None
-    next_index = state["next_response"]
-    if next_index >= len(responses):
-        state["error"] = (
-            "recorded LLM trace is exhausted but the agent requested another response"
-        )
-        raise web.HTTPConflict(text=state["error"])
-
-    request_hint = state["request_hints"][next_index]
-    min_message_count = request_hint.get("min_message_count")
-    if min_message_count is not None and len(messages) < min_message_count:
-        state["error"] = (
-            "recorded LLM trace request has too few messages before response "
-            f"{next_index}: expected at least {min_message_count}, got {len(messages)}"
-        )
-        raise web.HTTPConflict(text=state["error"])
-
-    hinted_user_input = request_hint.get("last_user_message_contains")
-    if hinted_user_input is not None and hinted_user_input not in _last_user_content(
-        messages
-    ):
-        state["error"] = (
-            "recorded LLM trace request hint does not match the last user message "
-            f"before response {next_index}"
-        )
-        raise web.HTTPConflict(text=state["error"])
-
-    expected_input = state["expected_user_inputs"].get(next_index)
-    if expected_input is not None:
-        actual_input = _last_user_content(messages)
-        if expected_input not in actual_input:
-            state["error"] = (
-                "recorded LLM trace user input does not match the conversation "
-                f"before response {next_index}"
-            )
-            raise web.HTTPConflict(text=state["error"])
-
-    failed_result = _failed_tool_result(messages)
-    expected_failed_result = request_hint.get("expected_failed_tool_result_contains")
-    if failed_result is None and expected_failed_result is not None:
-        state["error"] = (
-            "recorded LLM trace expected a failed capability result containing "
-            f"{expected_failed_result!r} before response {next_index}"
-        )
-        raise web.HTTPConflict(text=state["error"])
-    if failed_result is not None and (
-        expected_failed_result is None
-        or expected_failed_result not in failed_result["content"]
-    ):
-        state["error"] = (
-            "recorded LLM trace observed a failed capability result before response "
-            f"{next_index}: {failed_result['summary']}"
-        )
-        raise web.HTTPConflict(text=state["error"])
-
-    response = deepcopy(responses[next_index])
-    if response["type"] == "tool_calls":
-        available_tool_names = set(available_tool_names)
-        for result in _find_named_tool_results(messages, "capability_info"):
-            parsed = _parse_trace_result_content(result.get("content"))
-            disclosed_name = _find_trace_result_field(parsed, ["name"])
-            if isinstance(disclosed_name, str):
-                available_tool_names.add(disclosed_name)
-                available_tool_names.add(disclosed_name.replace(".", "__"))
-        missing = {
-            tool_call["name"]
-            for tool_call in response["tool_calls"]
-            if tool_call["name"] not in available_tool_names
-        }
-        if missing:
-            available_provider_tools = sorted(
-                name
-                for name in available_tool_names
-                if "__" in name and not name.startswith("builtin__")
-            )
-            state["error"] = (
-                "recorded LLM trace requested unavailable tools: "
-                + ", ".join(sorted(missing))
-                + "; available provider tools: "
-                + ", ".join(available_provider_tools)
-                + "; all available tools: "
-                + ", ".join(sorted(available_tool_names))
-            )
-            raise web.HTTPConflict(text=state["error"])
-        try:
-            response["tool_calls"] = _resolve_trace_result_bindings(
-                response["tool_calls"], messages
-            )
-        except ValueError as error:
-            state["error"] = str(error)
-            raise web.HTTPConflict(text=state["error"]) from error
-
-    state["next_response"] += 1
-    return response
-
-
-def _resolve_trace_result_bindings(value: object, messages: list[dict]) -> object:
-    """Resolve test-only arguments from earlier real capability results.
-
-    Harvested traces necessarily contain the provider IDs returned during the
-    live run. Full-path replay creates fresh Docs and Sheets resources, so a
-    later recorded call must consume the ID returned by the local provider,
-    not the stale live ID. Tests opt into that behavior with an argument value
-    shaped like::
-
-        {"$trace_result": {"tool": "google-docs__create_document",
-                            "fields": ["documentId", "document_id", "id"]}}
-
-    The marker is accepted only inside the mock server; committed trace files
-    remain unchanged and production code never sees it.
-    """
-    if isinstance(value, list):
-        return [_resolve_trace_result_bindings(item, messages) for item in value]
-    if not isinstance(value, dict):
-        return value
-
-    if set(value) == {"$trace_result"}:
-        binding = value["$trace_result"]
-        if not isinstance(binding, dict):
-            raise ValueError("$trace_result binding must be an object")
-        tool = binding.get("tool")
-        fields = binding.get("fields")
-        if not isinstance(tool, str) or not tool:
-            raise ValueError("$trace_result.tool must be a non-empty string")
-        if (
-            not isinstance(fields, list)
-            or not fields
-            or not all(isinstance(field, str) and field for field in fields)
-        ):
-            raise ValueError("$trace_result.fields must be non-empty strings")
-
-        named_results = _find_named_tool_results(messages, tool)
-        for result in reversed(named_results):
-            payload = _parse_trace_result_content(result.get("content"))
-            found = _find_trace_result_field(payload, fields)
-            if found is not None:
-                return found
-        observed = [
-            {
-                "name": result.get("name"),
-                "content": str(result.get("content", ""))[:500],
-            }
-            for result in _find_tool_results(messages)
-        ]
-        raise ValueError(
-            f"recorded LLM trace could not bind a result from {tool} "
-            f"using fields {fields}; observed tool results: {observed}"
-        )
-
-    return {
-        key: _resolve_trace_result_bindings(item, messages)
-        for key, item in value.items()
-    }
-
-
-def _parse_trace_result_content(content: object) -> object:
-    if not isinstance(content, str):
-        return content
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        return content
-
-
-def _find_trace_result_field(value: object, fields: list[str]) -> object | None:
-    if isinstance(value, dict):
-        for field in fields:
-            candidate = value.get(field)
-            if isinstance(candidate, (str, int)) and not isinstance(candidate, bool):
-                return candidate
-        for child in value.values():
-            candidate = _find_trace_result_field(child, fields)
-            if candidate is not None:
-                return candidate
-    elif isinstance(value, list):
-        for child in value:
-            candidate = _find_trace_result_field(child, fields)
-            if candidate is not None:
-                return candidate
-    elif isinstance(value, str) and value[:1] in {"{", "["}:
-        try:
-            nested = json.loads(value)
-        except json.JSONDecodeError:
-            return None
-        return _find_trace_result_field(nested, fields)
-    return None
-
-
-def _failed_tool_result(messages: list[dict]) -> dict | None:
-    for message in messages:
-        if message.get("role") != "tool":
-            continue
-        parsed = _parse_trace_result_content(message.get("content"))
-        status = _find_trace_result_field(parsed, ["status"])
-        if status in {"failed", "error"}:
-            return {
-                "content": json.dumps(parsed, sort_keys=True),
-                "summary": f"{message.get('name', 'unknown tool')} status={status}",
-            }
-    return None
-
 TOOL_FAILURE_TRIGGER = re.compile(r"issue 1780 tool failure", re.IGNORECASE)
 TRUNCATED_TOOL_CALL_TRIGGER = re.compile(
     r"issue 1780 truncated tool call",
@@ -460,6 +137,10 @@ REBORN_EXTERNAL_TOOL_LOOP_TRIGGER = re.compile(
 )
 REBORN_EXTERNAL_TOOL_FAILURE_TRIGGER = re.compile(
     r"reborn external tool failure",
+    re.IGNORECASE,
+)
+REBORN_EXTERNAL_TOOL_RESULT_READ_TRIGGER = re.compile(
+    r"reborn external tool result read",
     re.IGNORECASE,
 )
 REBORN_MIXED_INTERNAL_EXTERNAL_TRIGGER = re.compile(
@@ -515,6 +196,11 @@ NOTION_SEARCH_LIFECYCLE_TRIGGER = re.compile(
 )
 
 TOOL_CALL_PATTERNS = [
+    (
+        re.compile(r"reborn external tool result read", re.IGNORECASE),
+        "lookup_weather",
+        lambda _: {"city": "Boston"},
+    ),
     # Reborn parallel tool-call port: the Reborn provider-visible builtin tool
     # names are namespaced/sanitized, while the legacy engine keeps using the
     # unqualified trigger below.
@@ -612,13 +298,56 @@ TOOL_CALL_PATTERNS = [
     ),
     (
         re.compile(
+            r"reborn create notification (?P<kind>approval|authentication|completed|failed) "
+            r"automation (?P<label>[a-z0-9_-]+)",
+            re.IGNORECASE,
+        ),
+        "builtin__trigger_create",
+        lambda m: {
+            "name": f"E2E notification {m.group('kind')} {m.group('label')}",
+            "execution_contract": {
+                "version": 1,
+                "goal": {
+                    "approval": f"reborn builtin echo notification-{m.group('label')}",
+                    "authentication": "reborn install github for auth gate",
+                    "completed": f"notification completed {m.group('label')}",
+                    "failed": f"notification failed {m.group('label')}",
+                }[m.group("kind").lower()],
+                "success_criteria": ["Complete the notification lifecycle fixture"],
+                "output_instructions": "Return a concise result",
+                "no_result_text": "No result",
+                "policy": {"result_delivery": "deliver"},
+            },
+            "schedule": {
+                "kind": "once",
+                "at": "2999-06-02T00:00:00",
+                "timezone": "UTC",
+            },
+        },
+    ),
+    # Reborn WebUI v2 auth-gate smoke (#4633): installation parks on GitHub's
+    # required manual-token credential, then resumes through product auth.
+    (
+        re.compile(r"reborn install github for auth gate", re.IGNORECASE),
+        "builtin__extension_install",
+        lambda _: {"extension_id": "github"},
+    ),
+    (
+        re.compile(
             r"reborn create automation rename target (?P<label>[a-z0-9_-]+)",
             re.IGNORECASE,
         ),
         "builtin__trigger_create",
         lambda m: {
             "name": f"E2E rename original {m.group('label')}",
-            "prompt": f"E2E automation rename prompt {m.group('label')}",
+            "execution_contract": {
+                "version": 1,
+                "goal": f"E2E automation rename prompt {m.group('label')}",
+                "success_criteria": ["Complete the requested task"],
+                "output_instructions": "Return a concise result",
+                "no_result_text": "No result",
+                "policy": {"result_delivery": "deliver"},
+            },
             "schedule": {
                 "kind": "once",
                 "at": "2999-06-02T00:00:00",
@@ -1344,16 +1073,201 @@ def _message_text(msg: dict) -> str:
     return content
 
 
+def _is_host_reminder(msg: dict) -> bool:
+    # One definition, shared with the trace mock — see `is_host_reminder_text`.
+    return is_host_reminder_text(_message_text(msg))
+
+
+# ---------------------------------------------------------------------------
+# Prompt-cache prefix observer (#6985)
+#
+# Providers cache a *prefix* of the request. A cache hit needs request N+1 to
+# reproduce request N's leading bytes exactly, so anything that rewrites the
+# system block on every call silently multiplies input cost — the failure this
+# mock exists to catch, because no functional assertion in the suite can see it
+# (the model still answers correctly; it just costs 3.5x).
+#
+# What is gated vs. what is only measured:
+#
+#   * GATED — the system block changed while the advertised tool surface did
+#     NOT. There is no legitimate cause for that: it means per-call content
+#     (a clock, a nudge, a counter) is sitting in the cached prefix.
+#   * NOT GATED — the system block changed *together with* the tool surface.
+#     Installing an extension really does rewrite the capability list, and that
+#     invalidation is the correct price of a real change.
+#   * MEASURED ONLY — how much of the message history was reused. Compaction
+#     legitimately rewrites history, so this is a statistic for a ratchet to
+#     watch, not a per-request assertion.
+#
+# Every test that drives the mock gets the gate for free via the
+# `assert_prompt_cache_reuse` autouse fixture in conftest.py.
+# ---------------------------------------------------------------------------
+
+_cache_chains: dict[str, dict] = {}
+_cache_violations: list[dict] = []
+_cache_observations: list[dict] = []
+
+
+def _leading_system_text(messages: list[dict]) -> str:
+    """The provider-cached prompt prefix: the LEADING run of system messages.
+
+    Only the leading run — a system message after the first non-system message
+    is transcript-positioned content, not part of the cached prefix.
+    """
+    parts = []
+    for msg in messages:
+        if msg.get("role") != "system":
+            break
+        parts.append(_message_text(msg))
+    return "\n\n".join(parts)
+
+
+def _stable_history(messages: list[dict]) -> list[str]:
+    """Serialized non-system messages, minus the ephemeral host reminders.
+
+    Host reminders are replaced wholesale on every request by contract, so
+    including them would report churn the design intends.
+    """
+    out = []
+    for msg in messages:
+        if msg.get("role") == "system" or _is_host_reminder(msg):
+            continue
+        out.append(f"{msg.get('role')}\x00{_message_text(msg)}")
+    return out
+
+
+def _conversation_key(messages: list[dict], system_text: str, surface: str) -> str:
+    """Conservatively attach a request to an observed conversation chain.
+
+    The wire request carries no opaque thread ID. A first-user-text hash is not
+    an identity: unrelated threads can share the same opening message (or have
+    no user message). Treat a request as a continuation only when its stable
+    history extends a known chain, as an exact retry when history, prefix, and
+    tool surface all match, or when an otherwise stable chain has an observable
+    tool-surface transition or history rewrite. Ambiguous requests start a new
+    chain, which may under-report reuse but cannot blame one conversation for
+    another's churn.
+
+    Compaction replaces the history head and therefore starts a new chain, as
+    pinned by `test_compaction_starts_a_new_chain_rather_than_reporting_churn`.
+    """
+    history = _stable_history(messages)
+    for key, previous in reversed(tuple(_cache_chains.items())):
+        previous_history = previous["history"]
+        shared_history = 0
+        for index, entry in enumerate(previous_history):
+            if index >= len(history) or history[index] != entry:
+                break
+            shared_history += 1
+        extends_chain = (
+            len(history) > len(previous_history)
+            and shared_history == len(previous_history)
+        )
+        exact_retry = (
+            history == previous_history
+            and system_text == previous["system"]
+            and surface == previous["surface"]
+        )
+        surface_transition = history == previous_history and surface != previous["surface"]
+        history_rewrite = (
+            shared_history > 0
+            and history != previous_history
+            and system_text == previous["system"]
+            and surface == previous["surface"]
+        )
+        if extends_chain or exact_retry or surface_transition or history_rewrite:
+            return key
+    return f"chain-{len(_cache_chains) + 1}"
+
+
+def _tool_surface_signature(tools: object) -> str:
+    """Fingerprint of the advertised tool surface.
+
+    A changed surface is the one legitimate reason for the system block to be
+    rewritten, so it is what distinguishes explained churn from a cache bug.
+    """
+    try:
+        return hashlib.sha256(
+            json.dumps(tools, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+    except (TypeError, ValueError):
+        return "unserializable"
+
+
+def _observe_cache_prefix(messages: list[dict], tools: object) -> None:
+    system_text = _leading_system_text(messages)
+    history = _stable_history(messages)
+    surface = _tool_surface_signature(tools)
+    key = _conversation_key(messages, system_text, surface)
+    previous = _cache_chains.get(key)
+
+    if previous is not None:
+        system_changed = system_text != previous["system"]
+        surface_changed = surface != previous["surface"]
+        if system_changed and not surface_changed:
+            _cache_violations.append(
+                {
+                    "conversation": key,
+                    "reason": "system_prompt_churn_without_tool_surface_change",
+                    "detail": _first_divergence(previous["system"], system_text),
+                    "request_index": previous["requests"],
+                }
+            )
+        reused = 0
+        for index, entry in enumerate(previous["history"]):
+            if index >= len(history) or history[index] != entry:
+                break
+            reused += 1
+        _cache_observations.append(
+            {
+                "conversation": key,
+                "system_reused": not system_changed,
+                "system_change_explained": system_changed and surface_changed,
+                "history_messages_reused": reused,
+                "history_messages_before": len(previous["history"]),
+                "history_rewritten": reused < len(previous["history"]),
+            }
+        )
+
+    _cache_chains[key] = {
+        "system": system_text,
+        "history": history,
+        "surface": surface,
+        "requests": (previous["requests"] + 1) if previous else 1,
+    }
+
+
+def _first_divergence(before: str, after: str) -> str:
+    """Human-readable excerpt around the first differing character."""
+    at = 0
+    for at, (a, b) in enumerate(zip(before, after)):
+        if a != b:
+            break
+    else:
+        at = min(len(before), len(after))
+    start = max(0, at - 60)
+    return (
+        f"diverges at char {at}: "
+        f"before={before[start : at + 90]!r} after={after[start : at + 90]!r}"
+    )
+
+
+def _reset_cache_observations() -> None:
+    _cache_chains.clear()
+    _cache_violations.clear()
+    _cache_observations.clear()
+
+
 def _last_user_content(messages: list[dict]) -> str:
     for msg in reversed(messages):
-        if msg.get("role") == "user":
+        if msg.get("role") == "user" and not _is_host_reminder(msg):
             return _message_text(msg)
     return ""
 
 
 def _last_user_message(messages: list[dict]) -> dict:
     for msg in reversed(messages):
-        if msg.get("role") == "user":
+        if msg.get("role") == "user" and not _is_host_reminder(msg):
             return msg
     return {}
 
@@ -1853,6 +1767,39 @@ def match_tool_call(messages: list[dict], has_tools: bool) -> list[dict] | None:
         return None
     lower = content.lower()
     recent_tool_results = _find_tool_results(messages)
+    # The external-tool success path writes the client-submitted value through
+    # the same durable result writer as every other successful capability. Ask
+    # the real host `result_read` capability to select its nested JSON array so this
+    # E2E scenario proves both halves of that contract. The result reference
+    # is intentionally discovered from the model-visible observation, just as
+    # a real model would discover it.
+    if REBORN_EXTERNAL_TOOL_RESULT_READ_TRIGGER.search(content):
+        external_result = next(
+            (
+                result
+                for result in recent_tool_results
+                if result["name"] == "lookup_weather"
+            ),
+            None,
+        )
+        result_read_already_called = any(
+            result["name"] == "builtin__result_read" for result in recent_tool_results
+        )
+        if external_result is not None and not result_read_already_called:
+            result_ref = re.search(
+                r'"result_ref"\s*:\s*"([^"\\]+)"',
+                external_result["content"],
+            )
+            if result_ref:
+                return [{
+                    "tool_name": "builtin__result_read",
+                    "arguments": {
+                        "result_ref": result_ref.group(1),
+                        "offset": 0,
+                        "max_bytes": 24 * 1024,
+                        "json_pointer": "/items",
+                    },
+                }]
     # #3533: gmail-install-then-retry sequence.
     #
     # Turn 1: user says "check gmail unread" → match_tool_call below dispatches
@@ -1964,8 +1911,12 @@ def _extract_tool_name(msg: dict) -> str:
     return "unknown"
 
 
-def _find_tool_results(messages: list[dict]) -> list[dict]:
-    """Collect every fresh tool result that follows the most recent user turn.
+def _find_tool_results(
+    messages: list[dict],
+    *,
+    after_latest_user: bool = True,
+) -> list[dict]:
+    """Collect tool results, optionally limited to the most recent user turn.
 
     A single assistant turn can dispatch *several* tool calls (the v2 engine
     fans them out in parallel and CodeAct can call multiple Python helpers
@@ -1974,10 +1925,11 @@ def _find_tool_results(messages: list[dict]) -> list[dict]:
     acknowledge each result instead of dropping all but the first.
     """
     last_user_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "user":
-            last_user_idx = i
-            break
+    if after_latest_user:
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user" and not _is_host_reminder(messages[i]):
+                last_user_idx = i
+                break
 
     tool_call_names: dict[str, str] = {}
     results: list[dict] = []
@@ -2000,6 +1952,7 @@ def _find_tool_results(messages: list[dict]) -> list[dict]:
                 name = tool_call_names.get(message.get("tool_call_id", ""), name)
             results.append({
                 "name": name,
+                "tool_call_id": message.get("tool_call_id"),
                 "content": message.get("content", ""),
             })
     return results
@@ -2874,16 +2827,36 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     stream = body.get("stream", False)
     tools = body.get("tools")
     has_tools = bool(tools)
+    # Every request through this mock is also a prompt-cache observation, so
+    # cache regressions surface in whatever test happens to be running rather
+    # than needing a dedicated scenario (#6985).
+    _observe_cache_prefix(messages, tools)
     available_tool_names = _available_tool_names(tools)
     cid = f"mock-{uuid.uuid4().hex[:8]}"
 
-    trace_response = _next_llm_trace_response(
+    # Notification outcome E2E fixture: make the scheduled run itself fail
+    # with a non-retryable provider response. The creation turn contains the
+    # same marker without the formatted Goal block, so it still succeeds and
+    # persists the automation before the run is started explicitly.
+    if _job_contains_marker(messages, "## Goal\n\nnotification failed "):
+        return web.json_response(
+            {
+                "error": {
+                    "message": "scripted notification outcome failure",
+                    "type": "server_error",
+                }
+            },
+            status=400,
+        )
+
+    trace_response = next_llm_trace_response(
         request.app["llm_trace_state"], messages, available_tool_names
     )
     if trace_response is not None:
         if trace_response["type"] == "tool_calls":
             calls = [
                 {
+                    "id": tool_call.get("id"),
                     "tool_name": tool_call["name"],
                     "arguments": tool_call["arguments"],
                 }
@@ -3106,7 +3079,7 @@ def _tool_call_response(cid: str, calls: list[dict] | dict) -> web.Response:
         calls = [calls]
     tool_calls = [
         {
-            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}",
             "type": "function",
             "function": {
                 "name": tc["tool_name"],
@@ -3186,7 +3159,7 @@ async def _stream_tool_call(
     await resp.prepare(request)
     base = _make_base(cid)
     for idx, tc in enumerate(calls):
-        call_id = f"call_{uuid.uuid4().hex[:8]}"
+        call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
         # Header chunk: declare a new tool call slot at this index. Only
         # the very first chunk in the stream needs the assistant role.
         delta: dict = {
@@ -3764,7 +3737,7 @@ def main():
     app["oauth_state"] = _new_oauth_state()
     app["mcp_state"] = _new_mcp_state()
     app["gmail_state"] = _new_gmail_state()
-    app["llm_trace_state"] = _new_llm_trace_state()
+    register_llm_trace_routes(app)
     # Register both /v1/ and non-/v1/ paths (rig-core omits the /v1/ prefix)
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_post("/chat/completions", chat_completions)
@@ -3799,31 +3772,27 @@ def main():
         _chat_requests.clear()
         return web.json_response({"ok": True})
 
-    async def set_llm_trace(request: web.Request) -> web.Response:
-        body = await request.json()
-        try:
-            request.app["llm_trace_state"] = _parse_llm_trace(
-                body.get("trace"), body.get("source")
-            )
-        except ValueError as error:
-            return web.json_response({"ok": False, "error": str(error)}, status=400)
-        return web.json_response({"ok": True})
-
-    async def get_llm_trace(request: web.Request) -> web.Response:
-        state = request.app["llm_trace_state"]
+    async def get_cache_stats(request: web.Request) -> web.Response:
+        observations = _cache_observations
+        comparable = len(observations)
+        reused = sum(1 for o in observations if o["system_reused"])
         return web.json_response(
             {
-                "source": state["source"],
-                "next_response": state["next_response"],
-                "response_count": len(state["responses"]),
-                "complete": bool(state["responses"])
-                and state["next_response"] == len(state["responses"]),
-                "error": state["error"],
+                # Requests that had a predecessor to compare against; the first
+                # request of a conversation can neither hit nor miss.
+                "comparable_requests": comparable,
+                "system_prefix_reused": reused,
+                "system_prefix_reuse_ratio": (reused / comparable) if comparable else None,
+                "explained_surface_changes": sum(
+                    1 for o in observations if o["system_change_explained"]
+                ),
+                "history_rewrites": sum(1 for o in observations if o["history_rewritten"]),
+                "violations": _cache_violations,
             }
         )
 
-    async def reset_llm_trace(request: web.Request) -> web.Response:
-        request.app["llm_trace_state"] = _new_llm_trace_state()
+    async def reset_cache_stats(request: web.Request) -> web.Response:
+        _reset_cache_observations()
         return web.json_response({"ok": True})
 
     async def set_llm_faults(request: web.Request) -> web.Response:
@@ -3881,9 +3850,8 @@ def main():
     app.router.add_get("/__mock/last_chat_request", get_last_chat_request)
     app.router.add_get("/__mock/chat_requests", get_chat_requests)
     app.router.add_post("/__mock/chat_requests/reset", reset_chat_requests)
-    app.router.add_post("/__mock/llm_trace", set_llm_trace)
-    app.router.add_get("/__mock/llm_trace", get_llm_trace)
-    app.router.add_post("/__mock/llm_trace/reset", reset_llm_trace)
+    app.router.add_get("/__mock/cache_stats", get_cache_stats)
+    app.router.add_post("/__mock/cache_stats/reset", reset_cache_stats)
     app.router.add_post("/__mock/llm_faults", set_llm_faults)
     app.router.add_get("/__mock/llm_faults", get_llm_faults)
     app.router.add_post("/__mock/llm_faults/reset", reset_llm_faults)

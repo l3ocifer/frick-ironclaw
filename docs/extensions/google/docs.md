@@ -3,7 +3,7 @@ title: "Docs"
 description: "Let your agent create and edit Google Documents"
 ---
 
-The Google Docs extension allows your agent to interact with Google Docs — creating documents, reading content, inserting and formatting text, managing tables and lists, and running batch updates. It's ideal for drafting reports, editing existing documents, or automating document workflows directly from your agent.
+The Google Docs extension allows your agent to interact with Google Docs — creating documents, inspecting paragraphs and tables, applying anchored edits, creating populated tables, verifying results, and using low-level formatting or batch updates when needed. Semantic operations validate inputs and read provider state back, reducing multi-call index discovery loops.
 
 ---
 
@@ -22,7 +22,7 @@ In your Google Cloud project, navigate to **APIs & Services → Library**, searc
 <Step title="Install the Extension">
 
 ```bash
-ironclaw registry install google-docs
+ironclaw extension install google-docs
 ```
 
 </Step>
@@ -30,10 +30,10 @@ ironclaw registry install google-docs
 <Step title="Authorize Access">
 
 ```bash
-ironclaw tool auth google-docs
+ironclaw extension activate google-docs
 ```
 
-IronClaw will provide a URL for you to authenticate - remember to follow the [auth setup](./oauth-setup) to enable your agent to capture the callback. If possible, it will open a browser window. Once approved, the token is stored securely and refreshed automatically.
+Activating an extension that needs credentials starts its setup flow. Complete it from **Extensions** in the [web interface](/using/webui) — for Google services that means the OAuth consent screen. Follow the [auth setup](/extensions/google/oauth-setup) first so your agent can capture the callback. Tokens are stored encrypted and refreshed automatically.
 
 <Tip>
 If you already authenticated one Google service, you still need to authenticate each additional Google extension separately.
@@ -58,6 +58,10 @@ If you already authenticated one Google service, you still need to authenticate 
 - `insert_table`: Insert a table with a specified number of rows and columns
 - `create_list`: Convert a range of paragraphs into a bulleted or numbered list
 - `batch_update`: Send multiple document update requests in a single API call
+- `inspect_document`: Inspect paragraphs and tables with stable document indexes
+- `apply_text_edits`: Apply validated, tab-scoped text replacements and verify the result
+- `create_table_with_data`: Insert, populate, style, and verify a table
+- `verify_document`: Check expected text and specific table contents against provider state
 
 ---
 
