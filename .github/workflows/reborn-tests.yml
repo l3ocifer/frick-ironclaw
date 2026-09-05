@@ -383,7 +383,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.changes.outputs.run_coverage == 'true'
-        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # cargo-llvm-cov
+        uses: taiki-e/install-action@4e14a60b36eb62630dcc25614f0be0659ab8830c # cargo-llvm-cov
 
       - name: Run crate tests
         env:
@@ -644,7 +644,7 @@ jobs:
 
       - name: Install cargo-nextest
         if: needs.changes.outputs.run_coverage != 'true'
-        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # v2
+        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2
         with:
           tool: cargo-nextest@0.9.143
 
@@ -696,7 +696,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.changes.outputs.run_coverage == 'true'
-        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # cargo-llvm-cov
+        uses: taiki-e/install-action@4e14a60b36eb62630dcc25614f0be0659ab8830c # cargo-llvm-cov
 
       - name: Run this IronClaw integration batch
         env:
@@ -908,7 +908,7 @@ jobs:
 
       - name: Install cargo-mutants
         if: github.event_name == 'merge_group' && steps.scope.outputs.should_run == 'true'
-        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # v2
+        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2
         with:
           tool: cargo-mutants@27.1.0
 
