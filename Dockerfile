@@ -46,7 +46,7 @@ RUN apt-get -o Acquire::Retries=3 update \
     && install -m 0755 /tmp/railway /usr/local/bin/railway \
     && railway --version
 
-FROM rust:1.96-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS chef
+FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS chef
 
 COPY --from=node_toolchain /usr/local/bin/node /usr/local/bin/node
 COPY --from=node_toolchain /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
