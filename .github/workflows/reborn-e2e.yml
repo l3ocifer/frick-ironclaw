@@ -97,7 +97,7 @@ jobs:
       - id: non_diff
         if: github.event_name != 'merge_group' && github.event_name != 'pull_request'
         run: echo "has_e2e_scope=true" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         if: github.event_name == 'merge_group' || github.event_name == 'pull_request'
         with:
           fetch-depth: 0
@@ -145,7 +145,7 @@ jobs:
           - substrates
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
@@ -181,7 +181,7 @@ jobs:
       IRONCLAW_HERMETIC_SUITE_SKIP_PREPARE: "1"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # Live canary validates and tests the PR head SHA, so publish the
           # reusable binary for that same immutable commit. Merge-group runs
@@ -407,7 +407,7 @@ jobs:
             shard: "2/4 3/4"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.ref || (github.event_name == 'pull_request' && github.event.pull_request.head.sha) || github.sha }}
           persist-credentials: false
@@ -492,7 +492,7 @@ jobs:
 
       - name: Checkout pinned Emulate fork
         if: matrix.kind == 'provider'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: serrrfirat/emulate
           ref: c85da1ed9b4e1c9cbdcd9b9ec7af2aac93f5ea9e
@@ -657,7 +657,7 @@ jobs:
       - webui-v2-test-lanes
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Check Reborn E2E jobs

@@ -100,7 +100,7 @@ jobs:
       PROVIDER: mock
       PLAYWRIGHT_INSTALL: with-deps
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -131,7 +131,7 @@ jobs:
       PROVIDER: mock
       PLAYWRIGHT_INSTALL: with-deps
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -162,7 +162,7 @@ jobs:
       PROVIDER: mock
       PLAYWRIGHT_INSTALL: with-deps
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -206,7 +206,7 @@ jobs:
       AUTH_LIVE_NOTION_CLIENT_ID: ${{ secrets.AUTH_LIVE_NOTION_CLIENT_ID }}
       AUTH_LIVE_NOTION_QUERY: ${{ vars.AUTH_LIVE_NOTION_QUERY }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -301,7 +301,7 @@ jobs:
       # entry comes back into `BROWSER_CASES`. Coverage for github
       # lives in `SEEDED_CASES` (auth-live-seeded) instead.
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -386,7 +386,7 @@ jobs:
       # --scenario flags on run_workflow_canary.py. Empty = full suite.
       SCENARIO: ${{ inputs.scenario }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       # wasm32-wasip2 + cargo-component + the channels build are all
@@ -445,7 +445,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -499,7 +499,7 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       ANTHROPIC_MODEL: ${{ vars.LIVE_ANTHROPIC_MODEL || 'claude-sonnet-4-6' }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -626,7 +626,7 @@ jobs:
     outputs:
       status: ${{ steps.refresh.outputs.status }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Refresh Google OAuth access token
@@ -702,7 +702,7 @@ jobs:
           fi
           echo "checkout_ref=${TARGET_REF}" >> "${GITHUB_OUTPUT}"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
           ref: ${{ steps.target.outputs.checkout_ref }}
@@ -1010,7 +1010,7 @@ jobs:
               echo "Running requested cases in this shard: ${joined}"
             fi
           fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         if: steps.resolve_reborn_webui_v2_cases.outputs.skip_shard != '1'
         with:
           persist-credentials: false
@@ -1039,7 +1039,7 @@ jobs:
             --status "${GOOGLE_OAUTH_STATUS:-unknown}" \
             --github-env "${GITHUB_ENV}" \
             --github-output "${GITHUB_OUTPUT}"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         if: >
           steps.filter_reborn_webui_v2_google_cases.outputs.skip_shard != '1' &&
           github.event_name == 'workflow_dispatch' &&
@@ -1234,7 +1234,7 @@ jobs:
       LIVE_CANARY_TELEGRAM_BOT_TOKEN: ${{ secrets.LIVE_CANARY_TELEGRAM_BOT_TOKEN }}
       LIVE_CANARY_COMPOSIO_API_KEY: ${{ secrets.LIVE_CANARY_COMPOSIO_API_KEY }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -1304,7 +1304,7 @@ jobs:
             exit 1
           fi
           echo "Disk OK: ${avail_kb} KiB available on /."
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -1347,7 +1347,7 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       ANTHROPIC_MODEL: ${{ vars.LIVE_ANTHROPIC_MODEL || 'claude-sonnet-4-6' }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -1396,7 +1396,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -1462,7 +1462,7 @@ jobs:
       issues: write
       pull-requests: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
